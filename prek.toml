@@ -1,0 +1,51 @@
+# Configuration for prek (pre-commit hooks).
+# See https://prek.j178.dev for documentation.
+#
+# Hooks are gated by file patterns — they only fire when matching files are
+# staged. This means the config is safe to commit before any Rust or Kotlin
+# code exists; hooks simply won't run until there are relevant files.
+#
+# Install into the repo:  prek install
+# Run manually:           prek run --all-files
+
+[[repos]]
+repo = "builtin"
+hooks = [
+    { id = "trailing-whitespace" },
+    { id = "end-of-file-fixer" },
+    { id = "check-added-large-files", args = ["--maxkb=500"] },
+]
+
+[[repos]]
+repo = "local"
+hooks = [
+    # --- Rust (LSP server + extension) ---
+    { id = "cargo-fmt",
+      name = "cargo fmt --check",
+      language = "system",
+      entry = "cargo fmt --check",
+      files = "\\.rs$",
+      pass_filenames = false },
+
+    { id = "cargo-clippy",
+      name = "cargo clippy",
+      language = "system",
+      entry = "cargo clippy -- -D warnings",
+      files = "\\.rs$",
+      pass_filenames = false },
+
+    { id = "cargo-test",
+      name = "cargo test",
+      language = "system",
+      entry = "cargo test",
+      files = "\\.rs$",
+      pass_filenames = false },
+
+    # --- JVM sidecar (Kotlin + Gradle) ---
+    { id = "sidecar-test",
+      name = "sidecar ./gradlew test",
+      language = "system",
+      entry = "bash -c 'cd sidecar && ./gradlew test'",
+      files = "sidecar/.*\\.(kt|kts|gradle\\.kts)$",
+      pass_filenames = false },
+]
