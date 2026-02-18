@@ -1,0 +1,24 @@
+# Rust build output
+/target/
+
+# Cargo lock is committed for WASM extensions
+# Cargo.lock
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# macOS
+.DS_Store
+
+# Sidecar build output (future)
+sidecar/build/
+sidecar/.gradle/
+
+# Spike build output
+spike/analysis-api/build/
+spike/analysis-api/.gradle/
+
+# Ralph loop output
+.ralph-loop-output/

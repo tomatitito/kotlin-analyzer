@@ -42,40 +42,40 @@ This is a **gate for M2** — do not begin sidecar implementation until the spik
 
 Establish the Zed extension, tree-sitter integration, and CI pipeline. No LSP server yet — this milestone delivers syntax-level features only.
 
-- [ ] Fork `zed-extensions/zed-kotlin` as the starting point
-- [ ] Zed extension scaffold (`extension.toml`, `Cargo.toml`, `src/lib.rs`)
-- [ ] Language registration with `fwcd/tree-sitter-kotlin` grammar
-- [ ] Port and improve tree-sitter queries from the existing extension
-  - [ ] `highlights.scm` — review and improve coverage for Kotlin 2.x syntax
-  - [ ] `outline.scm` — ensure classes, functions, properties, objects, enums, interfaces appear
-  - [ ] `indents.scm` — review and test
-  - [ ] `brackets.scm`, `injections.scm`, `overrides.scm` — carry forward
-- [ ] Write `textobjects.scm` (function, class, comment, parameter text objects)
-- [ ] Write `runnables.scm` (detect `fun main()` and `@Test` annotated functions)
-- [ ] Create Kotlin source fixture files (see `docs/testing.md` §3.2)
-  - [ ] `correct/` files: BasicConstructs, ClassHierarchy, DataAndSealed, ExtensionFunctions, Generics, NullSafety, Lambdas, Collections, TypeAliases, Delegation, Annotations, MainFunction, OutlineShowcase
-  - [ ] `errors/` files: TypeMismatch, UnresolvedReference, MissingOverride, WrongArgCount, NullViolation, ReturnTypeMismatch, DuplicateDeclaration, AbstractInstantiation, ValReassignment, VisibilityViolation, MissingSuperCall
-  - [ ] `warnings/` files: UnusedVariable, UnusedImport, UnusedParameter, DeprecatedUsage, RedundantCast, UnnecessarySafeCall, UnreachableCode, RedundantIf
-  - [ ] `edge-cases/` files: Empty, OnlyComments, OnlyPackage, SyntaxError, UnicodeIdentifiers
-  - [ ] `compiler-flags/` files: ContextParameters, MultiDollarInterpolation, ContextReceivers
-- [ ] Verify tree-sitter queries against fixture files
-  - [ ] Run `highlights.scm` against all `correct/` files, verify no missing or incorrect highlights
-  - [ ] Run `outline.scm` against `OutlineShowcase.kt`, verify all classes, functions, objects, enums, interfaces appear
-  - [ ] Run `runnables.scm` against `MainFunction.kt`, verify `fun main()` is detected
-  - [ ] Run `runnables.scm` against `TestClass.kt`, verify `@Test` functions are detected
-  - [ ] Run `textobjects.scm` against `ClassHierarchy.kt` and `Lambdas.kt`, verify function and class boundaries
-  - [ ] Verify `SyntaxError.kt` produces a partial tree with `ERROR` node, does not hang
-- [ ] **CHECKPOINT: Verify extension loads and tree-sitter works in Zed**
-  - [ ] Add `eprintln!` log statements in `src/lib.rs` at language registration to confirm extension initialization
-  - [ ] Start Zed in foreground mode via tmux: `tmux new-session -d -s zed 'zed --foreground /path/to/fixtures'`
-  - [ ] Attach to the tmux session (`tmux attach -t zed`) and verify log output shows the kotlin-analyzer extension loaded successfully
-  - [ ] Open `tests/fixtures/kotlin/correct/BasicConstructs.kt` in Zed
-  - [ ] Use Peekaboo to capture an annotated screenshot: `peekaboo see --app Zed --annotate`
-  - [ ] Verify syntax highlighting is applied — keywords, types, strings, and comments should show distinct colors
-  - [ ] Open `tests/fixtures/kotlin/correct/OutlineShowcase.kt`, open the outline panel, verify classes/functions/objects/enums/interfaces appear
-  - [ ] Open `tests/fixtures/kotlin/correct/MainFunction.kt`, verify runnables gutter icon appears for `fun main()`
-  - [ ] Open `tests/fixtures/kotlin/edge-cases/SyntaxError.kt`, verify partial highlighting renders without crash or hang
-  - [ ] Capture a Peekaboo screenshot for each verification step — these serve as visual regression references
+- [x] Fork `zed-extensions/zed-kotlin` as the starting point
+- [x] Zed extension scaffold (`extension.toml`, `Cargo.toml`, `src/lib.rs`)
+- [x] Language registration with `fwcd/tree-sitter-kotlin` grammar
+- [x] Port and improve tree-sitter queries from the existing extension
+  - [x] `highlights.scm` — review and improve coverage for Kotlin 2.x syntax
+  - [x] `outline.scm` — ensure classes, functions, properties, objects, enums, interfaces appear
+  - [x] `indents.scm` — review and test
+  - [x] `brackets.scm`, `injections.scm`, `overrides.scm` — carry forward
+- [x] Write `textobjects.scm` (function, class, comment, parameter text objects)
+- [x] Write `runnables.scm` (detect `fun main()` and `@Test` annotated functions)
+- [x] Create Kotlin source fixture files (see `docs/testing.md` §3.2)
+  - [x] `correct/` files: BasicConstructs, ClassHierarchy, DataAndSealed, ExtensionFunctions, Generics, NullSafety, Lambdas, Collections, TypeAliases, Delegation, Annotations, MainFunction, OutlineShowcase
+  - [x] `errors/` files: TypeMismatch, UnresolvedReference, MissingOverride, WrongArgCount, NullViolation, ReturnTypeMismatch, DuplicateDeclaration, AbstractInstantiation, ValReassignment, VisibilityViolation, MissingSuperCall
+  - [x] `warnings/` files: UnusedVariable, UnusedImport, UnusedParameter, DeprecatedUsage, RedundantCast, UnnecessarySafeCall, UnreachableCode, RedundantIf
+  - [x] `edge-cases/` files: Empty, OnlyComments, OnlyPackage, SyntaxError, UnicodeIdentifiers
+  - [x] `compiler-flags/` files: ContextParameters, MultiDollarInterpolation, ContextReceivers
+- [x] Verify tree-sitter queries against fixture files
+  - [x] Run `highlights.scm` against all `correct/` files, verify no missing or incorrect highlights
+  - [x] Run `outline.scm` against `OutlineShowcase.kt`, verify all classes, functions, objects, enums, interfaces appear
+  - [x] Run `runnables.scm` against `MainFunction.kt`, verify `fun main()` is detected
+  - [x] Run `runnables.scm` against `TestClass.kt`, verify `@Test` functions are detected
+  - [x] Run `textobjects.scm` against `ClassHierarchy.kt` and `Lambdas.kt`, verify function and class boundaries
+  - [x] Verify `SyntaxError.kt` produces a partial tree with `ERROR` node, does not hang
+- [x] **CHECKPOINT: Verify extension loads and tree-sitter works in Zed**
+  - [x] Add `eprintln!` log statements in `src/lib.rs` at language registration to confirm extension initialization
+  - [x] Start Zed in foreground mode via tmux: `tmux new-session -d -s zed 'zed --foreground /path/to/fixtures'`
+  - [x] Attach to the tmux session (`tmux attach -t zed`) and verify log output shows the kotlin-analyzer extension loaded successfully
+  - [x] Open `tests/fixtures/kotlin/correct/BasicConstructs.kt` in Zed
+  - [x] Use Peekaboo to capture an annotated screenshot: `peekaboo see --app Zed --annotate`
+  - [x] Verify syntax highlighting is applied — keywords, types, strings, and comments should show distinct colors
+  - [x] Open `tests/fixtures/kotlin/correct/OutlineShowcase.kt`, open the outline panel, verify classes/functions/objects/enums/interfaces appear
+  - [x] Open `tests/fixtures/kotlin/correct/MainFunction.kt`, verify runnables gutter icon appears for `fun main()`
+  - [x] Open `tests/fixtures/kotlin/edge-cases/SyntaxError.kt`, verify partial highlighting renders without crash or hang
+  - [x] Capture a Peekaboo screenshot for each verification step — these serve as visual regression references
 - [ ] Set up GitHub Actions CI workflow
   - [ ] Build matrix for platform targets
   - [ ] Cross-platform Rust binary builds (using `cargo-zigbuild`)
