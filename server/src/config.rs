@@ -7,6 +7,7 @@ pub struct Config {
     pub compiler_flags: Vec<String>,
     pub formatting_tool: FormattingTool,
     pub formatting_style: String,
+    pub formatting_path: Option<String>,
     pub sidecar_max_memory: String,
     pub trace_server: TraceLevel,
 }
@@ -18,6 +19,7 @@ impl Default for Config {
             compiler_flags: Vec::new(),
             formatting_tool: FormattingTool::Ktfmt,
             formatting_style: "google".into(),
+            formatting_path: None,
             sidecar_max_memory: "512m".into(),
             trace_server: TraceLevel::Off,
         }

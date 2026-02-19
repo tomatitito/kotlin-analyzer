@@ -142,8 +142,8 @@ Once the sidecar project scaffold exists, verify it builds and its tests pass be
 - [x] JSON-RPC client in Rust for communicating with the sidecar
 - [x] Sidecar lifecycle manager: spawn JVM process, manage stdin/stdout pipes
 - [x] Startup state machine: `Starting` -> `Ready` -> `Degraded` -> `Stopped`
-- [ ] Health check via periodic heartbeat RPC
-- [ ] Crash detection and automatic restart with exponential backoff
+- [x] Health check via periodic heartbeat RPC
+- [x] Crash detection and automatic restart with exponential backoff
 - [x] Graceful shutdown: send `shutdown` RPC, wait, then terminate process
 
 ### Project Model
@@ -152,7 +152,7 @@ Once the sidecar project scaffold exists, verify it builds and its tests pass be
 - [x] Classpath extraction via Gradle init script
 - [x] Compiler flag extraction (`freeCompilerArgs`, `compilerOptions`)
 - [x] Project model caching to disk (avoid re-running Gradle on every startup)
-- [ ] Build file watching with debounced re-extraction (watch `build.gradle.kts`, `settings.gradle.kts`, `gradle.properties`)
+- [x] Build file watching with debounced re-extraction (watch `build.gradle.kts`, `settings.gradle.kts`, `gradle.properties`)
 
 ### Diagnostics
 
@@ -212,58 +212,58 @@ Build the semantic features that make the LSP useful for daily Kotlin developmen
 
 ### Navigation and Intelligence
 
-- [ ] Go-to-definition (`textDocument/definition`)
+- [x] Go-to-definition (`textDocument/definition`)
   - Local variables, functions, classes
   - Stdlib and dependency symbols (navigate to decompiled stubs)
-- [ ] Hover (`textDocument/hover`)
+- [x] Hover (`textDocument/hover`)
   - Type information for variables and expressions
   - KDoc rendering for functions and classes
   - Signature display for function calls
-- [ ] Completion (`textDocument/completion`)
+- [x] Completion (`textDocument/completion`)
   - Type-aware completions (methods, properties, functions in scope)
   - Auto-import suggestions for unresolved symbols
   - Keyword completions in appropriate contexts
   - Snippet completions for common patterns (`if`, `when`, `fun`)
-- [ ] Signature help (`textDocument/signatureHelp`)
+- [x] Signature help (`textDocument/signatureHelp`)
   - Parameter hints when typing function arguments
   - Highlight active parameter
 
 ### Formatting
 
-- [ ] Formatting via `textDocument/formatting`
-- [ ] Shell to external formatter (ktfmt or ktlint, configurable)
-- [ ] Formatter binary discovery (PATH lookup, configurable path)
-- [ ] Handle formatter not found (clear error message, no crash)
-- [ ] `.editorconfig` support
-  - [ ] Ensure the formatter is invoked with the project root as its working directory so it discovers `.editorconfig` files (ktlint reads them natively)
-  - [ ] Watch `**/.editorconfig` for changes (add to `workspace/didChangeWatchedFiles` registrations)
+- [x] Formatting via `textDocument/formatting`
+- [x] Shell to external formatter (ktfmt or ktlint, configurable)
+- [x] Formatter binary discovery (PATH lookup, configurable path)
+- [x] Handle formatter not found (clear error message, no crash)
+- [x] `.editorconfig` support
+  - [x] Ensure the formatter is invoked with the project root as its working directory so it discovers `.editorconfig` files (ktlint reads them natively)
+  - [x] Watch `**/.editorconfig` for changes (add to `workspace/didChangeWatchedFiles` registrations)
   - [ ] On `.editorconfig` change: invalidate any cached formatting state and re-format open files if the user has format-on-save enabled
   - [ ] For ktfmt: map applicable `.editorconfig` properties (`max_line_length` → `--max-width`) since ktfmt does not read `.editorconfig` natively
   - [ ] Respect per-section overrides (e.g., `[{*.kt,*.kts}]` for Kotlin-specific settings, `[src/test/**/*.kt]` for test-specific rule disabling)
-  - [ ] Pass through ktlint-specific `.editorconfig` properties (`ktlint_code_style`, `ktlint_standard_*` rule toggles) — these are handled by ktlint itself, but the LSP must not interfere with them
+  - [x] Pass through ktlint-specific `.editorconfig` properties (`ktlint_code_style`, `ktlint_standard_*` rule toggles) — these are handled by ktlint itself, but the LSP must not interfere with them
 
 ### Request Management
 
-- [ ] Cancellation propagation: LSP `$/cancelRequest` -> Rust -> sidecar
+- [x] Cancellation propagation: LSP `$/cancelRequest` -> Rust -> sidecar
 - [ ] Backpressure handling: bounded request channels, supersede stale completion/hover requests
 - [ ] Request prioritization: cancellation > document sync > diagnostics > completion > hover
 
 ### Kotlin-Specific Support
 
-- [ ] Compose compiler plugin detection (look for `org.jetbrains.compose` or `kotlin("plugin.compose")` in build file)
+- [x] Compose compiler plugin detection (look for `org.jetbrains.compose` or `kotlin("plugin.compose")` in build file)
 - [ ] Compose compiler plugin loading in sidecar environment
-- [ ] KAPT generated source roots (`build/generated/source/kapt/`)
-- [ ] KSP generated source roots (`build/generated/ksp/`)
+- [x] KAPT generated source roots (`build/generated/source/kapt/`)
+- [x] KSP generated source roots (`build/generated/ksp/`)
 
 ### Configuration
 
-- [ ] Configuration schema passed from extension to LSP:
+- [x] Configuration schema passed from extension to LSP:
   - `kotlin-analyzer.javaHome`: override JVM path
   - `kotlin-analyzer.compiler.flags`: additional compiler flags
   - `kotlin-analyzer.formatting.formatter`: `ktfmt` | `ktlint` | `none`
   - `kotlin-analyzer.formatting.path`: path to formatter binary
   - `kotlin-analyzer.sidecar.maxMemory`: JVM `-Xmx` value (default: `512m`)
-- [ ] Progress notifications during sidecar initialization (`window/workDoneProgress`)
+- [x] Progress notifications during sidecar initialization (`window/workDoneProgress`)
 
 ### Testing
 
@@ -326,11 +326,11 @@ Harden the system, measure performance, fill gaps, write documentation, and publ
 
 ### Fallback Support
 
-- [ ] Maven project support (`pom.xml` detection, `dependency:build-classpath` for classpath)
-- [ ] Manual configuration fallback (`.kotlin-analyzer.json` in project root)
+- [x] Maven project support (`pom.xml` detection, `dependency:build-classpath` for classpath)
+- [x] Manual configuration fallback (`.kotlin-analyzer.json` in project root)
   - Specify source roots, classpath entries, compiler flags manually
   - For projects without Gradle or Maven, or when automatic extraction fails
-- [ ] No-build-system fallback (analyze `.kt` files with stdlib only)
+- [x] No-build-system fallback (analyze `.kt` files with stdlib only)
 
 ### Error Handling and User Experience
 
@@ -363,18 +363,18 @@ Before writing documentation and publishing, verify that error states and fallba
 
 ### Documentation
 
-- [ ] README with:
+- [x] README with:
   - What kotlin-analyzer is and what it provides
   - Installation instructions (Zed extension install)
   - JDK requirement and setup
   - Configuration reference
   - Troubleshooting guide
-- [ ] CHANGELOG for the initial release
+- [x] CHANGELOG for the initial release
 
 ### Legal and Publishing
 
 - [x] License selection: **Apache 2.0** (compatible with `zed-kotlin` fork [Apache 2.0] and `kotlin-compiler-embeddable` [Apache 2.0])
-- [ ] Add `LICENSE` file to repository root
+- [x] Add `LICENSE` file to repository root
 - [ ] Publish extension to Zed extension registry
 - [ ] Create GitHub release with binaries (`gh release create v0.1.0 --title "..." --notes "..." *.tar.gz`)
 
@@ -391,15 +391,15 @@ Before writing documentation and publishing, verify that error states and fallba
 These features are explicitly out of scope for v1. They will be considered based on user demand after the initial release.
 
 ### Additional LSP Features
-- Find references (`textDocument/references`)
-- Rename symbol (`textDocument/rename`)
-- Code actions and quickfixes (`textDocument/codeAction`)
-- Workspace symbols (`workspace/symbol`)
-- Inlay hints (`textDocument/inlayHint`)
-- Semantic tokens (`textDocument/semanticTokens`)
-- Call hierarchy (`callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`)
-- Type hierarchy (`typeHierarchy/supertypes`, `typeHierarchy/subtypes`)
-- Code lens (`textDocument/codeLens`)
+- [x] Find references (`textDocument/references`)
+- [x] Rename symbol (`textDocument/rename`)
+- [x] Code actions and quickfixes (`textDocument/codeAction`)
+- [x] Workspace symbols (`workspace/symbol`)
+- [x] Inlay hints (`textDocument/inlayHint`)
+- [x] Semantic tokens (`textDocument/semanticTokens`)
+- [x] Call hierarchy (`callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`)
+- [x] Type hierarchy (`typeHierarchy/supertypes`, `typeHierarchy/subtypes`)
+- [x] Code lens (`textDocument/codeLens`)
 
 ### Project Support
 - `.kts` scripting support (build scripts, standalone scripts)

@@ -57,6 +57,16 @@ class AnalysisServer(
             "references" -> handleReferences(request)
             "signatureHelp" -> handleSignatureHelp(request)
             "formatting" -> handleFormatting(request)
+            "rename" -> handleRename(request)
+            "codeActions" -> handleCodeActions(request)
+            "workspaceSymbols" -> handleWorkspaceSymbols(request)
+            "inlayHints" -> handleInlayHints(request)
+            "codeLens" -> handleCodeLens(request)
+            "semanticTokens" -> handleSemanticTokens(request)
+            "callHierarchy/prepare" -> handleCallHierarchyPrepare(request)
+            "callHierarchy/incoming" -> handleCallHierarchyIncoming(request)
+            "typeHierarchy/prepare" -> handleTypeHierarchyPrepare(request)
+            "typeHierarchy/supertypes" -> handleTypeHierarchySupertypes(request)
             "$/cancelRequest" -> {
                 // Best-effort cancellation - currently a no-op since we process sequentially
             }
@@ -237,6 +247,193 @@ class AnalysisServer(
         // For now, return empty edits
         val result = JsonObject()
         result.add("edits", com.google.gson.JsonArray())
+        transport.sendResult(request.id, result)
+    }
+
+    private fun handleRename(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("edits", com.google.gson.JsonArray()) })
+            return
+        }
+        val uri = params.get("uri")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("edits", com.google.gson.JsonArray()) })
+            return
+        }
+        val line = params.get("line")?.asInt ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("edits", com.google.gson.JsonArray()) })
+            return
+        }
+        val character = params.get("character")?.asInt ?: 0
+        val newName = params.get("newName")?.asString ?: run {
+            transport.sendError(request.id, -32602, "Missing newName param")
+            return
+        }
+
+        val result = bridge.rename(uri, line, character, newName)
+        transport.sendResult(request.id, result)
+    }
+
+    private fun handleCodeActions(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("actions", com.google.gson.JsonArray()) })
+            return
+        }
+        val uri = params.get("uri")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("actions", com.google.gson.JsonArray()) })
+            return
+        }
+        val line = params.get("line")?.asInt ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("actions", com.google.gson.JsonArray()) })
+            return
+        }
+        val character = params.get("character")?.asInt ?: 0
+
+        val result = bridge.codeActions(uri, line, character)
+        transport.sendResult(request.id, result)
+    }
+
+    private fun handleWorkspaceSymbols(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("symbols", com.google.gson.JsonArray()) })
+            return
+        }
+        val query = params.get("query")?.asString ?: ""
+
+        val result = bridge.workspaceSymbols(query)
+        transport.sendResult(request.id, result)
+    }
+
+    private fun handleInlayHints(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("hints", com.google.gson.JsonArray()) })
+            return
+        }
+        val uri = params.get("uri")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("hints", com.google.gson.JsonArray()) })
+            return
+        }
+        val startLine = params.get("startLine")?.asInt ?: 1
+        val endLine = params.get("endLine")?.asInt ?: Int.MAX_VALUE
+
+        val result = bridge.inlayHints(uri, startLine, endLine)
+        transport.sendResult(request.id, result)
+    }
+
+    private fun handleCodeLens(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("lenses", com.google.gson.JsonArray()) })
+            return
+        }
+        val uri = params.get("uri")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("lenses", com.google.gson.JsonArray()) })
+            return
+        }
+
+        val result = bridge.codeLens(uri)
+        transport.sendResult(request.id, result)
+    }
+
+    private fun handleSemanticTokens(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply {
+                add("data", com.google.gson.JsonArray())
+                add("legend", JsonObject())
+            })
+            return
+        }
+        val uri = params.get("uri")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply {
+                add("data", com.google.gson.JsonArray())
+                add("legend", JsonObject())
+            })
+            return
+        }
+
+        val result = bridge.semanticTokens(uri)
+        transport.sendResult(request.id, result)
+    }
+
+    private fun handleCallHierarchyPrepare(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("items", com.google.gson.JsonArray()) })
+            return
+        }
+        val uri = params.get("uri")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("items", com.google.gson.JsonArray()) })
+            return
+        }
+        val line = params.get("line")?.asInt ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("items", com.google.gson.JsonArray()) })
+            return
+        }
+        val character = params.get("character")?.asInt ?: 0
+
+        val result = bridge.callHierarchyPrepare(uri, line, character)
+        transport.sendResult(request.id, result)
+    }
+
+    private fun handleCallHierarchyIncoming(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("calls", com.google.gson.JsonArray()) })
+            return
+        }
+        val uri = params.get("uri")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("calls", com.google.gson.JsonArray()) })
+            return
+        }
+        val line = params.get("line")?.asInt ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("calls", com.google.gson.JsonArray()) })
+            return
+        }
+        val character = params.get("character")?.asInt ?: 0
+        val name = params.get("name")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("calls", com.google.gson.JsonArray()) })
+            return
+        }
+
+        val result = bridge.callHierarchyIncoming(uri, line, character, name)
+        transport.sendResult(request.id, result)
+    }
+
+    private fun handleTypeHierarchyPrepare(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("items", com.google.gson.JsonArray()) })
+            return
+        }
+        val uri = params.get("uri")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("items", com.google.gson.JsonArray()) })
+            return
+        }
+        val line = params.get("line")?.asInt ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("items", com.google.gson.JsonArray()) })
+            return
+        }
+        val character = params.get("character")?.asInt ?: 0
+
+        val result = bridge.typeHierarchyPrepare(uri, line, character)
+        transport.sendResult(request.id, result)
+    }
+
+    private fun handleTypeHierarchySupertypes(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("supertypes", com.google.gson.JsonArray()) })
+            return
+        }
+        val uri = params.get("uri")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("supertypes", com.google.gson.JsonArray()) })
+            return
+        }
+        val line = params.get("line")?.asInt ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("supertypes", com.google.gson.JsonArray()) })
+            return
+        }
+        val character = params.get("character")?.asInt ?: 0
+        val name = params.get("name")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("supertypes", com.google.gson.JsonArray()) })
+            return
+        }
+
+        val result = bridge.typeHierarchySupertypes(uri, line, character, name)
         transport.sendResult(request.id, result)
     }
 }

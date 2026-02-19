@@ -16,6 +16,12 @@ pub struct ProjectModel {
     pub compiler_flags: Vec<String>,
     pub kotlin_version: Option<String>,
     pub jdk_home: Option<PathBuf>,
+    /// Whether the project uses Jetpack Compose.
+    #[serde(default)]
+    pub has_compose: bool,
+    /// Generated source roots (KAPT, KSP).
+    #[serde(default)]
+    pub generated_source_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -36,6 +42,8 @@ impl ProjectModel {
             compiler_flags: Vec::new(),
             kotlin_version: None,
             jdk_home: None,
+            has_compose: false,
+            generated_source_roots: Vec::new(),
         }
     }
 }
@@ -52,7 +60,20 @@ pub fn detect_build_system(root: &Path) -> BuildSystem {
 }
 
 /// Resolves the project model from the build system.
+///
+/// Resolution order:
+/// 1. Manual `.kotlin-analyzer.json` in project root (always takes priority)
+/// 2. Gradle (`build.gradle.kts` or `build.gradle`)
+/// 3. Maven (`pom.xml`)
+/// 4. Stdlib-only fallback (analyze `.kt` files with no classpath)
 pub fn resolve_project(root: &Path, config: &Config) -> Result<ProjectModel, Error> {
+    // Check for manual configuration first
+    let manual_config = root.join(".kotlin-analyzer.json");
+    if manual_config.exists() {
+        tracing::info!("using manual project configuration from .kotlin-analyzer.json");
+        return resolve_manual_config(&manual_config, root, config);
+    }
+
     let build_system = detect_build_system(root);
 
     match build_system {
@@ -116,6 +137,19 @@ allprojects {
                 if (kotlinVersion != null) sb.appendLine("KOTLIN_VERSION=$kotlinVersion")
             } catch (_: Exception) {}
 
+            // Compose detection
+            val hasCompose = project.plugins.hasPlugin("org.jetbrains.compose") ||
+                project.plugins.hasPlugin("org.jetbrains.kotlin.plugin.compose")
+            if (hasCompose) sb.appendLine("HAS_COMPOSE=true")
+
+            // KAPT generated sources
+            val kaptDir = project.layout.buildDirectory.dir("generated/source/kapt/main").get().asFile
+            if (kaptDir.exists()) sb.appendLine("GENERATED_SOURCE_ROOT=${kaptDir.absolutePath}")
+
+            // KSP generated sources
+            val kspDir = project.layout.buildDirectory.dir("generated/ksp/main/kotlin").get().asFile
+            if (kspDir.exists()) sb.appendLine("GENERATED_SOURCE_ROOT=${kspDir.absolutePath}")
+
             sb.appendLine("---KOTLIN-ANALYZER-END---")
             println(sb.toString())
         }
@@ -162,6 +196,8 @@ fn parse_gradle_output(output: &str, root: &Path, config: &Config) -> Result<Pro
         compiler_flags: Vec::new(),
         kotlin_version: None,
         jdk_home: config.java_home.as_ref().map(PathBuf::from),
+        has_compose: false,
+        generated_source_roots: Vec::new(),
     };
 
     let mut in_section = false;
@@ -187,6 +223,10 @@ fn parse_gradle_output(output: &str, root: &Path, config: &Config) -> Result<Pro
             model.compiler_flags.push(flag.to_string());
         } else if let Some(version) = line.strip_prefix("KOTLIN_VERSION=") {
             model.kotlin_version = Some(version.to_string());
+        } else if line == "HAS_COMPOSE=true" {
+            model.has_compose = true;
+        } else if let Some(path) = line.strip_prefix("GENERATED_SOURCE_ROOT=") {
+            model.generated_source_roots.push(PathBuf::from(path));
         }
     }
 
@@ -242,12 +282,94 @@ fn resolve_maven_project(root: &Path, config: &Config) -> Result<ProjectModel, E
         compiler_flags: config.compiler_flags.clone(),
         kotlin_version: None,
         jdk_home: config.java_home.as_ref().map(PathBuf::from),
+        has_compose: false,
+        generated_source_roots: Vec::new(),
     };
 
     // Filter to existing source roots
     model.source_roots.retain(|p| p.exists());
 
     Ok(model)
+}
+
+/// Manual project configuration file format.
+/// Users create `.kotlin-analyzer.json` in the project root for projects
+/// without Gradle/Maven or when automatic extraction fails.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManualProjectConfig {
+    #[serde(default)]
+    source_roots: Vec<String>,
+    #[serde(default)]
+    classpath: Vec<String>,
+    #[serde(default)]
+    compiler_flags: Vec<String>,
+    #[serde(default)]
+    kotlin_version: Option<String>,
+    #[serde(default)]
+    jdk_home: Option<String>,
+}
+
+fn resolve_manual_config(
+    config_path: &Path,
+    root: &Path,
+    lsp_config: &Config,
+) -> Result<ProjectModel, Error> {
+    let content = std::fs::read_to_string(config_path).map_err(Error::Io)?;
+    let manual: ManualProjectConfig = serde_json::from_str(&content)
+        .map_err(|e| ProjectError::ClasspathExtraction(format!("invalid .kotlin-analyzer.json: {e}")))?;
+
+    let source_roots: Vec<PathBuf> = manual
+        .source_roots
+        .iter()
+        .map(|p| {
+            let path = PathBuf::from(p);
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(p)
+            }
+        })
+        .filter(|p| p.exists())
+        .collect();
+
+    let classpath: Vec<PathBuf> = manual
+        .classpath
+        .iter()
+        .map(|p| {
+            let path = PathBuf::from(p);
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(p)
+            }
+        })
+        .filter(|p| p.exists())
+        .collect();
+
+    let mut compiler_flags = manual.compiler_flags;
+    for flag in &lsp_config.compiler_flags {
+        if !compiler_flags.contains(flag) {
+            compiler_flags.push(flag.clone());
+        }
+    }
+
+    let jdk_home = manual
+        .jdk_home
+        .map(PathBuf::from)
+        .or_else(|| lsp_config.java_home.as_ref().map(PathBuf::from));
+
+    Ok(ProjectModel {
+        project_root: root.to_path_buf(),
+        build_system: BuildSystem::None,
+        source_roots,
+        classpath,
+        compiler_flags,
+        kotlin_version: manual.kotlin_version,
+        jdk_home,
+        has_compose: false,
+        generated_source_roots: Vec::new(),
+    })
 }
 
 fn find_gradle_wrapper(root: &Path) -> PathBuf {
@@ -364,5 +486,57 @@ COMPILER_FLAG=-Xcontext-parameters
         let model = ProjectModel::no_build_system(PathBuf::from("/project"));
         assert_eq!(model.build_system, BuildSystem::None);
         assert!(model.classpath.is_empty());
+    }
+
+    #[test]
+    fn manual_config_overrides_detection() {
+        let dir = TempDir::new().unwrap();
+        // Even with a build.gradle.kts present, .kotlin-analyzer.json takes priority
+        fs::write(dir.path().join("build.gradle.kts"), "").unwrap();
+        fs::write(
+            dir.path().join(".kotlin-analyzer.json"),
+            r#"{
+                "compilerFlags": ["-Xcontext-parameters"],
+                "kotlinVersion": "2.1.20"
+            }"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let model = resolve_project(dir.path(), &config).unwrap();
+        assert_eq!(model.compiler_flags, vec!["-Xcontext-parameters"]);
+        assert_eq!(model.kotlin_version, Some("2.1.20".into()));
+    }
+
+    #[test]
+    fn manual_config_relative_paths() {
+        let dir = TempDir::new().unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(
+            dir.path().join(".kotlin-analyzer.json"),
+            r#"{"sourceRoots": ["src"]}"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let model = resolve_project(dir.path(), &config).unwrap();
+        assert_eq!(model.source_roots.len(), 1);
+        assert_eq!(model.source_roots[0], src_dir);
+    }
+
+    #[test]
+    fn manual_config_merges_lsp_flags() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".kotlin-analyzer.json"),
+            r#"{"compilerFlags": ["-Xcontext-parameters"]}"#,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.compiler_flags = vec!["-Xmulti-dollar-interpolation".into()];
+        let model = resolve_project(dir.path(), &config).unwrap();
+        assert_eq!(model.compiler_flags.len(), 2);
     }
 }
