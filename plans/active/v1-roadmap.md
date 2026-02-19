@@ -81,7 +81,8 @@ Establish the Zed extension, tree-sitter integration, and CI pipeline. No LSP se
   - [ ] Cross-platform Rust binary builds (using `cargo-zigbuild`)
   - [ ] Sidecar JAR build step (Gradle `shadowJar`)
   - [ ] Automated packaging into release archives (`.tar.gz`, `.zip`)
-  - [ ] Tag-triggered release creation on GitHub
+  - [ ] Tag-triggered release creation on GitHub (use `gh release create` for manual/local releases)
+  - [ ] Verify CI runs with `gh run list` and `gh run view`
 
 ---
 
@@ -376,12 +377,12 @@ Before writing documentation and publishing, verify that error states and fallba
 - [x] License selection: **Apache 2.0** (compatible with `zed-kotlin` fork [Apache 2.0] and `kotlin-compiler-embeddable` [Apache 2.0])
 - [ ] Add `LICENSE` file to repository root
 - [ ] Publish extension to Zed extension registry
-- [ ] Create GitHub release with binaries
+- [ ] Create GitHub release with binaries (`gh release create v0.1.0 --title "..." --notes "..." *.tar.gz`)
 
 ### Feedback
 
 - [ ] Announce availability (Zed community, Kotlin community)
-- [ ] Set up issue templates for bug reports and feature requests
+- [ ] Set up issue templates for bug reports and feature requests (use `gh` to manage issues)
 - [ ] Gather initial user feedback, triage into backlog
 
 ---
