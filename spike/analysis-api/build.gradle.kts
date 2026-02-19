@@ -56,6 +56,13 @@ application {
 
 kotlin {
     jvmToolchain(17)
+    compilerOptions {
+        freeCompilerArgs.addAll(
+            "-opt-in=org.jetbrains.kotlin.analysis.api.KaExperimentalApi",
+            "-opt-in=org.jetbrains.kotlin.analysis.api.KaNonPublicApi",
+            "-opt-in=org.jetbrains.kotlin.analysis.api.KaIdeApi",
+        )
+    }
 }
 
 tasks.named<JavaExec>("run") {

@@ -75,6 +75,14 @@ kotlin {
 
 tasks.test {
     useJUnitPlatform()
+    // Analysis API requires reflective access to java.base internals
+    jvmArgs(
+        "--add-opens", "java.base/java.lang=ALL-UNNAMED",
+        "--add-opens", "java.base/java.lang.reflect=ALL-UNNAMED",
+        "--add-opens", "java.base/java.util=ALL-UNNAMED",
+    )
+    // Integration tests need enough heap for the Analysis API session
+    maxHeapSize = "1g"
 }
 
 tasks.named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar") {

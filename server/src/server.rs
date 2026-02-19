@@ -41,13 +41,20 @@ impl KotlinLanguageServer {
 
     /// Publishes diagnostics for a document by requesting analysis from the sidecar.
     async fn analyze_document(&self, uri: &Url) {
+        tracing::info!("analyze_document: {}", uri);
+
         let bridge = self.bridge.lock().await;
         let bridge = match bridge.as_ref() {
             Some(b) => b,
-            None => return,
+            None => {
+                tracing::warn!("analyze_document: bridge is None, skipping");
+                return;
+            }
         };
 
-        if bridge.state().await != SidecarState::Ready {
+        let state = bridge.state().await;
+        if state != SidecarState::Ready {
+            tracing::warn!("analyze_document: sidecar state is {:?}, skipping", state);
             return;
         }
 
@@ -83,12 +90,16 @@ impl KotlinLanguageServer {
         {
             Ok(result) => {
                 let diagnostics = self.parse_diagnostics(&result);
+                tracing::info!("analyze_document: {} returned {} diagnostics", uri, diagnostics.len());
+                for d in &diagnostics {
+                    tracing::info!("  diagnostic: {:?} at L{}:{} - {}", d.severity, d.range.start.line, d.range.start.character, d.message);
+                }
                 self.client
                     .publish_diagnostics(uri.clone(), diagnostics, None)
                     .await;
             }
             Err(e) => {
-                tracing::warn!("analysis failed for {}: {}", uri, e);
+                tracing::warn!("analyze_document: analysis failed for {}: {}", uri, e);
             }
         }
     }
@@ -259,43 +270,11 @@ impl LanguageServer for KotlinLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
         tracing::info!("kotlin-analyzer: initializing");
 
-        // Store project root
+        // Store project root (project model resolution happens in initialized())
         if let Some(root_uri) = params.root_uri {
             if let Ok(path) = root_uri.to_file_path() {
                 let mut project_root = self.project_root.lock().await;
-                *project_root = Some(path.clone());
-
-                // Resolve project model in background
-                let config = self.config.lock().await.clone();
-                let client = self.client.clone();
-
-                tokio::spawn(async move {
-                    match project::resolve_project(&path, &config) {
-                        Ok(model) => {
-                            tracing::info!(
-                                "project resolved: {} source roots, {} classpath entries, {} compiler flags",
-                                model.source_roots.len(),
-                                model.classpath.len(),
-                                model.compiler_flags.len()
-                            );
-
-                            // Cache the project model
-                            let cache_dir = path.join(".kotlin-analyzer");
-                            if let Err(e) = project::save_cache(&model, &cache_dir) {
-                                tracing::warn!("failed to cache project model: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("project resolution failed: {}", e);
-                            let _ = client
-                                .show_message(
-                                    MessageType::WARNING,
-                                    format!("kotlin-analyzer: {}", e),
-                                )
-                                .await;
-                        }
-                    }
-                });
+                *project_root = Some(path);
             }
         }
 
@@ -454,9 +433,11 @@ impl LanguageServer for KotlinLanguageServer {
         let client = self.client.clone();
         let bridge_holder = Arc::clone(&self.bridge);
         let config = self.config.lock().await.clone();
+        let project_root = self.project_root.lock().await.clone();
 
+        tracing::info!("About to spawn background task for sidecar startup");
         tokio::spawn(async move {
-            tracing::debug!("initialized: background task started");
+            tracing::info!("initialized: background task started - spawned successfully");
 
             // Create progress token
             let token = NumberOrString::String("kotlin-analyzer-startup".to_string());
@@ -484,7 +465,7 @@ impl LanguageServer for KotlinLanguageServer {
                     value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
                         WorkDoneProgressBegin {
                             title: "Starting Kotlin sidecar".to_string(),
-                            message: Some("Initializing JVM...".to_string()),
+                            message: Some("Resolving project...".to_string()),
                             percentage: None,
                             cancellable: Some(false),
                         },
@@ -492,7 +473,54 @@ impl LanguageServer for KotlinLanguageServer {
                 })
                 .await;
 
-            tracing::debug!("progress token handled, starting sidecar discovery");
+            // Resolve project model first so we can pass it to the sidecar
+            let project_model = if let Some(ref root) = project_root {
+                tracing::info!("resolving project model for {:?}", root);
+                match project::resolve_project(root, &config) {
+                    Ok(model) => {
+                        tracing::info!(
+                            "project resolved: {} source roots, {} classpath entries, {} compiler flags",
+                            model.source_roots.len(),
+                            model.classpath.len(),
+                            model.compiler_flags.len()
+                        );
+
+                        // Cache the project model
+                        let cache_dir = root.join(".kotlin-analyzer");
+                        if let Err(e) = project::save_cache(&model, &cache_dir) {
+                            tracing::warn!("failed to cache project model: {}", e);
+                        }
+
+                        Some(model)
+                    }
+                    Err(e) => {
+                        tracing::warn!("project resolution failed: {}, using stdlib-only", e);
+                        let _ = client
+                            .show_message(
+                                MessageType::WARNING,
+                                format!("kotlin-analyzer: project resolution failed: {}. Using stdlib-only analysis.", e),
+                            )
+                            .await;
+                        None
+                    }
+                }
+            } else {
+                tracing::info!("no project root, using stdlib-only analysis");
+                None
+            };
+
+            client
+                .send_notification::<lsp_types::notification::Progress>(ProgressParams {
+                    token: token.clone(),
+                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                        WorkDoneProgressReport {
+                            message: Some("Starting JVM sidecar...".to_string()),
+                            percentage: None,
+                            cancellable: Some(false),
+                        },
+                    )),
+                })
+                .await;
 
             // Try to start the sidecar
             let java_path = match crate::bridge::find_java() {
@@ -548,16 +576,64 @@ impl LanguageServer for KotlinLanguageServer {
             };
 
             tracing::debug!("sidecar JAR found at {:?}", sidecar_jar);
+            tracing::info!("Creating Bridge with sidecar JAR and java path");
             let bridge = Bridge::new(sidecar_jar, java_path, config);
 
-            // Set up replay callback for document restoration after restart
-            bridge
-                .set_replay_callback(move || {
-                    Vec::new()
-                })
-                .await;
+            // Store the bridge BEFORE starting so LSP requests that arrive
+            // during sidecar startup can reach it and wait for Ready state
+            // (request buffering in bridge.rs handles the wait).
+            {
+                let mut b = bridge_holder.lock().await;
+                *b = Some(bridge);
+            }
+            // Lock is released here so hover/completion handlers can access
+            // the bridge while start() is running. Their requests will wait
+            // for Ready via the watch channel in bridge.rs.
 
-            match bridge.start().await {
+            // Prepare project config for the sidecar
+            let project_root_str = project_root
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            let (classpath, source_roots) = match &project_model {
+                Some(model) => {
+                    let cp: Vec<String> = model.classpath.iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect();
+                    let sr: Vec<String> = model.source_roots.iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect();
+                    (cp, sr)
+                }
+                None => (Vec::new(), Vec::new()),
+            };
+
+            // Note: when no source roots are found (no build system), the sidecar
+            // falls back to creating ad-hoc KtFile objects from opened files via
+            // KtPsiFactory. This is faster than scanning the entire project root
+            // and works well for basic features (hover, completion, diagnostics).
+            if source_roots.is_empty() {
+                tracing::info!("no source roots found, sidecar will use per-file fallback");
+            }
+
+            tracing::info!(
+                "Starting sidecar with project_root={}, classpath={} entries, source_roots={:?}",
+                project_root_str, classpath.len(), source_roots
+            );
+
+            // Re-acquire lock briefly to call start() on the bridge
+            let start_result = {
+                let b = bridge_holder.lock().await;
+                let bridge = b.as_ref().unwrap();
+                bridge.start(
+                    Some(project_root_str.as_str()),
+                    &classpath,
+                    &source_roots,
+                ).await
+            };
+
+            match start_result {
                 Ok(()) => {
                     tracing::info!("sidecar started successfully");
                     client
@@ -570,12 +646,14 @@ impl LanguageServer for KotlinLanguageServer {
                             )),
                         })
                         .await;
-
-                    let mut b = bridge_holder.lock().await;
-                    *b = Some(bridge);
                 }
                 Err(e) => {
-                    tracing::error!("failed to start sidecar: {}", e);
+                    tracing::error!("failed to start sidecar: {:?}", e);
+                    // Remove the bridge since startup failed
+                    {
+                        let mut b = bridge_holder.lock().await;
+                        *b = None;
+                    }
                     client
                         .send_notification::<lsp_types::notification::Progress>(ProgressParams {
                             token: token.clone(),
@@ -614,6 +692,8 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = params.text_document.uri.clone();
         let text = params.text_document.text.clone();
         let version = params.text_document.version;
+
+        tracing::info!("did_open: {} (version {}, {} bytes)", uri, version, text.len());
 
         {
             let mut documents = self.documents.lock().await;
@@ -718,11 +798,19 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
+        tracing::info!("hover request: {}:{}:{}", uri, position.line, position.character);
+
         let bridge = self.bridge.lock().await;
         let bridge = match bridge.as_ref() {
             Some(b) => b,
-            None => return Ok(None),
+            None => {
+                tracing::warn!("hover: bridge is None, returning null");
+                return Ok(None);
+            }
         };
+
+        let sidecar_state = bridge.state().await;
+        tracing::info!("hover: sidecar state is {:?}", sidecar_state);
 
         match bridge
             .request(
@@ -736,6 +824,7 @@ impl LanguageServer for KotlinLanguageServer {
             .await
         {
             Ok(result) => {
+                tracing::info!("hover: sidecar returned: {}", result);
                 if let Some(contents) = result.get("contents").and_then(|c| c.as_str()) {
                     Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
@@ -745,11 +834,12 @@ impl LanguageServer for KotlinLanguageServer {
                         range: None,
                     }))
                 } else {
+                    tracing::warn!("hover: sidecar result has no 'contents' string field");
                     Ok(None)
                 }
             }
             Err(e) => {
-                tracing::warn!("hover failed: {}", e);
+                tracing::warn!("hover: bridge request failed: {}", e);
                 Ok(None)
             }
         }

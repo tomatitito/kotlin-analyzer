@@ -82,6 +82,13 @@ class CompilerBridge {
             emptyList()
         }
 
+        System.err.println("CompilerBridge: projectRoot=$projectRoot")
+        System.err.println("CompilerBridge: sourceRoots=$sourceRoots")
+        System.err.println("CompilerBridge: effectiveSourceRoots=$effectiveSourceRoots")
+        System.err.println("CompilerBridge: classpath=${classpath.size} entries")
+        System.err.println("CompilerBridge: stdlibJars=${stdlibJars.size} jars")
+        System.err.println("CompilerBridge: jdkHome=$jdkHome")
+
         session = buildStandaloneAnalysisAPISession(disposable) {
             buildKtModuleProvider {
                 platform = JvmPlatforms.defaultJvmPlatform
@@ -97,8 +104,9 @@ class CompilerBridge {
                     // Try to use the current JDK
                     val currentJdkHome = System.getProperty("java.home")
                     if (currentJdkHome != null) {
+                        System.err.println("CompilerBridge: using current JDK at $currentJdkHome")
                         buildKtSdkModule {
-                            addBinaryRootsFromJdkHome(Paths.get(currentJdkHome), isJre = true)
+                            addBinaryRootsFromJdkHome(Paths.get(currentJdkHome), isJre = false)
                             libraryName = "JDK"
                             platform = JvmPlatforms.defaultJvmPlatform
                         }
@@ -157,6 +165,19 @@ class CompilerBridge {
 
         val elapsed = System.currentTimeMillis() - startTime
         System.err.println("CompilerBridge: session created in ${elapsed}ms")
+
+        // Log discovered files
+        val allFiles = session!!.modulesWithFiles.entries
+            .flatMap { (module, files) ->
+                files.filterIsInstance<KtFile>().map { module to it }
+            }
+        System.err.println("CompilerBridge: discovered ${allFiles.size} KtFile(s) in session:")
+        for ((module, ktFile) in allFiles.take(20)) {
+            System.err.println("  - ${ktFile.virtualFile.path} (module: ${module})")
+        }
+        if (allFiles.size > 20) {
+            System.err.println("  ... and ${allFiles.size - 20} more")
+        }
     }
 
     /**
@@ -385,19 +406,31 @@ class CompilerBridge {
                         if (current is KtReferenceExpression) {
                             val references = current.references
                             for (ref in references) {
-                                val resolved = ref.resolve()
-                                if (resolved != null) {
-                                    val file = resolved.containingFile
-                                    val textOffset = resolved.textOffset
-                                    val doc = file?.viewProvider?.document
+                                try {
+                                    val resolved = ref.resolve()
+                                    if (resolved != null) {
+                                        val file = resolved.containingFile
+                                        val textOffset = resolved.textOffset
+                                        val doc = file?.viewProvider?.document
+                                        val vfPath = file?.virtualFile?.path
 
-                                    if (file != null && doc != null) {
-                                        val loc = JsonObject()
-                                        loc.addProperty("uri", "file://${file.virtualFile.path}")
-                                        loc.addProperty("line", doc.getLineNumber(textOffset) + 1)
-                                        loc.addProperty("column", textOffset - doc.getLineStartOffset(doc.getLineNumber(textOffset)))
-                                        locationsArray.add(loc)
+                                        if (file != null && doc != null) {
+                                            // For KtPsiFactory files, virtualFile.path may be null;
+                                            // fall back to the original URI (same-file reference)
+                                            val targetUri = if (vfPath != null && !vfPath.contains("dummy")) {
+                                                "file://$vfPath"
+                                            } else {
+                                                uri
+                                            }
+                                            val loc = JsonObject()
+                                            loc.addProperty("uri", targetUri)
+                                            loc.addProperty("line", doc.getLineNumber(textOffset) + 1)
+                                            loc.addProperty("column", textOffset - doc.getLineStartOffset(doc.getLineNumber(textOffset)))
+                                            locationsArray.add(loc)
+                                        }
                                     }
+                                } catch (e: Exception) {
+                                    System.err.println("CompilerBridge: definition ref.resolve() failed: ${e.message?.take(100)}")
                                 }
                             }
                             break
@@ -2512,10 +2545,44 @@ class CompilerBridge {
 
     private fun findKtFile(session: StandaloneAnalysisAPISession, uri: String): KtFile? {
         val filePath = uriToPath(uri)
-        return session.modulesWithFiles.entries
+
+        // First, look for the file in the session's discovered source files
+        val sessionFile = session.modulesWithFiles.entries
             .flatMap { (_, files) -> files }
             .filterIsInstance<KtFile>()
             .find { it.virtualFile.path == filePath || it.name == filePath }
+
+        if (sessionFile != null) {
+            return sessionFile
+        }
+
+        // If not found in session, try to create a KtFile from virtualFiles content
+        val content = virtualFiles[uri]
+        if (content != null) {
+            System.err.println("CompilerBridge: file not in session, creating from virtualFiles: $uri")
+            try {
+                val fileName = filePath.substringAfterLast('/')
+                val psiFactory = KtPsiFactory(session.project)
+                return psiFactory.createFile(fileName, content)
+            } catch (e: Exception) {
+                System.err.println("CompilerBridge: failed to create KtFile from virtualFiles: ${e.message}")
+            }
+        }
+
+        // Last resort: try to read from disk if the file exists
+        val file = File(filePath)
+        if (file.exists() && file.extension == "kt") {
+            System.err.println("CompilerBridge: file not in session, creating from disk: $uri")
+            try {
+                val psiFactory = KtPsiFactory(session.project)
+                return psiFactory.createFile(file.name, file.readText())
+            } catch (e: Exception) {
+                System.err.println("CompilerBridge: failed to create KtFile from disk: ${e.message}")
+            }
+        }
+
+        System.err.println("CompilerBridge: file not found anywhere: $uri (path=$filePath)")
+        return null
     }
 
     private fun uriToPath(uri: String): String {
@@ -2534,19 +2601,121 @@ class CompilerBridge {
     }
 
     private fun findKotlinStdlibJars(): List<Path> {
-        val classpath = System.getProperty("java.class.path") ?: return emptyList()
-        return classpath.split(File.pathSeparator)
+        // 1. Check java.class.path (works when running as individual JARs)
+        val classpath = System.getProperty("java.class.path") ?: ""
+        val fromClasspath = classpath.split(File.pathSeparator)
             .filter { it.contains("kotlin-stdlib") && it.endsWith(".jar") }
             .map { Paths.get(it) }
+            .filter { it.toFile().exists() }
+
+        if (fromClasspath.isNotEmpty()) {
+            System.err.println("CompilerBridge: found ${fromClasspath.size} stdlib JARs on classpath")
+            return fromClasspath
+        }
+
+        // 2. Search Gradle cache (when running as fat JAR, stdlib isn't on classpath)
+        // Prefer version matching the compiler (2.1.20), fall back to any version
+        val gradleCache = Paths.get(System.getProperty("user.home"), ".gradle", "caches", "modules-2", "files-2.1", "org.jetbrains.kotlin")
+        if (gradleCache.toFile().exists()) {
+            val stdlibNames = listOf("kotlin-stdlib", "kotlin-stdlib-jdk7", "kotlin-stdlib-jdk8")
+            val preferredVersion = "2.1.20"
+
+            // Try preferred version first
+            val preferred = mutableListOf<Path>()
+            for (name in stdlibNames) {
+                val versionDir = gradleCache.resolve(name).resolve(preferredVersion).toFile()
+                if (!versionDir.exists()) continue
+                val jars = versionDir.walkTopDown()
+                    .filter { it.extension == "jar" && !it.name.contains("-sources") && !it.name.contains("-javadoc") }
+                    .toList()
+                if (jars.isNotEmpty()) {
+                    preferred.add(jars.first().toPath())
+                }
+            }
+            if (preferred.isNotEmpty()) {
+                System.err.println("CompilerBridge: found ${preferred.size} stdlib JARs (v$preferredVersion) in Gradle cache: $preferred")
+                return preferred
+            }
+
+            // Fall back to any version (prefer newest)
+            val found = mutableListOf<Path>()
+            for (name in stdlibNames) {
+                val moduleDir = gradleCache.resolve(name).toFile()
+                if (!moduleDir.exists()) continue
+                val versionDirs = moduleDir.listFiles()?.filter { it.isDirectory }?.sortedDescending() ?: continue
+                for (versionDir in versionDirs) {
+                    val jars = versionDir.walkTopDown()
+                        .filter { it.extension == "jar" && !it.name.contains("-sources") && !it.name.contains("-javadoc") }
+                        .toList()
+                    if (jars.isNotEmpty()) {
+                        found.add(jars.first().toPath())
+                        break
+                    }
+                }
+            }
+            if (found.isNotEmpty()) {
+                System.err.println("CompilerBridge: found ${found.size} stdlib JARs (fallback) in Gradle cache: $found")
+                return found
+            }
+        }
+
+        // 3. Search Maven local repo
+        val m2Repo = Paths.get(System.getProperty("user.home"), ".m2", "repository", "org", "jetbrains", "kotlin")
+        if (m2Repo.toFile().exists()) {
+            val stdlibNames = listOf("kotlin-stdlib", "kotlin-stdlib-jdk7", "kotlin-stdlib-jdk8")
+            val found = mutableListOf<Path>()
+
+            for (name in stdlibNames) {
+                val moduleDir = m2Repo.resolve(name).toFile()
+                if (!moduleDir.exists()) continue
+
+                val versionDirs = moduleDir.listFiles()?.filter { it.isDirectory }?.sortedDescending() ?: continue
+                for (versionDir in versionDirs) {
+                    val jar = versionDir.resolve("$name-${versionDir.name}.jar")
+                    if (jar.exists()) {
+                        found.add(jar.toPath())
+                        break
+                    }
+                }
+            }
+
+            if (found.isNotEmpty()) {
+                System.err.println("CompilerBridge: found ${found.size} stdlib JARs in Maven local: $found")
+                return found
+            }
+        }
+
+        System.err.println("CompilerBridge: WARNING - no kotlin-stdlib JARs found!")
+        return emptyList()
     }
 
     private fun findSourceRoots(projectRoot: Path): List<Path> {
+        // Check conventional Kotlin/JVM source directories
         val candidates = listOf(
             projectRoot.resolve("src/main/kotlin"),
             projectRoot.resolve("src/main/java"),
             projectRoot.resolve("src"),
         )
-        return candidates.filter { it.toFile().exists() }
+        val found = candidates.filter { it.toFile().exists() }
+        if (found.isNotEmpty()) {
+            return found
+        }
+
+        // No conventional source dirs found. If the project root itself contains
+        // .kt files (directly or in subdirectories), use it as a source root.
+        // This handles simple projects, scripts, and non-standard layouts.
+        val rootDir = projectRoot.toFile()
+        if (rootDir.exists() && rootDir.isDirectory) {
+            val hasKtFiles = rootDir.walk()
+                .take(500) // limit scan depth for performance
+                .any { it.extension == "kt" }
+            if (hasKtFiles) {
+                System.err.println("CompilerBridge: no conventional source dirs, using project root as source root")
+                return listOf(projectRoot)
+            }
+        }
+
+        return emptyList()
     }
 
     companion object {
