@@ -95,7 +95,7 @@ pub async fn read_message(
     }
 
     let response: Response =
-        serde_json::from_slice(&body).map_err(|e| ProtocolError::JsonParse(e))?;
+        serde_json::from_slice(&body).map_err(ProtocolError::JsonParse)?;
 
     Ok(Some(response))
 }

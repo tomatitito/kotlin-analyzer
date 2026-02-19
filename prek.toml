@@ -41,6 +41,14 @@ hooks = [
       files = "\\.rs$",
       pass_filenames = false },
 
+    # --- Documentation sync ---
+    { id = "sync-claude-agents",
+      name = "CLAUDE.md == AGENTS.md",
+      language = "system",
+      entry = "bash -c 'diff CLAUDE.md AGENTS.md || (echo \"CLAUDE.md and AGENTS.md must be identical. Run: cp CLAUDE.md AGENTS.md\" && exit 1)'",
+      files = "(CLAUDE|AGENTS)\\.md$",
+      pass_filenames = false },
+
     # --- JVM sidecar (Kotlin + Gradle) ---
     { id = "sidecar-test",
       name = "sidecar ./gradlew test",

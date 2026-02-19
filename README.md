@@ -22,23 +22,34 @@ A Kotlin language server for the [Zed](https://zed.dev) editor, providing semant
 
 ## Installation
 
-Install from the Zed extension registry:
+### From GitHub Releases (current)
+
+Download the [latest release](https://github.com/tomatitito/kotlin-analyzer/releases) and install manually:
+
+```bash
+tar -xzf kotlin-analyzer-v0.2.0-macos-aarch64.tar.gz
+cp kotlin-analyzer ~/.local/bin/
+cp sidecar.jar ~/.local/bin/
+```
+
+Then symlink the Zed extension:
+
+```bash
+git clone https://github.com/tomatitito/kotlin-analyzer.git
+ln -sfn "$(pwd)/kotlin-analyzer" \
+  ~/Library/Application\ Support/Zed/extensions/installed/kotlin-analyzer
+```
+
+Restart Zed to load the extension.
+
+### From Zed Extension Registry (planned)
+
+Once published to the Zed extension registry:
 
 1. Open Zed
 2. Open the Extensions panel (`cmd+shift+x`)
 3. Search for "Kotlin Analyzer"
 4. Click Install
-
-The extension downloads the appropriate binary for your platform on first use.
-
-### Supported Platforms
-
-| Platform | Architecture |
-|----------|-------------|
-| macOS | Apple Silicon (aarch64) |
-| macOS | Intel (x86_64) |
-| Linux | x86_64 |
-| Linux | aarch64 |
 
 ## Configuration
 
@@ -125,6 +136,14 @@ kotlin-analyzer requires JDK 17+. It searches for Java in this order:
 
 ## Building from Source
 
+### Prerequisites
+
+- Rust 1.70+ (via [rustup](https://rustup.rs))
+- JDK 17+ (for sidecar)
+- wasm32-wasip1 target (`rustup target add wasm32-wasip1`)
+
+### Build
+
 ```bash
 # Rust LSP binary
 cd server && cargo build --release
@@ -134,9 +153,26 @@ cd sidecar && ./gradlew shadowJar
 
 # Zed extension (WASM)
 cargo build --target wasm32-wasip1
+```
 
-# Run all tests
-cargo test && (cd sidecar && ./gradlew test)
+### Install locally
+
+```bash
+cp server/target/release/kotlin-analyzer ~/.local/bin/
+cp sidecar/build/libs/sidecar-all.jar ~/.local/bin/sidecar.jar
+
+# Symlink the Zed extension (only needed once)
+ln -sfn "$(pwd)" ~/Library/Application\ Support/Zed/extensions/installed/kotlin-analyzer
+```
+
+### Test
+
+```bash
+# Unit tests
+cd server && cargo test
+
+# Full smoke test
+cargo build && (cd sidecar && ./gradlew shadowJar) && cd server && cargo test
 ```
 
 ## Documentation
