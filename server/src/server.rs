@@ -430,11 +430,15 @@ impl LanguageServer for KotlinLanguageServer {
                 ),
             };
 
-            if let Err(e) = client
-                .register_capability(vec![registration])
-                .await
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                client.register_capability(vec![registration]),
+            )
+            .await
             {
-                tracing::warn!("failed to register file watchers: {:?}", e);
+                Ok(Err(e)) => tracing::warn!("failed to register file watchers: {:?}", e),
+                Err(_) => tracing::warn!("file watcher registration timed out"),
+                Ok(Ok(())) => {}
             }
         });
 
@@ -444,139 +448,153 @@ impl LanguageServer for KotlinLanguageServer {
     async fn initialized(&self, _: InitializedParams) {
         tracing::info!("kotlin-analyzer: initialized");
 
-        // Create progress token
-        let token = NumberOrString::String("kotlin-analyzer-startup".to_string());
+        // Spawn sidecar startup in a background task. tower-lsp processes
+        // notifications sequentially, so calling send_request (which awaits
+        // the client's response) from within a notification handler deadlocks.
+        let client = self.client.clone();
+        let bridge_holder = Arc::clone(&self.bridge);
+        let config = self.config.lock().await.clone();
 
-        // Create work done progress
-        if let Err(e) = self
-            .client
-            .send_request::<lsp_types::request::WorkDoneProgressCreate>(
-                WorkDoneProgressCreateParams {
-                    token: token.clone(),
-                },
+        tokio::spawn(async move {
+            tracing::debug!("initialized: background task started");
+
+            // Create progress token
+            let token = NumberOrString::String("kotlin-analyzer-startup".to_string());
+
+            // Use a timeout: if the client doesn't support workDoneProgress
+            // or doesn't respond, we still proceed with sidecar startup.
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                client.send_request::<lsp_types::request::WorkDoneProgressCreate>(
+                    WorkDoneProgressCreateParams {
+                        token: token.clone(),
+                    },
+                ),
             )
             .await
-        {
-            tracing::warn!("failed to create progress token: {:?}", e);
-        }
-
-        // Send begin progress
-        self.client
-            .send_notification::<lsp_types::notification::Progress>(ProgressParams {
-                token: token.clone(),
-                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
-                    WorkDoneProgressBegin {
-                        title: "Starting Kotlin sidecar".to_string(),
-                        message: Some("Initializing JVM...".to_string()),
-                        percentage: None,
-                        cancellable: Some(false),
-                    },
-                )),
-            })
-            .await;
-
-        // Try to start the sidecar
-        let java_path = match crate::bridge::find_java() {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("JVM not found: {}", e);
-                self.client
-                    .send_notification::<lsp_types::notification::Progress>(ProgressParams {
-                        token: token.clone(),
-                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
-                            WorkDoneProgressEnd {
-                                message: Some(format!("Failed: {}", e)),
-                            },
-                        )),
-                    })
-                    .await;
-                self.client
-                    .show_message(
-                        MessageType::ERROR,
-                        "kotlin-analyzer: JDK 17+ required but not found. Set JAVA_HOME or KOTLIN_LS_JAVA_HOME.",
-                    )
-                    .await;
-                return;
+            {
+                Ok(Err(e)) => tracing::warn!("failed to create progress token: {:?}", e),
+                Err(_) => tracing::warn!("progress token creation timed out, client may not support workDoneProgress"),
+                Ok(Ok(())) => {}
             }
-        };
 
-        // Find sidecar JAR - look relative to the server binary
-        let sidecar_jar = find_sidecar_jar();
-        let sidecar_jar = match sidecar_jar {
-            Some(p) => p,
-            None => {
-                tracing::warn!("sidecar JAR not found, semantic features unavailable");
-                self.client
-                    .send_notification::<lsp_types::notification::Progress>(ProgressParams {
-                        token: token.clone(),
-                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
-                            WorkDoneProgressEnd {
-                                message: Some("sidecar.jar not found".to_string()),
-                            },
-                        )),
-                    })
-                    .await;
-                self.client
-                    .show_message(
-                        MessageType::WARNING,
-                        "kotlin-analyzer: sidecar.jar not found. Semantic features are unavailable.",
-                    )
-                    .await;
-                return;
+            client
+                .send_notification::<lsp_types::notification::Progress>(ProgressParams {
+                    token: token.clone(),
+                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                        WorkDoneProgressBegin {
+                            title: "Starting Kotlin sidecar".to_string(),
+                            message: Some("Initializing JVM...".to_string()),
+                            percentage: None,
+                            cancellable: Some(false),
+                        },
+                    )),
+                })
+                .await;
+
+            tracing::debug!("progress token handled, starting sidecar discovery");
+
+            // Try to start the sidecar
+            let java_path = match crate::bridge::find_java() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("JVM not found: {}", e);
+                    client
+                        .send_notification::<lsp_types::notification::Progress>(ProgressParams {
+                            token: token.clone(),
+                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                WorkDoneProgressEnd {
+                                    message: Some(format!("Failed: {}", e)),
+                                },
+                            )),
+                        })
+                        .await;
+                    client
+                        .show_message(
+                            MessageType::ERROR,
+                            "kotlin-analyzer: JDK 17+ required but not found. Set JAVA_HOME or KOTLIN_LS_JAVA_HOME.",
+                        )
+                        .await;
+                    return;
+                }
+            };
+
+            tracing::debug!("java found at {:?}", java_path);
+
+            // Find sidecar JAR - look relative to the server binary
+            let sidecar_jar = find_sidecar_jar();
+            let sidecar_jar = match sidecar_jar {
+                Some(p) => p,
+                None => {
+                    tracing::warn!("sidecar JAR not found, semantic features unavailable");
+                    client
+                        .send_notification::<lsp_types::notification::Progress>(ProgressParams {
+                            token: token.clone(),
+                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                WorkDoneProgressEnd {
+                                    message: Some("sidecar.jar not found".to_string()),
+                                },
+                            )),
+                        })
+                        .await;
+                    client
+                        .show_message(
+                            MessageType::WARNING,
+                            "kotlin-analyzer: sidecar.jar not found. Semantic features are unavailable.",
+                        )
+                        .await;
+                    return;
+                }
+            };
+
+            tracing::debug!("sidecar JAR found at {:?}", sidecar_jar);
+            let bridge = Bridge::new(sidecar_jar, java_path, config);
+
+            // Set up replay callback for document restoration after restart
+            bridge
+                .set_replay_callback(move || {
+                    Vec::new()
+                })
+                .await;
+
+            match bridge.start().await {
+                Ok(()) => {
+                    tracing::info!("sidecar started successfully");
+                    client
+                        .send_notification::<lsp_types::notification::Progress>(ProgressParams {
+                            token: token.clone(),
+                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                WorkDoneProgressEnd {
+                                    message: Some("Ready".to_string()),
+                                },
+                            )),
+                        })
+                        .await;
+
+                    let mut b = bridge_holder.lock().await;
+                    *b = Some(bridge);
+                }
+                Err(e) => {
+                    tracing::error!("failed to start sidecar: {}", e);
+                    client
+                        .send_notification::<lsp_types::notification::Progress>(ProgressParams {
+                            token: token.clone(),
+                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                WorkDoneProgressEnd {
+                                    message: Some(format!("Failed: {}", e)),
+                                },
+                            )),
+                        })
+                        .await;
+                    client
+                        .show_message(
+                            MessageType::ERROR,
+                            format!("kotlin-analyzer: failed to start sidecar: {}", e),
+                        )
+                        .await;
+                }
             }
-        };
-
-        let config = self.config.lock().await.clone();
-        let bridge = Bridge::new(sidecar_jar, java_path, config);
-
-        // Set up replay callback for document restoration after restart
-        // Note: Replay is currently logged but not fully implemented
-        // Full restart with replay would require restructuring the bridge's stdin handling
-        bridge
-            .set_replay_callback(move || {
-                // This is a placeholder - a real implementation would need to
-                // coordinate with the bridge to send documents to the new sidecar process
-                Vec::new()
-            })
-            .await;
-
-        match bridge.start().await {
-            Ok(()) => {
-                tracing::info!("sidecar started successfully");
-                self.client
-                    .send_notification::<lsp_types::notification::Progress>(ProgressParams {
-                        token: token.clone(),
-                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
-                            WorkDoneProgressEnd {
-                                message: Some("Ready".to_string()),
-                            },
-                        )),
-                    })
-                    .await;
-
-                let mut b = self.bridge.lock().await;
-                *b = Some(bridge);
-            }
-            Err(e) => {
-                tracing::error!("failed to start sidecar: {}", e);
-                self.client
-                    .send_notification::<lsp_types::notification::Progress>(ProgressParams {
-                        token: token.clone(),
-                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
-                            WorkDoneProgressEnd {
-                                message: Some(format!("Failed: {}", e)),
-                            },
-                        )),
-                    })
-                    .await;
-                self.client
-                    .show_message(
-                        MessageType::ERROR,
-                        format!("kotlin-analyzer: failed to start sidecar: {}", e),
-                    )
-                    .await;
-            }
-        }
+        });
     }
 
     async fn shutdown(&self) -> LspResult<()> {
@@ -2057,6 +2075,9 @@ impl KotlinLanguageServer {
 /// Finds the sidecar JAR relative to the server binary.
 fn find_sidecar_jar() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
+    // Resolve symlinks so the dev path works when the binary is symlinked
+    // (e.g. ~/.local/bin/kotlin-analyzer -> server/target/debug/kotlin-analyzer)
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     let exe_dir = exe.parent()?;
 
     // Check next to the binary

@@ -36,7 +36,7 @@ pub struct Bridge {
     state: Arc<Mutex<SidecarState>>,
     request_id: AtomicU64,
     pending: Arc<Mutex<Vec<PendingRequest>>>,
-    request_tx: mpsc::Sender<Request>,
+    request_tx: Mutex<mpsc::Sender<Request>>,
     sidecar_jar: PathBuf,
     java_path: PathBuf,
     config: Arc<Mutex<Config>>,
@@ -44,6 +44,8 @@ pub struct Bridge {
     replay_callback: Arc<Mutex<Option<ReplayCallback>>>,
     restart_count: Arc<Mutex<u32>>,
     health_check_shutdown: Arc<Notify>,
+    /// Holds the sidecar child process to prevent kill_on_drop from firing.
+    child: Mutex<Option<tokio::process::Child>>,
 }
 
 impl Bridge {
@@ -55,7 +57,7 @@ impl Bridge {
             state: Arc::new(Mutex::new(SidecarState::Stopped)),
             request_id: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(Vec::new())),
-            request_tx,
+            request_tx: Mutex::new(request_tx),
             sidecar_jar,
             java_path,
             config: Arc::new(Mutex::new(config)),
@@ -63,6 +65,7 @@ impl Bridge {
             replay_callback: Arc::new(Mutex::new(None)),
             restart_count: Arc::new(Mutex::new(0)),
             health_check_shutdown: Arc::new(Notify::new()),
+            child: Mutex::new(None),
         }
     }
 
@@ -166,14 +169,14 @@ impl Bridge {
 
         let mut child = Command::new(&self.java_path)
             .arg(format!("-Xmx{max_memory}"))
-            .arg("-jar")
-            .arg(&self.sidecar_jar)
             .arg("--add-opens")
             .arg("java.base/java.lang=ALL-UNNAMED")
             .arg("--add-opens")
             .arg("java.base/java.lang.reflect=ALL-UNNAMED")
             .arg("--add-opens")
             .arg("java.base/java.util=ALL-UNNAMED")
+            .arg("-jar")
+            .arg(&self.sidecar_jar)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -189,6 +192,12 @@ impl Bridge {
             .stdout
             .take()
             .ok_or_else(|| BridgeError::SpawnFailed("failed to capture stdout".into()))?;
+
+        // Store the child process handle to prevent kill_on_drop from firing
+        {
+            let mut child_slot = self.child.lock().await;
+            *child_slot = Some(child);
+        }
 
         // Spawn the reader task to process incoming responses
         let pending = Arc::clone(&self.pending);
@@ -229,10 +238,11 @@ impl Bridge {
         // Create a new request channel for this sidecar instance
         let (tx, mut rx) = mpsc::channel::<Request>(32);
 
-        // Replace the sender (other code holds a clone of the old one, but that's fine
-        // since we're starting fresh)
-        // Note: We can't replace self.request_tx directly because of &self.
-        // Instead, we spawn the writer task and use this channel.
+        // Swap in the live sender so request()/notify()/shutdown() use it
+        {
+            let mut current_tx = self.request_tx.lock().await;
+            *current_tx = tx.clone();
+        }
 
         let stdin = Arc::new(Mutex::new(stdin));
         let stdin_clone = Arc::clone(&stdin);
@@ -324,6 +334,8 @@ impl Bridge {
         }
 
         self.request_tx
+            .lock()
+            .await
             .send(request)
             .await
             .map_err(|_| BridgeError::Crashed("request channel closed".into()))?;
@@ -339,6 +351,8 @@ impl Bridge {
     pub async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), Error> {
         let notification = Request::notification(method, params);
         self.request_tx
+            .lock()
+            .await
             .send(notification)
             .await
             .map_err(|_| BridgeError::Crashed("request channel closed".into()))?;
@@ -359,6 +373,8 @@ impl Bridge {
         // Try to send shutdown request
         let _ = self
             .request_tx
+            .lock()
+            .await
             .send(Request::new(self.next_id(), "shutdown", None))
             .await;
 
@@ -474,5 +490,22 @@ mod tests {
         let id1 = bridge.next_id();
         let id2 = bridge.next_id();
         assert_eq!(id2, id1 + 1);
+    }
+
+    #[tokio::test]
+    async fn request_before_start_returns_not_ready() {
+        let bridge = Bridge::new(
+            PathBuf::from("sidecar.jar"),
+            PathBuf::from("/usr/bin/java"),
+            Config::default(),
+        );
+        let result = bridge.request("hover", None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, Error::Bridge(BridgeError::NotReady(_))),
+            "expected NotReady, got: {:?}",
+            err
+        );
     }
 }
