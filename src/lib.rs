@@ -16,20 +16,17 @@ impl zed::Extension for KotlinAnalyzerExtension {
     fn language_server_command(
         &mut self,
         language_server_id: &LanguageServerId,
-        _worktree: &zed::Worktree,
+        worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
-        // 1. Check for a local binary in ~/.local/bin (dev override)
-        let local_binary = format!(
-            "{}/{}",
-            std::env::var("HOME").unwrap_or_default(),
-            ".local/bin/kotlin-analyzer"
-        );
-        if fs::metadata(&local_binary).is_ok() {
-            eprintln!("kotlin-analyzer: using local binary at {}", local_binary);
+        let env = worktree.shell_env();
+
+        // 1. Check if kotlin-analyzer is on PATH (dev override or system install)
+        if let Some(path) = worktree.which("kotlin-analyzer") {
+            eprintln!("kotlin-analyzer: using binary from PATH at {}", path);
             return Ok(zed::Command {
-                command: local_binary,
+                command: path,
                 args: vec!["--log-level".into(), "info".into()],
-                env: Default::default(),
+                env,
             });
         }
 
@@ -39,7 +36,7 @@ impl zed::Extension for KotlinAnalyzerExtension {
                 return Ok(zed::Command {
                     command: path.clone(),
                     args: vec!["--log-level".into(), "info".into()],
-                    env: Default::default(),
+                    env,
                 });
             }
         }
@@ -97,7 +94,7 @@ impl zed::Extension for KotlinAnalyzerExtension {
         Ok(zed::Command {
             command: binary_path,
             args: vec!["--log-level".into(), "info".into()],
-            env: Default::default(),
+            env,
         })
     }
 

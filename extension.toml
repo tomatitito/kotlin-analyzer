@@ -5,11 +5,16 @@ schema_version = 1
 authors = ["Jens Kouros <jens.kouros@posteo.de>"]
 description = "Kotlin language support with Analysis API-backed language server."
 repository = "https://github.com/jenskouros/kotlin-analyzer"
+languages = ["languages/kotlin"]
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
 
 [grammars.kotlin]
 repository = "https://github.com/fwcd/tree-sitter-kotlin"
 commit = "c915271d261e8c0a590a0c05ad921c8cb73393c8"
 
 [language_servers.kotlin-analyzer]
-name = "kotlin-analyzer"
+language = "Kotlin"
 languages = ["Kotlin"]

@@ -23,3 +23,8 @@ spike/analysis-api/.gradle/
 
 # Ralph loop output
 .ralph-loop-output/
+
+# Extension build artifacts
+extension.wasm
+grammars/
+.kotlin-analyzer/
