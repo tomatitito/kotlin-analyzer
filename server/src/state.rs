@@ -12,7 +12,6 @@ pub struct DocumentStore {
 
 #[derive(Debug, Clone)]
 pub struct Document {
-    pub uri: Url,
     pub text: String,
     pub version: i32,
 }
@@ -20,7 +19,7 @@ pub struct Document {
 impl DocumentStore {
     pub fn open(&mut self, uri: Url, text: String, version: i32) {
         self.documents
-            .insert(uri.clone(), Document { uri, text, version });
+            .insert(uri, Document { text, version });
     }
 
     pub fn change(&mut self, uri: &Url, text: String, version: i32) -> bool {
@@ -41,10 +40,12 @@ impl DocumentStore {
         self.documents.get(uri)
     }
 
+    #[allow(dead_code)]
     pub fn all_documents(&self) -> impl Iterator<Item = &Document> {
         self.documents.values()
     }
 
+    #[allow(dead_code)]
     pub fn is_open(&self, uri: &Url) -> bool {
         self.documents.contains_key(uri)
     }

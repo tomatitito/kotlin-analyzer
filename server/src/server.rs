@@ -1643,33 +1643,6 @@ impl KotlinLanguageServer {
             .collect()
     }
 
-    fn parse_text_edits(&self, result: &Value) -> Vec<TextEdit> {
-        let edits = match result.get("edits").and_then(|e| e.as_array()) {
-            Some(arr) => arr,
-            None => return Vec::new(),
-        };
-
-        edits
-            .iter()
-            .filter_map(|edit| {
-                let range = edit.get("range")?;
-                let start_line = range.get("startLine")?.as_u64()? as u32;
-                let start_col = range.get("startColumn")?.as_u64()? as u32;
-                let end_line = range.get("endLine")?.as_u64()? as u32;
-                let end_col = range.get("endColumn")?.as_u64()? as u32;
-                let new_text = edit.get("newText")?.as_str()?.to_string();
-
-                Some(TextEdit {
-                    range: Range {
-                        start: Position::new(start_line, start_col),
-                        end: Position::new(end_line, end_col),
-                    },
-                    new_text,
-                })
-            })
-            .collect()
-    }
-
     fn parse_signatures(&self, result: &Value) -> Vec<SignatureInformation> {
         let signatures = match result.get("signatures").and_then(|s| s.as_array()) {
             Some(arr) => arr,

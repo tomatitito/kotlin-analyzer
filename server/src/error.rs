@@ -41,9 +41,6 @@ pub enum ProtocolError {
     #[error("missing content-length header")]
     MissingContentLength,
 
-    #[error("content-length mismatch: expected {expected}, got {actual}")]
-    ContentLengthMismatch { expected: usize, actual: usize },
-
     #[error("json parse error: {0}")]
     JsonParse(#[from] serde_json::Error),
 }
@@ -53,14 +50,9 @@ pub enum ProjectError {
     #[error("gradle execution failed: {0}")]
     GradleFailed(String),
 
-    #[error("no build system found in {0}")]
-    NoBuildSystem(String),
-
     #[error("classpath extraction failed: {0}")]
     ClasspathExtraction(String),
 
     #[error("jvm not found: {0}")]
     JvmNotFound(String),
 }
-
-pub type Result<T> = std::result::Result<T, Error>;

@@ -406,13 +406,6 @@ pub fn save_cache(model: &ProjectModel, cache_dir: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Loads the project model from cache.
-pub fn load_cache(cache_dir: &Path) -> Option<ProjectModel> {
-    let cache_file = cache_dir.join("project-model.json");
-    let json = std::fs::read_to_string(&cache_file).ok()?;
-    serde_json::from_str(&json).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

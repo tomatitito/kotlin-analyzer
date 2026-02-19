@@ -5,10 +5,7 @@
 //! Run with: cargo test --features integration
 
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use std::time::Duration;
-use tower_lsp::jsonrpc::{Request as JsonRpcRequest, Response as JsonRpcResponse};
-use tower_lsp::lsp_types::*;
 
 /// Test helper to start the LSP server and communicate with it
 struct LspTestClient {

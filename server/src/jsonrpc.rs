@@ -136,6 +136,7 @@ async fn read_content_length(
 }
 
 /// Encodes a message into Content-Length framed bytes.
+#[cfg(test)]
 pub fn encode_message(message: &impl Serialize) -> Result<Vec<u8>, ProtocolError> {
     let body = serde_json::to_string(message)?;
     let header = format!("Content-Length: {}\r\n\r\n", body.len());

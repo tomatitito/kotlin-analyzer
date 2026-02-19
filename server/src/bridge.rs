@@ -19,7 +19,6 @@ pub enum SidecarState {
     Starting,
     Ready,
     Degraded,
-    Restarting,
     Stopped,
 }
 
@@ -28,8 +27,6 @@ struct PendingRequest {
     id: u64,
     response_tx: oneshot::Sender<Result<Value, Error>>,
 }
-
-type ReplayCallback = Arc<dyn Fn() -> Vec<(String, String, i32)> + Send + Sync>;
 
 /// Manages the JVM sidecar process lifecycle and JSON-RPC communication.
 pub struct Bridge {
@@ -44,7 +41,6 @@ pub struct Bridge {
     java_path: PathBuf,
     config: Arc<Mutex<Config>>,
     shutdown_notify: Arc<Notify>,
-    replay_callback: Arc<Mutex<Option<ReplayCallback>>>,
     restart_count: Arc<Mutex<u32>>,
     health_check_shutdown: Arc<Notify>,
     /// Holds the sidecar child process to prevent kill_on_drop from firing.
@@ -69,21 +65,10 @@ impl Bridge {
             java_path,
             config: Arc::new(Mutex::new(config)),
             shutdown_notify: Arc::new(Notify::new()),
-            replay_callback: Arc::new(Mutex::new(None)),
             restart_count: Arc::new(Mutex::new(0)),
             health_check_shutdown: Arc::new(Notify::new()),
             child: Mutex::new(None),
         }
-    }
-
-    /// Sets a callback to replay open documents after sidecar restart.
-    /// The callback should return a vec of (uri, text, version) tuples.
-    pub async fn set_replay_callback<F>(&self, callback: F)
-    where
-        F: Fn() -> Vec<(String, String, i32)> + Send + Sync + 'static,
-    {
-        let mut replay = self.replay_callback.lock().await;
-        *replay = Some(Arc::new(callback));
     }
 
     /// Returns the current sidecar state.
@@ -412,7 +397,7 @@ impl Bridge {
             SidecarState::Degraded => {
                 return Err(BridgeError::NotReady("sidecar is Degraded".into()).into());
             }
-            SidecarState::Starting | SidecarState::Restarting => {
+            SidecarState::Starting => {
                 tracing::info!("waiting for sidecar to become Ready (current: {:?})", current);
             }
         }
@@ -431,7 +416,7 @@ impl Bridge {
                             format!("sidecar transitioned to {:?} while waiting", state),
                         ).into());
                     }
-                    SidecarState::Starting | SidecarState::Restarting => {
+                    SidecarState::Starting => {
                         // Keep waiting
                         continue;
                     }
