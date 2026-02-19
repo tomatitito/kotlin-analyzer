@@ -92,6 +92,12 @@ Further optimization can be deferred to post-v1.
    - Create GitHub release with binaries
    - Establish stable baseline to return to
 
+2. **Documentation sync and build instructions** (see `documentation-sync.md`)
+   - Add build instructions to README.md, AGENTS.md, CLAUDE.md
+   - Synchronize CLAUDE.md and AGENTS.md content
+   - Add pre-commit hook to enforce synchronization
+   - Update all docs/ files to current state
+
 ### Must Have (Blocking v1.0)
 1. Error handling for missing JVM/JAR
 2. Basic Zed status bar integration
