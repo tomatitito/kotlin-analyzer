@@ -1,5 +1,6 @@
 # Rust build output
 /target/
+server/target/
 
 # Cargo lock is committed for WASM extensions
 # Cargo.lock

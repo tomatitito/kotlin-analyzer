@@ -30,7 +30,7 @@ repositories {
     maven("https://maven.pkg.jetbrains.space/kotlin/p/kotlin/kotlin-ide-plugin-dependencies")
 }
 
-val analysisApiVersion = "2.3.10"
+val analysisApiVersion = "2.1.20"  // Latest stable with published -for-ide artifacts
 
 dependencies {
     // From Maven Central

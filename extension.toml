@@ -9,3 +9,7 @@ repository = "https://github.com/jenskouros/kotlin-analyzer"
 [grammars.kotlin]
 repository = "https://github.com/fwcd/tree-sitter-kotlin"
 commit = "c915271d261e8c0a590a0c05ad921c8cb73393c8"
+
+[language_servers.kotlin-analyzer]
+name = "kotlin-analyzer"
+languages = ["Kotlin"]
