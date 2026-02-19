@@ -86,11 +86,17 @@ Further optimization can be deferred to post-v1.
 
 ## Priority Order for v1.0
 
+### IMMEDIATE - Before Any Other Changes
+1. **Create v0.2.0 release** (see `create-v0.2.0-release.md`)
+   - Tag current working version
+   - Create GitHub release with binaries
+   - Establish stable baseline to return to
+
 ### Must Have (Blocking v1.0)
 1. Error handling for missing JVM/JAR
 2. Basic Zed status bar integration
 3. Publishing to Zed registry
-4. GitHub release with binaries
+4. GitHub release with v1.0 binaries
 
 ### Nice to Have (Can be v1.1)
 1. Formatting enhancements (.editorconfig)
