@@ -55,12 +55,13 @@ Current metrics already meet v1 targets:
 Further optimization can be deferred to post-v1.
 
 #### Error Handling and UX
-- [ ] Clear error messages for common failures:
-  - [ ] No JVM found
+- [x] Clear error messages for common failures:
+  - [x] No JVM found (shows ERROR via LSP showMessage)
   - [ ] JVM version too old
-  - [ ] Gradle extraction failed
+  - [x] Gradle extraction failed (shows WARNING via LSP showMessage)
   - [x] Sidecar crash notification (already shows in logs)
   - [ ] Out of memory suggestion
+  - [x] Sidecar JAR not found (shows WARNING via LSP showMessage)
 - [ ] Zed status bar integration
 - [x] Graceful degradation when sidecar is down (returns empty results)
 
@@ -72,7 +73,7 @@ Further optimization can be deferred to post-v1.
 
 #### Publishing
 - [ ] Publish extension to Zed registry
-- [ ] Create GitHub release with binaries
+- [x] Create GitHub release with binaries (v0.2.0)
 - [ ] Announce availability
 - [ ] Set up issue templates
 - [ ] Gather initial feedback
@@ -87,19 +88,11 @@ Further optimization can be deferred to post-v1.
 ## Priority Order for v1.0
 
 ### IMMEDIATE - Before Any Other Changes
-1. **Create v0.2.0 release** (see `create-v0.2.0-release.md`)
-   - Tag current working version
-   - Create GitHub release with binaries
-   - Establish stable baseline to return to
-
-2. **Documentation sync and build instructions** (see `documentation-sync.md`)
-   - Add build instructions to README.md, AGENTS.md, CLAUDE.md
-   - Synchronize CLAUDE.md and AGENTS.md content
-   - Add pre-commit hook to enforce synchronization
-   - Update all docs/ files to current state
+1. ~~**Create v0.2.0 release**~~ — Done. See [v0.2.0 release](https://github.com/tomatitito/kotlin-analyzer/releases/tag/v0.2.0)
+2. ~~**Documentation sync and build instructions**~~ — Done. README updated, pre-commit hook added.
 
 ### Must Have (Blocking v1.0)
-1. Error handling for missing JVM/JAR
+1. ~~Error handling for missing JVM/JAR~~ — Already implemented (clear error messages shown to user via LSP showMessage)
 2. Basic Zed status bar integration
 3. Publishing to Zed registry
 4. GitHub release with v1.0 binaries
@@ -116,12 +109,16 @@ Further optimization can be deferred to post-v1.
 - Pre-commit hooks
 - Integration tests (14 sidecar tests)
 - Performance targets met
+- v0.2.0 release created (stable baseline)
+- Documentation and build instructions updated
+- Error handling for missing JVM/JAR (user-facing messages via LSP)
+- Zero compiler warnings
 
 ## Success Criteria for v1.0
 
 - [x] All core LSP features work
 - [x] Performance meets targets
-- [ ] Clear error messages for common failures
+- [x] Clear error messages for common failures (JVM, JAR, Gradle, sidecar crash)
 - [ ] Published to Zed extension registry
 - [ ] Works on macOS and Linux
 
