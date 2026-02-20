@@ -90,75 +90,90 @@ pub fn resolve_project(root: &Path, config: &Config) -> Result<ProjectModel, Err
     }
 }
 
-/// Extracts project model from a Gradle project using the init script approach.
-fn resolve_gradle_project(root: &Path, config: &Config) -> Result<ProjectModel, Error> {
-    let gradlew = find_gradle_wrapper(root);
-
-    // Use a Gradle init script to extract classpath and compiler flags
-    let init_script = r#"
+/// Gradle init script (Groovy DSL) that extracts classpath, source roots, and
+/// compiler flags. Groovy is used instead of Kotlin DSL (`.gradle.kts`) because
+/// init scripts are compiled before project buildscripts are evaluated — the
+/// Kotlin Gradle Plugin classes (e.g. `KotlinCompile`) are not on the compile
+/// classpath at init-script time. Groovy resolves types at runtime, sidestepping
+/// the issue entirely.
+const INIT_SCRIPT: &str = r#"
 allprojects {
     task("kotlinAnalyzerExtract") {
         doLast {
-            val sb = StringBuilder()
-            sb.appendLine("---KOTLIN-ANALYZER-START---")
+            def sb = new StringBuilder()
+            sb.append("---KOTLIN-ANALYZER-START---\n")
 
             // Source roots
-            project.convention.findPlugin(org.gradle.api.plugins.JavaPluginConvention::class.java)?.let { jpc ->
-                jpc.sourceSets.findByName("main")?.let { main ->
-                    main.allSource.srcDirs.forEach { dir ->
-                        if (dir.exists()) sb.appendLine("SOURCE_ROOT=${dir.absolutePath}")
+            def jpe = project.extensions.findByType(org.gradle.api.plugins.JavaPluginExtension)
+            if (jpe != null) {
+                def main = jpe.sourceSets.findByName("main")
+                if (main != null) {
+                    main.allSource.srcDirs.each { dir ->
+                        if (dir.exists()) sb.append("SOURCE_ROOT=${dir.absolutePath}\n")
                     }
                 }
             }
 
             // Classpath
             try {
-                val compileClasspath = project.configurations.getByName("compileClasspath")
-                compileClasspath.resolve().forEach { file ->
-                    sb.appendLine("CLASSPATH=${file.absolutePath}")
+                def compileClasspath = project.configurations.getByName("compileClasspath")
+                compileClasspath.resolve().each { file ->
+                    sb.append("CLASSPATH=${file.absolutePath}\n")
                 }
-            } catch (_: Exception) {}
+            } catch (Exception e) {
+                sb.append("CLASSPATH_ERROR=${e.message}\n")
+            }
 
             // Compiler flags
-            project.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile::class.java).forEach { task ->
-                task.compilerOptions.freeCompilerArgs.get().forEach { flag ->
-                    sb.appendLine("COMPILER_FLAG=$flag")
+            try {
+                project.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).each { task ->
+                    task.compilerOptions.freeCompilerArgs.get().each { flag ->
+                        sb.append("COMPILER_FLAG=${flag}\n")
+                    }
                 }
+            } catch (Exception e) {
+                // Kotlin plugin not applied to this module
             }
 
             // Kotlin version
             try {
-                val kotlinVersion = project.buildscript.configurations
+                def kotlinVersion = project.buildscript.configurations
                     .getByName("classpath")
                     .resolvedConfiguration
                     .resolvedArtifacts
                     .find { it.moduleVersion.id.group == "org.jetbrains.kotlin" && it.moduleVersion.id.name == "kotlin-gradle-plugin" }
                     ?.moduleVersion?.id?.version
-                if (kotlinVersion != null) sb.appendLine("KOTLIN_VERSION=$kotlinVersion")
-            } catch (_: Exception) {}
+                if (kotlinVersion != null) sb.append("KOTLIN_VERSION=${kotlinVersion}\n")
+            } catch (Exception e) {
+                sb.append("KOTLIN_VERSION_ERROR=${e.message}\n")
+            }
 
             // Compose detection
-            val hasCompose = project.plugins.hasPlugin("org.jetbrains.compose") ||
+            def hasCompose = project.plugins.hasPlugin("org.jetbrains.compose") ||
                 project.plugins.hasPlugin("org.jetbrains.kotlin.plugin.compose")
-            if (hasCompose) sb.appendLine("HAS_COMPOSE=true")
+            if (hasCompose) sb.append("HAS_COMPOSE=true\n")
 
             // KAPT generated sources
-            val kaptDir = project.layout.buildDirectory.dir("generated/source/kapt/main").get().asFile
-            if (kaptDir.exists()) sb.appendLine("GENERATED_SOURCE_ROOT=${kaptDir.absolutePath}")
+            def kaptDir = project.layout.buildDirectory.dir("generated/source/kapt/main").get().asFile
+            if (kaptDir.exists()) sb.append("GENERATED_SOURCE_ROOT=${kaptDir.absolutePath}\n")
 
             // KSP generated sources
-            val kspDir = project.layout.buildDirectory.dir("generated/ksp/main/kotlin").get().asFile
-            if (kspDir.exists()) sb.appendLine("GENERATED_SOURCE_ROOT=${kspDir.absolutePath}")
+            def kspDir = project.layout.buildDirectory.dir("generated/ksp/main/kotlin").get().asFile
+            if (kspDir.exists()) sb.append("GENERATED_SOURCE_ROOT=${kspDir.absolutePath}\n")
 
-            sb.appendLine("---KOTLIN-ANALYZER-END---")
+            sb.append("---KOTLIN-ANALYZER-END---\n")
             println(sb.toString())
         }
     }
 }
 "#;
 
-    let init_script_path = root.join(".kotlin-analyzer-init.gradle.kts");
-    std::fs::write(&init_script_path, init_script)
+/// Extracts project model from a Gradle project using the init script approach.
+fn resolve_gradle_project(root: &Path, config: &Config) -> Result<ProjectModel, Error> {
+    let gradlew = find_gradle_wrapper(root);
+
+    let init_script_path = root.join(".kotlin-analyzer-init.gradle");
+    std::fs::write(&init_script_path, INIT_SCRIPT)
         .map_err(|e| ProjectError::GradleFailed(format!("failed to write init script: {e}")))?;
 
     let output = Command::new(&gradlew)
@@ -209,7 +224,8 @@ fn parse_gradle_output(output: &str, root: &Path, config: &Config) -> Result<Pro
             continue;
         }
         if line == "---KOTLIN-ANALYZER-END---" {
-            break;
+            in_section = false;
+            continue;
         }
         if !in_section {
             continue;
@@ -219,10 +235,14 @@ fn parse_gradle_output(output: &str, root: &Path, config: &Config) -> Result<Pro
             model.source_roots.push(PathBuf::from(path));
         } else if let Some(path) = line.strip_prefix("CLASSPATH=") {
             model.classpath.push(PathBuf::from(path));
+        } else if let Some(err) = line.strip_prefix("CLASSPATH_ERROR=") {
+            tracing::warn!("gradle classpath extraction failed: {}", err);
         } else if let Some(flag) = line.strip_prefix("COMPILER_FLAG=") {
             model.compiler_flags.push(flag.to_string());
         } else if let Some(version) = line.strip_prefix("KOTLIN_VERSION=") {
             model.kotlin_version = Some(version.to_string());
+        } else if let Some(err) = line.strip_prefix("KOTLIN_VERSION_ERROR=") {
+            tracing::warn!("gradle kotlin version extraction failed: {}", err);
         } else if line == "HAS_COMPOSE=true" {
             model.has_compose = true;
         } else if let Some(path) = line.strip_prefix("GENERATED_SOURCE_ROOT=") {
@@ -531,5 +551,140 @@ COMPILER_FLAG=-Xcontext-parameters
         config.compiler_flags = vec!["-Xmulti-dollar-interpolation".into()];
         let model = resolve_project(dir.path(), &config).unwrap();
         assert_eq!(model.compiler_flags.len(), 2);
+    }
+
+    #[test]
+    fn parse_gradle_output_multi_module() {
+        let output = r#"
+---KOTLIN-ANALYZER-START---
+SOURCE_ROOT=/project/common/src/main/kotlin
+CLASSPATH=/lib/spring-context.jar
+COMPILER_FLAG=-Xcontext-parameters
+---KOTLIN-ANALYZER-END---
+---KOTLIN-ANALYZER-START---
+SOURCE_ROOT=/project/app/src/main/kotlin
+CLASSPATH=/lib/spring-boot-starter-web.jar
+KOTLIN_VERSION=2.1.20
+---KOTLIN-ANALYZER-END---
+"#;
+        let config = Config::default();
+        let model = parse_gradle_output(output, Path::new("/project"), &config).unwrap();
+        assert_eq!(model.source_roots.len(), 2);
+        assert_eq!(model.classpath.len(), 2);
+        assert_eq!(model.compiler_flags, vec!["-Xcontext-parameters"]);
+        assert_eq!(model.kotlin_version, Some("2.1.20".into()));
+    }
+
+    #[test]
+    fn parse_gradle_output_with_errors() {
+        let output = r#"
+---KOTLIN-ANALYZER-START---
+SOURCE_ROOT=/project/src/main/kotlin
+CLASSPATH_ERROR=Cannot resolve configuration 'compileClasspath'
+KOTLIN_VERSION_ERROR=Could not resolve buildscript classpath
+COMPILER_FLAG=-Xcontext-parameters
+---KOTLIN-ANALYZER-END---
+"#;
+        let config = Config::default();
+        let model = parse_gradle_output(output, Path::new("/project"), &config).unwrap();
+        assert_eq!(model.source_roots.len(), 1);
+        assert!(model.classpath.is_empty());
+        assert_eq!(model.compiler_flags, vec!["-Xcontext-parameters"]);
+        assert_eq!(model.kotlin_version, None);
+    }
+
+    #[test]
+    fn parse_gradle_output_multi_module_compose_and_generated() {
+        let output = r#"
+---KOTLIN-ANALYZER-START---
+SOURCE_ROOT=/project/app/src/main/kotlin
+HAS_COMPOSE=true
+---KOTLIN-ANALYZER-END---
+---KOTLIN-ANALYZER-START---
+SOURCE_ROOT=/project/lib/src/main/kotlin
+GENERATED_SOURCE_ROOT=/project/lib/build/generated/ksp/main/kotlin
+---KOTLIN-ANALYZER-END---
+"#;
+        let config = Config::default();
+        let model = parse_gradle_output(output, Path::new("/project"), &config).unwrap();
+        assert_eq!(model.source_roots.len(), 2);
+        assert!(model.has_compose);
+        assert_eq!(model.generated_source_roots.len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "integration")]
+    fn init_script_kotlin_project() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/gradle-kotlin-simple");
+        let config = Config::default();
+        let model =
+            resolve_gradle_project(&fixture, &config).expect("gradle resolution should succeed");
+
+        assert!(!model.source_roots.is_empty(), "should find source roots");
+        assert!(!model.classpath.is_empty(), "should find classpath entries");
+        assert!(
+            model.kotlin_version.is_some(),
+            "should detect kotlin version"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "integration")]
+    fn init_script_java_only_project() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/gradle-java-only");
+        let config = Config::default();
+        let model = resolve_gradle_project(&fixture, &config)
+            .expect("gradle resolution should not crash on java-only project");
+
+        assert!(
+            model.kotlin_version.is_none(),
+            "no kotlin version in java-only project"
+        );
+        assert!(
+            model.compiler_flags.is_empty(),
+            "no compiler flags without kotlin plugin"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "integration")]
+    fn init_script_output_format() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/gradle-kotlin-simple");
+
+        // Write init script to a temp dir to avoid racing with other tests
+        // that also write to the fixture directory.
+        let tmp = TempDir::new().unwrap();
+        let init_script_path = tmp.path().join("kotlin-analyzer-init.gradle");
+        std::fs::write(&init_script_path, INIT_SCRIPT).unwrap();
+
+        let output = std::process::Command::new("gradle")
+            .current_dir(&fixture)
+            .arg("--init-script")
+            .arg(&init_script_path)
+            .arg("kotlinAnalyzerExtract")
+            .arg("--quiet")
+            .output()
+            .expect("gradle should be available for integration tests");
+
+        assert!(
+            output.status.success(),
+            "gradle should exit 0: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("---KOTLIN-ANALYZER-START---"),
+            "missing start marker"
+        );
+        assert!(
+            stdout.contains("---KOTLIN-ANALYZER-END---"),
+            "missing end marker"
+        );
+        assert!(stdout.contains("SOURCE_ROOT="), "missing source root");
+        assert!(stdout.contains("CLASSPATH="), "missing classpath");
     }
 }
