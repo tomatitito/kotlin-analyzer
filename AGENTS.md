@@ -101,13 +101,20 @@ cd sidecar && ./gradlew test               # unit tests
 ### Zed extension
 
 ```bash
-cargo build --target wasm32-wasip1         # build WASM extension
+bash scripts/build-extension.sh            # build WASM component (wasip2) and copy to extension.wasm
 
 # symlink the extension into Zed's local extensions directory (macOS)
 ln -sfn "$(pwd)" ~/Library/Application\ Support/Zed/extensions/installed/kotlin-analyzer
+
+# symlink the server binary so the extension can find it and the sidecar JAR
+ln -sf "$(pwd)/server/target/debug/kotlin-analyzer" ~/.local/bin/kotlin-analyzer
 ```
 
-After symlinking, rebuild and restart Zed to pick up changes. The symlink only needs to be created once.
+After symlinking, rebuild and restart Zed to pick up changes. The symlinks only need to be created once.
+
+**Important**: The binary at `~/.local/bin/kotlin-analyzer` must be a symlink (not a copy) so that the server can resolve its path back to the source tree to find the sidecar JAR at `sidecar/build/libs/sidecar-all.jar`.
+
+**Trust**: This dev build of Zed (`my-zed`) requires worktree trust before starting language servers. If the LS doesn't start automatically, use `Cmd+Shift+P` → "Restart Language Server" to trigger it manually.
 
 ### Tree-sitter queries
 
@@ -140,6 +147,20 @@ zed [OPTIONS] [PATHS]...
 | `--foreground` | Run Zed in the foreground, keeping the terminal attached |
 
 Files can be opened at a specific position with `zed file.txt:line:column`. Pass `-` as the path to read from stdin.
+
+### `my-zed` — Development Build
+
+For kotlin-analyzer development, use `my-zed` instead of `zed`. This is a custom Zed build that prints language server logs and JSON-RPC messages to the console, making it much easier to debug LSP interactions with the sidecar.
+
+```bash
+my-zed /path/to/kotlin/project    # opens project and streams LSP logs to the terminal
+```
+
+Always prefer `my-zed` when:
+- Debugging diagnostics, completions, hover, or go-to-definition behavior
+- Verifying end-to-end LSP communication (initialize, textDocument/*, shutdown)
+- Investigating sidecar startup, crash recovery, or classpath issues
+- Performing the visual verification tasks in the v1 roadmap
 
 ## Peekaboo (macOS UI Automation)
 
