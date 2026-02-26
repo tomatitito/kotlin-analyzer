@@ -15,5 +15,4 @@ repository = "https://github.com/fwcd/tree-sitter-kotlin"
 rev = "ff2e742f946d060b68bfb9a3544184ecd61e1228"
 
 [language_servers.kotlin-analyzer]
-language = "Kotlin"
 languages = ["Kotlin"]
