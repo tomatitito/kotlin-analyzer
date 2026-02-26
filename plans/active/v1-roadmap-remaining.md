@@ -16,7 +16,7 @@ This roadmap contains only the remaining tasks for the v1 release. Completed ite
 These are firing correctly on every commit. No further action needed.
 
 #### End-to-End Diagnostics Verification
-**Visual verification in Zed:**
+**Visual verification in Zed (use `my-zed` to see LSP logs and JSON-RPC messages in the terminal):**
 - [ ] Verify TypeMismatch.kt shows red squiggly lines
 - [ ] Verify UnusedVariable.kt shows warning indicators
 - [ ] Verify BasicConstructs.kt shows no squiggly lines
@@ -113,6 +113,18 @@ Further optimization can be deferred to post-v1.
 - Documentation and build instructions updated
 - Error handling for missing JVM/JAR (user-facing messages via LSP)
 - Zero compiler warnings
+- Enhanced hover: package/container info, documentation from library symbols (KDoc + Javadoc)
+- Code actions: refactoring actions (add explicit type, convert expression/block body), line-level diagnostic matching
+- Logging cleanup: per-request logs moved to debug level, only lifecycle events at info
+- Spring Boot annotation support (classpath extraction + multi-module parser fixes)
+- Extension always passes `--log-file /tmp/kotlin-analyzer-server.log` for debugging
+- Server logs PID and CLI args on startup for diagnostics
+- Bridge lock contention fix in `did_close` handler
+- Build script corrected to use `wasm32-wasip2` target
+- Binary install documented as symlink (required for sidecar JAR discovery)
+- Project root discovery: server walks up from rootUri to find actual project root (fixes incorrect classpath/source root when Zed passes a deep source directory)
+- Startup race condition: `analyze_document` no longer logs WARN when bridge is initializing (expected during startup)
+- Integration tests fixed: proper channel-based LSP message handling (notifications vs requests), all 4 integration tests pass
 
 ## Success Criteria for v1.0
 
@@ -128,6 +140,6 @@ Target: Complete remaining Must Have tasks for v1.0 release by end of February 2
 
 ## Notes
 
-- Spring Boot annotation support tracked separately in `plans/active/spring-boot-annotations.md`
+- Spring Boot annotation support completed and moved to `plans/completed/spring-boot-annotations.md`
 - Advanced LSP features (call hierarchy, semantic tokens) deferred to post-v1
 - Multi-module and Kotlin Multiplatform support deferred to v2
