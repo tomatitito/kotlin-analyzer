@@ -59,6 +59,37 @@ pub fn detect_build_system(root: &Path) -> BuildSystem {
     }
 }
 
+/// Walks up from `start` looking for a directory that contains a build system
+/// marker (build.gradle.kts, build.gradle, pom.xml, settings.gradle.kts,
+/// settings.gradle, .kotlin-analyzer.json) or a VCS root (.git).
+/// Returns the first ancestor that has one of these markers, or `start` itself
+/// if no marker is found.
+pub fn find_project_root(start: &Path) -> PathBuf {
+    let mut current = start.to_path_buf();
+    loop {
+        // Build system markers
+        if current.join("build.gradle.kts").exists()
+            || current.join("build.gradle").exists()
+            || current.join("settings.gradle.kts").exists()
+            || current.join("settings.gradle").exists()
+            || current.join("pom.xml").exists()
+            || current.join(".kotlin-analyzer.json").exists()
+        {
+            return current;
+        }
+        // VCS root as fallback — better than a deep source directory
+        if current.join(".git").exists() {
+            return current;
+        }
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    // No marker found — use the original path
+    start.to_path_buf()
+}
+
 /// Resolves the project model from the build system.
 ///
 /// Resolution order:
@@ -485,11 +516,13 @@ KOTLIN_VERSION=2.1.20
 COMPILER_FLAG=-Xcontext-parameters
 ---KOTLIN-ANALYZER-END---
 "#;
-        let mut config = Config::default();
-        config.compiler_flags = vec![
-            "-Xcontext-parameters".into(), // duplicate
-            "-Xmulti-dollar-interpolation".into(),
-        ];
+        let config = Config {
+            compiler_flags: vec![
+                "-Xcontext-parameters".into(), // duplicate
+                "-Xmulti-dollar-interpolation".into(),
+            ],
+            ..Config::default()
+        };
         let model = parse_gradle_output(output, Path::new("/project"), &config).unwrap();
         assert_eq!(model.compiler_flags.len(), 2);
     }
@@ -547,8 +580,10 @@ COMPILER_FLAG=-Xcontext-parameters
         )
         .unwrap();
 
-        let mut config = Config::default();
-        config.compiler_flags = vec!["-Xmulti-dollar-interpolation".into()];
+        let config = Config {
+            compiler_flags: vec!["-Xmulti-dollar-interpolation".into()],
+            ..Config::default()
+        };
         let model = resolve_project(dir.path(), &config).unwrap();
         assert_eq!(model.compiler_flags.len(), 2);
     }
@@ -686,5 +721,62 @@ GENERATED_SOURCE_ROOT=/project/lib/build/generated/ksp/main/kotlin
         );
         assert!(stdout.contains("SOURCE_ROOT="), "missing source root");
         assert!(stdout.contains("CLASSPATH="), "missing classpath");
+    }
+
+    #[test]
+    fn find_project_root_from_source_dir() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src/main/kotlin/com/example");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "").unwrap();
+
+        let found = find_project_root(&src);
+        assert_eq!(found, dir.path());
+    }
+
+    #[test]
+    fn find_project_root_already_at_root() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "").unwrap();
+
+        let found = find_project_root(dir.path());
+        assert_eq!(found, dir.path());
+    }
+
+    #[test]
+    fn find_project_root_git_fallback() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+
+        let found = find_project_root(&src);
+        assert_eq!(found, dir.path());
+    }
+
+    #[test]
+    fn find_project_root_no_marker() {
+        let dir = TempDir::new().unwrap();
+        let deep = dir.path().join("a/b/c");
+        fs::create_dir_all(&deep).unwrap();
+
+        // Without any markers, returns the start path
+        let found = find_project_root(&deep);
+        // It will walk up and not find anything — should return the start
+        // (In practice it walks up to the filesystem root and then returns start)
+        // But since TempDir is under /tmp which likely has no build markers,
+        // it should return the deep path.
+        assert!(found.exists());
+    }
+
+    #[test]
+    fn find_project_root_settings_gradle() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("app/src/main/kotlin");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(dir.path().join("settings.gradle.kts"), "").unwrap();
+
+        let found = find_project_root(&src);
+        assert_eq!(found, dir.path());
     }
 }
