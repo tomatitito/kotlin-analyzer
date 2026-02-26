@@ -5,20 +5,29 @@
 //! Run with: cargo test --features integration
 
 use serde_json::{json, Value};
+use std::io::{BufRead, Read, Write};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
-/// Test helper to start the LSP server and communicate with it
+/// Test helper to start the LSP server and communicate with it.
+///
+/// Spawns a background reader thread that continuously reads server messages
+/// from stdout and forwards them through a channel. This prevents pipe buffer
+/// deadlocks that occur when the server writes many messages (progress
+/// notifications, diagnostics) while the test is sleeping.
 struct LspTestClient {
     process: std::process::Child,
     stdin: std::process::ChildStdin,
-    stdout: std::io::BufReader<std::process::ChildStdout>,
+    rx: mpsc::Receiver<Value>,
+    next_id: AtomicI64,
 }
 
 impl LspTestClient {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         // Build the server first
         std::process::Command::new("cargo")
-            .args(&["build", "--release"])
+            .args(["build", "--release"])
             .output()?;
 
         // Start the LSP server
@@ -29,63 +38,164 @@ impl LspTestClient {
             .spawn()?;
 
         let stdin = process.stdin.take().expect("Failed to get stdin");
-        let stdout = std::io::BufReader::new(process.stdout.take().expect("Failed to get stdout"));
+        let stdout = process.stdout.take().expect("Failed to get stdout");
+
+        // Spawn background reader thread
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            loop {
+                // Read Content-Length header
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => return, // EOF
+                        Err(_) => return,
+                        Ok(_) => {}
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                    headers.push_str(&line);
+                }
+
+                let content_length: usize = match headers
+                    .lines()
+                    .find(|l| l.starts_with("Content-Length:"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|len| len.trim().parse().ok())
+                {
+                    Some(len) => len,
+                    None => continue,
+                };
+
+                let mut buffer = vec![0u8; content_length];
+                if reader.read_exact(&mut buffer).is_err() {
+                    return;
+                }
+
+                if let Ok(msg) = serde_json::from_slice::<Value>(&buffer) {
+                    if tx.send(msg).is_err() {
+                        return; // Receiver dropped
+                    }
+                }
+            }
+        });
 
         Ok(LspTestClient {
             process,
             stdin,
-            stdout,
+            rx,
+            next_id: AtomicI64::new(1),
         })
     }
 
+    /// Write a raw JSON-RPC message to the server's stdin.
+    fn write_message(&mut self, msg: &Value) -> Result<(), Box<dyn std::error::Error>> {
+        let body = serde_json::to_string(msg)?;
+        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        self.stdin.write_all(header.as_bytes())?;
+        self.stdin.write_all(body.as_bytes())?;
+        self.stdin.flush()?;
+        Ok(())
+    }
+
+    /// Send a JSON-RPC request and wait for the matching response (by id).
+    /// Server-initiated requests are answered with empty results.
     fn send_request(
         &mut self,
         method: &str,
         params: Value,
     ) -> Result<Value, Box<dyn std::error::Error>> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+
         let request = json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": id,
             "method": method,
             "params": params
         });
 
-        // Send request
-        let request_str = serde_json::to_string(&request)?;
-        let content_length = request_str.len();
-        let message = format!("Content-Length: {}\r\n\r\n{}", content_length, request_str);
+        self.write_message(&request)?;
 
-        use std::io::Write;
-        self.stdin.write_all(message.as_bytes())?;
-        self.stdin.flush()?;
-
-        // Read response
-        use std::io::BufRead;
-        let mut headers = String::new();
+        // Read messages until we find the response with our id.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            let mut line = String::new();
-            self.stdout.read_line(&mut line)?;
-            if line == "\r\n" {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("Timeout waiting for response to {} (id={})", method, id).into());
+            }
+
+            let msg = match self.rx.recv_timeout(remaining) {
+                Ok(msg) => msg,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(format!("Timeout waiting for response to {} (id={})", method, id).into());
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("Server stdout closed".into());
+                }
+            };
+
+            // Is this a response to our request?
+            if let Some(msg_id) = msg.get("id") {
+                if msg_id.as_i64() == Some(id) {
+                    return Ok(msg);
+                }
+
+                // It's a server→client request (has method + id). Reply with
+                // an empty success so the server doesn't time out.
+                if msg.get("method").is_some() {
+                    let reply = json!({
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": null
+                    });
+                    self.write_message(&reply)?;
+                }
+            }
+            // Otherwise it's a notification from the server — skip it.
+        }
+    }
+
+    /// Send a JSON-RPC notification (no response expected).
+    fn send_notification(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        });
+        self.write_message(&notification)
+    }
+
+    /// Drain pending server messages for the given duration, answering any
+    /// server→client requests that arrive.
+    fn drain_messages(&mut self, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
                 break;
             }
-            headers.push_str(&line);
+            match self.rx.recv_timeout(remaining) {
+                Ok(msg) => {
+                    // Answer server requests
+                    if let (Some(id), Some(_method)) = (msg.get("id"), msg.get("method")) {
+                        let reply = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": null
+                        });
+                        let _ = self.write_message(&reply);
+                    }
+                }
+                Err(_) => break,
+            }
         }
-
-        // Parse content-length
-        let content_length: usize = headers
-            .lines()
-            .find(|line| line.starts_with("Content-Length:"))
-            .and_then(|line| line.split(':').nth(1))
-            .and_then(|len| len.trim().parse().ok())
-            .expect("Failed to parse Content-Length");
-
-        // Read response body
-        let mut buffer = vec![0u8; content_length];
-        use std::io::Read;
-        self.stdout.read_exact(&mut buffer)?;
-
-        let response: Value = serde_json::from_slice(&buffer)?;
-        Ok(response)
     }
 
     fn initialize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -94,15 +204,9 @@ impl LspTestClient {
             "rootUri": "file:///tmp/test-project",
             "capabilities": {
                 "textDocument": {
-                    "hover": {
-                        "dynamicRegistration": false
-                    },
-                    "rename": {
-                        "dynamicRegistration": false
-                    },
-                    "definition": {
-                        "dynamicRegistration": false
-                    }
+                    "hover": { "dynamicRegistration": false },
+                    "rename": { "dynamicRegistration": false },
+                    "definition": { "dynamicRegistration": false }
                 }
             }
         });
@@ -123,8 +227,14 @@ impl LspTestClient {
             return Err("Server doesn't support hover".into());
         }
 
-        // Send initialized notification
-        self.send_request("initialized", json!({})).ok();
+        // Send initialized notification (no response expected)
+        self.send_notification("initialized", json!({}))?;
+
+        // Wait for sidecar to start — it needs to spawn the JVM process,
+        // initialise the Kotlin Analysis API session, and register file
+        // watchers. With no real project (rootUri points to /tmp) and
+        // stdlib-only mode this takes ~2-3 seconds.
+        self.drain_messages(Duration::from_secs(5));
 
         Ok(())
     }
@@ -139,10 +249,10 @@ impl LspTestClient {
             }
         });
 
-        self.send_request("textDocument/didOpen", params)?;
+        self.send_notification("textDocument/didOpen", params)?;
 
-        // Wait a bit for the sidecar to process
-        std::thread::sleep(Duration::from_millis(500));
+        // Wait for sidecar to process the file and produce diagnostics
+        self.drain_messages(Duration::from_secs(3));
 
         Ok(())
     }
@@ -154,13 +264,8 @@ impl LspTestClient {
         character: u32,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let params = json!({
-            "textDocument": {
-                "uri": uri
-            },
-            "position": {
-                "line": line,
-                "character": character
-            }
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
         });
 
         let response = self.send_request("textDocument/hover", params)?;
@@ -191,6 +296,18 @@ impl LspTestClient {
 
 impl Drop for LspTestClient {
     fn drop(&mut self) {
+        // Send a shutdown request so the server can gracefully terminate
+        // the JVM sidecar. If this fails (e.g. pipe broken), fall back
+        // to SIGKILL which may leave orphaned sidecar processes.
+        let shutdown = json!({
+            "jsonrpc": "2.0",
+            "id": 9999,
+            "method": "shutdown",
+            "params": null
+        });
+        let _ = self.write_message(&shutdown);
+        // Brief wait for graceful shutdown
+        std::thread::sleep(Duration::from_millis(500));
         let _ = self.process.kill();
     }
 }
@@ -278,7 +395,7 @@ fn test_sidecar_stays_alive() {
         .expect("Failed to initialize LSP server");
 
     // Wait to see if sidecar crashes after initialization
-    std::thread::sleep(Duration::from_secs(2));
+    client.drain_messages(Duration::from_secs(2));
 
     // Try a hover request - if sidecar died, this will fail
     let test_code = "val x = 42";
@@ -317,27 +434,22 @@ fun main() {
 
     // Request completion after "str."
     let params = json!({
-        "textDocument": {
-            "uri": uri
-        },
-        "position": {
-            "line": 3,
-            "character": 8
-        }
+        "textDocument": { "uri": uri },
+        "position": { "line": 3, "character": 8 }
     });
 
     let response = client
         .send_request("textDocument/completion", params)
         .expect("Completion request failed");
 
-    // Check we got completions
+    // Check we got completions — response may be an array or {items: [...]}
     let items = response
         .get("result")
-        .and_then(|r| r.get("items"))
-        .and_then(|i| i.as_array());
+        .and_then(|r| r.as_array().or_else(|| r.get("items").and_then(|i| i.as_array())));
 
     assert!(
         items.is_some() && !items.unwrap().is_empty(),
-        "Completion should return String methods but got none or empty"
+        "Completion should return String methods but got none or empty. Response: {:?}",
+        response.get("result")
     );
 }
