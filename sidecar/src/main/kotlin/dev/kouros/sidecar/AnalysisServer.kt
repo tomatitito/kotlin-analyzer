@@ -28,10 +28,11 @@ class AnalysisServer(
 
             try {
                 handleRequest(request)
-            } catch (e: Exception) {
-                System.err.println("AnalysisServer: error handling ${request.method}: ${e.message}")
+            } catch (e: Throwable) {
+                System.err.println("AnalysisServer: error handling ${request.method}: ${e.javaClass.name}: ${e.message}")
+                e.printStackTrace(System.err)
                 if (request.id != null) {
-                    transport.sendError(request.id, -32603, "Internal error: ${e.message}")
+                    transport.sendError(request.id, -32603, "Internal error: ${e.javaClass.simpleName}: ${e.message}")
                 }
             }
         }

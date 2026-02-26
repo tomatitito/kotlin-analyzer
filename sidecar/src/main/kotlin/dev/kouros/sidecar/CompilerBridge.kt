@@ -86,6 +86,16 @@ class CompilerBridge {
         System.err.println("CompilerBridge: sourceRoots=$sourceRoots")
         System.err.println("CompilerBridge: effectiveSourceRoots=$effectiveSourceRoots")
         System.err.println("CompilerBridge: classpath=${classpath.size} entries")
+
+        // Warn if classpath is empty — likely means dependency extraction failed
+        if (classpath.isEmpty()) {
+            System.err.println("CompilerBridge: WARNING — classpath is empty, external dependency resolution will fail")
+        }
+
+        // Log Spring-related JARs for diagnostic visibility
+        classpath.filter { "spring" in it.lowercase() }.forEach {
+            System.err.println("CompilerBridge: spring JAR on classpath: $it")
+        }
         System.err.println("CompilerBridge: stdlibJars=${stdlibJars.size} jars")
         System.err.println("CompilerBridge: jdkHome=$jdkHome")
 
@@ -203,22 +213,30 @@ class CompilerBridge {
 
         val currentSession = session
         if (currentSession == null) {
+            System.err.println("CompilerBridge: analyze($uri) — session is NULL, returning empty diagnostics")
             result.add("diagnostics", diagnosticsArray)
             return result
         }
 
         val ktFile = findKtFile(currentSession, uri)
         if (ktFile == null) {
-            System.err.println("CompilerBridge: file not found: $uri")
+            System.err.println("CompilerBridge: analyze($uri) — file not found anywhere")
             result.add("diagnostics", diagnosticsArray)
             return result
         }
+
+        System.err.println("CompilerBridge: analyze($uri) — found KtFile: ${ktFile.virtualFile?.path ?: "(ad-hoc)"}, name=${ktFile.name}")
 
         try {
             analyze(ktFile) {
                 val diagnostics = ktFile.collectDiagnostics(
                     KaDiagnosticCheckerFilter.EXTENDED_AND_COMMON_CHECKERS
                 )
+
+                System.err.println("CompilerBridge: analyze($uri) — collectDiagnostics returned ${diagnostics.size} diagnostic(s)")
+                for (d in diagnostics) {
+                    System.err.println("  [${d.severity}] ${d.factoryName}: ${d.defaultMessage} at ${d.textRanges.firstOrNull()}")
+                }
 
                 for (diagnostic in diagnostics) {
                     val diagObj = JsonObject()
@@ -257,8 +275,9 @@ class CompilerBridge {
                     diagnosticsArray.add(diagObj)
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: analysis failed for $uri: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: analysis failed for $uri: ${e.javaClass.name}: ${e.message}")
+            e.printStackTrace(System.err)
         }
 
         result.add("diagnostics", diagnosticsArray)
@@ -319,8 +338,8 @@ class CompilerBridge {
                     current = current.parent
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: hover failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: hover failed: ${e.javaClass.name}: ${e.message}")
         }
 
         return result
@@ -367,8 +386,8 @@ class CompilerBridge {
                     collectScopeCompletions(ktFile, element, itemsArray)
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: completion failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: completion failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("items", itemsArray)
@@ -439,8 +458,8 @@ class CompilerBridge {
                     }
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: definition failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: definition failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("locations", locationsArray)
@@ -541,8 +560,8 @@ class CompilerBridge {
                     locationsArray.add(declLoc)
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: references failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: references failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("locations", locationsArray)
@@ -656,8 +675,8 @@ class CompilerBridge {
                     }
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: signatureHelp failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: signatureHelp failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("signatures", signaturesArray)
@@ -782,8 +801,8 @@ class CompilerBridge {
                     editsArray.add(edit)
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: rename failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: rename failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("edits", editsArray)
@@ -792,18 +811,23 @@ class CompilerBridge {
 
     /**
      * Provides code actions at the given position.
-     * Suggests quick-fixes based on diagnostics at the cursor location,
-     * including "Suppress warning" and "Add import" actions.
+     * Includes:
+     * - Diagnostic-based quick-fixes (suppress warning, add import)
+     * - Context-aware refactoring actions (add/remove explicit type, convert body style)
      */
     fun codeActions(uri: String, line: Int, character: Int): JsonObject {
         val result = JsonObject()
         val actionsArray = JsonArray()
 
+        System.err.println("CompilerBridge: codeActions($uri, line=$line, char=$character)")
+
         val currentSession = session ?: run {
+            System.err.println("CompilerBridge: codeActions — session is NULL")
             result.add("actions", actionsArray)
             return result
         }
         val ktFile = findKtFile(currentSession, uri) ?: run {
+            System.err.println("CompilerBridge: codeActions — file not found")
             result.add("actions", actionsArray)
             return result
         }
@@ -823,97 +847,279 @@ class CompilerBridge {
 
                 val fileUri = "file://${ktFile.virtualFile.path}"
 
-                // Collect diagnostics that overlap with the cursor position
-                val diagnostics = ktFile.collectDiagnostics(
-                    KaDiagnosticCheckerFilter.EXTENDED_AND_COMMON_CHECKERS
-                )
+                // 1. Diagnostic-based code actions
+                try {
+                    val diagnostics = ktFile.collectDiagnostics(
+                        KaDiagnosticCheckerFilter.EXTENDED_AND_COMMON_CHECKERS
+                    )
 
-                for (diagnostic in diagnostics) {
-                    val textRange = diagnostic.textRanges.firstOrNull() ?: continue
+                    for (diagnostic in diagnostics) {
+                        val textRange = diagnostic.textRanges.firstOrNull() ?: continue
 
-                    // Check if the cursor is within this diagnostic's range
-                    if (offset < textRange.startOffset || offset > textRange.endOffset) continue
+                        // Use line-level matching: check if the cursor line overlaps the diagnostic
+                        val diagStartLine = document.getLineNumber(textRange.startOffset)
+                        val diagEndLine = document.getLineNumber(textRange.endOffset)
+                        val cursorLine = line - 1 // Convert to 0-based
 
-                    val factoryName = diagnostic.factoryName ?: continue
-                    val severityName = diagnostic.severity.name
+                        if (cursorLine < diagStartLine || cursorLine > diagEndLine) continue
 
-                    // Suppress warning action for warnings
-                    if (severityName == "WARNING") {
-                        val action = JsonObject()
-                        action.addProperty("title", "Suppress warning '$factoryName'")
-                        action.addProperty("kind", "quickfix")
+                        val factoryName = diagnostic.factoryName ?: continue
+                        val severityName = diagnostic.severity.name
 
-                        val actionEdits = JsonArray()
+                        // Suppress warning action for warnings
+                        if (severityName == "WARNING") {
+                            val action = JsonObject()
+                            action.addProperty("title", "Suppress warning '$factoryName'")
+                            action.addProperty("kind", "quickfix")
 
-                        // Find the enclosing declaration to add @Suppress annotation
-                        val element = ktFile.findElementAt(textRange.startOffset)
-                        val enclosingDeclaration = findEnclosingDeclaration(element)
+                            val actionEdits = JsonArray()
 
-                        if (enclosingDeclaration != null) {
-                            val declOffset = enclosingDeclaration.textOffset
-                            val declLine = document.getLineNumber(declOffset) + 1
-                            val declLineStart = document.getLineStartOffset(document.getLineNumber(declOffset))
-                            val declCol = declOffset - declLineStart
+                            val element = ktFile.findElementAt(textRange.startOffset)
+                            val enclosingDeclaration = findEnclosingDeclaration(element)
 
-                            // Determine indentation of the declaration
-                            val lineEndOffset = document.getLineEndOffset(document.getLineNumber(declOffset))
-                            val lineText = document.charsSequence.subSequence(declLineStart, lineEndOffset).toString()
-                            val indent = lineText.takeWhile { it == ' ' || it == '\t' }
+                            if (enclosingDeclaration != null) {
+                                val declOffset = enclosingDeclaration.textOffset
+                                val declLine = document.getLineNumber(declOffset) + 1
+                                val declLineStart = document.getLineStartOffset(document.getLineNumber(declOffset))
+                                val declCol = declOffset - declLineStart
 
-                            val suppressEdit = JsonObject()
-                            suppressEdit.addProperty("uri", fileUri)
-                            val suppressRange = JsonObject()
-                            suppressRange.addProperty("startLine", declLine)
-                            suppressRange.addProperty("startColumn", declCol)
-                            suppressRange.addProperty("endLine", declLine)
-                            suppressRange.addProperty("endColumn", declCol)
-                            suppressEdit.add("range", suppressRange)
-                            suppressEdit.addProperty("newText", "@Suppress(\"$factoryName\")\n$indent")
-                            actionEdits.add(suppressEdit)
+                                val lineEndOffset = document.getLineEndOffset(document.getLineNumber(declOffset))
+                                val lineText = document.charsSequence.subSequence(declLineStart, lineEndOffset).toString()
+                                val indent = lineText.takeWhile { it == ' ' || it == '\t' }
+
+                                val suppressEdit = JsonObject()
+                                suppressEdit.addProperty("uri", fileUri)
+                                val suppressRange = JsonObject()
+                                suppressRange.addProperty("startLine", declLine)
+                                suppressRange.addProperty("startColumn", declCol)
+                                suppressRange.addProperty("endLine", declLine)
+                                suppressRange.addProperty("endColumn", declCol)
+                                suppressEdit.add("range", suppressRange)
+                                suppressEdit.addProperty("newText", "@Suppress(\"$factoryName\")\n$indent")
+                                actionEdits.add(suppressEdit)
+                            }
+
+                            action.add("edits", actionEdits)
+                            actionsArray.add(action)
                         }
 
-                        action.add("edits", actionEdits)
-                        actionsArray.add(action)
+                        // Add import action for unresolved references
+                        if (factoryName == "UNRESOLVED_REFERENCE") {
+                            val unresolvedText = ktFile.text.substring(
+                                textRange.startOffset,
+                                minOf(textRange.endOffset, ktFile.text.length)
+                            )
+
+                            val action = JsonObject()
+                            action.addProperty("title", "Add import for '$unresolvedText'")
+                            action.addProperty("kind", "quickfix")
+
+                            val actionEdits = JsonArray()
+                            val importInsertLine = findImportInsertLine(ktFile, document)
+
+                            val importEdit = JsonObject()
+                            importEdit.addProperty("uri", fileUri)
+                            val importRange = JsonObject()
+                            importRange.addProperty("startLine", importInsertLine)
+                            importRange.addProperty("startColumn", 0)
+                            importRange.addProperty("endLine", importInsertLine)
+                            importRange.addProperty("endColumn", 0)
+                            importEdit.add("range", importRange)
+                            importEdit.addProperty("newText", "import $unresolvedText\n")
+                            actionEdits.add(importEdit)
+
+                            action.add("edits", actionEdits)
+                            actionsArray.add(action)
+                        }
                     }
+                } catch (e: Exception) {
+                    System.err.println("CompilerBridge: diagnostic code actions failed: ${e.message}")
+                }
 
-                    // Add import action for unresolved references
-                    if (factoryName == "UNRESOLVED_REFERENCE") {
-                        val unresolvedText = ktFile.text.substring(
-                            textRange.startOffset,
-                            minOf(textRange.endOffset, ktFile.text.length)
-                        )
+                // 2. Context-aware refactoring actions
+                val element = ktFile.findElementAt(offset)
+                if (element != null) {
+                    // Add explicit type annotation for properties without one
+                    addExplicitTypeAction(element, document, fileUri, actionsArray)
 
-                        val action = JsonObject()
-                        action.addProperty("title", "Add import for '$unresolvedText'")
-                        action.addProperty("kind", "quickfix")
-
-                        val actionEdits = JsonArray()
-
-                        // Find the insertion point for imports (after package statement, before first declaration)
-                        val importInsertLine = findImportInsertLine(ktFile, document)
-
-                        val importEdit = JsonObject()
-                        importEdit.addProperty("uri", fileUri)
-                        val importRange = JsonObject()
-                        importRange.addProperty("startLine", importInsertLine)
-                        importRange.addProperty("startColumn", 0)
-                        importRange.addProperty("endLine", importInsertLine)
-                        importRange.addProperty("endColumn", 0)
-                        importEdit.add("range", importRange)
-                        importEdit.addProperty("newText", "import $unresolvedText\n")
-                        actionEdits.add(importEdit)
-
-                        action.add("edits", actionEdits)
-                        actionsArray.add(action)
-                    }
+                    // Convert between expression body and block body for functions
+                    addConvertBodyAction(element, document, fileUri, actionsArray)
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: codeActions failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: codeActions failed: ${e.javaClass.name}: ${e.message}")
+            e.printStackTrace(System.err)
+        }
+
+        System.err.println("CompilerBridge: codeActions($uri) — returning ${actionsArray.size()} action(s)")
+        for (i in 0 until actionsArray.size()) {
+            val action = actionsArray[i].asJsonObject
+            System.err.println("  action[$i]: ${action.get("title")?.asString} (kind=${action.get("kind")?.asString})")
         }
 
         result.add("actions", actionsArray)
         return result
+    }
+
+    /**
+     * Adds "Add explicit type" code action for properties/variables that lack a type annotation.
+     */
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.addExplicitTypeAction(
+        element: PsiElement,
+        document: com.intellij.openapi.editor.Document,
+        fileUri: String,
+        actionsArray: JsonArray,
+    ) {
+        try {
+            val property = PsiTreeUtil.getParentOfType(element, KtProperty::class.java, false)
+            if (property != null && property.typeReference == null && property.initializer != null) {
+                val nameIdentifier = property.nameIdentifier ?: return
+                val symbol = property.symbol
+                val returnType = symbol.returnType
+                val rendered = returnType.render(
+                    KaTypeRendererForSource.WITH_SHORT_NAMES,
+                    Variance.INVARIANT
+                )
+
+                if (rendered.isNotEmpty() && rendered != "Unit" && rendered != "Nothing") {
+                    val action = JsonObject()
+                    action.addProperty("title", "Add explicit type '$rendered'")
+                    action.addProperty("kind", "refactor")
+
+                    val actionEdits = JsonArray()
+                    val insertOffset = nameIdentifier.textRange.endOffset
+                    val insertLine = document.getLineNumber(insertOffset) + 1
+                    val insertLineStart = document.getLineStartOffset(document.getLineNumber(insertOffset))
+                    val insertCol = insertOffset - insertLineStart
+
+                    val edit = JsonObject()
+                    edit.addProperty("uri", fileUri)
+                    val range = JsonObject()
+                    range.addProperty("startLine", insertLine)
+                    range.addProperty("startColumn", insertCol)
+                    range.addProperty("endLine", insertLine)
+                    range.addProperty("endColumn", insertCol)
+                    edit.add("range", range)
+                    edit.addProperty("newText", ": $rendered")
+                    actionEdits.add(edit)
+
+                    action.add("edits", actionEdits)
+                    actionsArray.add(action)
+                }
+            }
+        } catch (_: Exception) {
+            // Ignore failures in type resolution
+        }
+    }
+
+    /**
+     * Adds "Convert to expression body" / "Convert to block body" code action for functions.
+     */
+    private fun addConvertBodyAction(
+        element: PsiElement,
+        document: com.intellij.openapi.editor.Document,
+        fileUri: String,
+        actionsArray: JsonArray,
+    ) {
+        try {
+            val function = PsiTreeUtil.getParentOfType(element, KtNamedFunction::class.java, false)
+                ?: return
+
+            val body = function.bodyBlockExpression
+            val expressionBody = function.bodyExpression
+
+            if (body != null && body.statements.size == 1) {
+                // Function has block body with single statement — offer conversion to expression body
+                val singleStatement = body.statements.first()
+                // Only convert if the statement is a return or a simple expression
+                val expr = if (singleStatement is KtReturnExpression) {
+                    singleStatement.returnedExpression
+                } else {
+                    singleStatement
+                }
+
+                if (expr != null) {
+                    val action = JsonObject()
+                    action.addProperty("title", "Convert to expression body")
+                    action.addProperty("kind", "refactor")
+
+                    val actionEdits = JsonArray()
+
+                    // Replace from the opening brace to the closing brace with "= expr"
+                    val bodyStart = body.textOffset
+                    val bodyEnd = body.textRange.endOffset
+
+                    val startLine = document.getLineNumber(bodyStart) + 1
+                    val startLineStart = document.getLineStartOffset(document.getLineNumber(bodyStart))
+                    val startCol = bodyStart - startLineStart
+
+                    val endLine = document.getLineNumber(bodyEnd) + 1
+                    val endLineStart = document.getLineStartOffset(document.getLineNumber(bodyEnd))
+                    val endCol = bodyEnd - endLineStart
+
+                    val edit = JsonObject()
+                    edit.addProperty("uri", fileUri)
+                    val range = JsonObject()
+                    range.addProperty("startLine", startLine)
+                    range.addProperty("startColumn", startCol)
+                    range.addProperty("endLine", endLine)
+                    range.addProperty("endColumn", endCol)
+                    edit.add("range", range)
+                    edit.addProperty("newText", "= ${expr.text}")
+                    actionEdits.add(edit)
+
+                    action.add("edits", actionEdits)
+                    actionsArray.add(action)
+                }
+            } else if (expressionBody != null && body == null) {
+                // Function has expression body — offer conversion to block body
+                val equalsToken = function.equalsToken ?: return
+
+                val action = JsonObject()
+                action.addProperty("title", "Convert to block body")
+                action.addProperty("kind", "refactor")
+
+                val actionEdits = JsonArray()
+
+                val exprStart = equalsToken.textOffset
+                val exprEnd = expressionBody.textRange.endOffset
+
+                val startLine = document.getLineNumber(exprStart) + 1
+                val startLineStart = document.getLineStartOffset(document.getLineNumber(exprStart))
+                val startCol = exprStart - startLineStart
+
+                val endLine = document.getLineNumber(exprEnd) + 1
+                val endLineStart = document.getLineStartOffset(document.getLineNumber(exprEnd))
+                val endCol = exprEnd - endLineStart
+
+                // Determine indentation
+                val funcOffset = function.textOffset
+                val funcLineStart = document.getLineStartOffset(document.getLineNumber(funcOffset))
+                val funcLineEnd = document.getLineEndOffset(document.getLineNumber(funcOffset))
+                val funcLineText = document.charsSequence.subSequence(funcLineStart, funcLineEnd).toString()
+                val indent = funcLineText.takeWhile { it == ' ' || it == '\t' }
+
+                val hasReturnType = function.typeReference != null
+
+                val edit = JsonObject()
+                edit.addProperty("uri", fileUri)
+                val range = JsonObject()
+                range.addProperty("startLine", startLine)
+                range.addProperty("startColumn", startCol)
+                range.addProperty("endLine", endLine)
+                range.addProperty("endColumn", endCol)
+                edit.add("range", range)
+
+                val returnKeyword = if (hasReturnType) "return " else ""
+                edit.addProperty("newText", "{\n$indent    ${returnKeyword}${expressionBody.text}\n$indent}")
+                actionEdits.add(edit)
+
+                action.add("edits", actionEdits)
+                actionsArray.add(action)
+            }
+        } catch (_: Exception) {
+            // Ignore failures in function body analysis
+        }
     }
 
     /**
@@ -983,8 +1189,8 @@ class CompilerBridge {
                     count++
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: workspaceSymbols failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: workspaceSymbols failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("symbols", symbolsArray)
@@ -1158,8 +1364,8 @@ class CompilerBridge {
                     }
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: inlayHints failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: inlayHints failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("hints", hintsArray)
@@ -1269,8 +1475,8 @@ class CompilerBridge {
                     }
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: codeLens failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: codeLens failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("lenses", lensesArray)
@@ -1437,8 +1643,8 @@ class CompilerBridge {
                 prevLine = token.line
                 prevCol = token.col
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: semanticTokens failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: semanticTokens failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("data", dataArray)
@@ -1485,8 +1691,8 @@ class CompilerBridge {
                     }
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: callHierarchyPrepare failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: callHierarchyPrepare failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("items", itemsArray)
@@ -1617,8 +1823,8 @@ class CompilerBridge {
                     }
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: callHierarchyIncoming failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: callHierarchyIncoming failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("calls", callsArray)
@@ -1663,8 +1869,8 @@ class CompilerBridge {
                     }
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: typeHierarchyPrepare failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: typeHierarchyPrepare failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("items", itemsArray)
@@ -1770,8 +1976,8 @@ class CompilerBridge {
                     }
                 }
             }
-        } catch (e: Exception) {
-            System.err.println("CompilerBridge: typeHierarchySupertypes failed: ${e.message}")
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: typeHierarchySupertypes failed: ${e.javaClass.name}: ${e.message}")
         }
 
         result.add("supertypes", supertypesArray)
@@ -1808,6 +2014,12 @@ class CompilerBridge {
         val kdocText = extractKDocText(declaration)
 
         return buildString {
+            // Show containing package/class for context
+            val containerInfo = buildContainerInfo(symbol)
+            if (containerInfo != null) {
+                append(containerInfo)
+                append("\n\n")
+            }
             append("```kotlin\n")
             append(rendered)
             append("\n```")
@@ -1836,11 +2048,16 @@ class CompilerBridge {
                         symbol.toString()
                     }
 
-                    // Try to get KDoc from the PSI
-                    val psi = symbol.psi
-                    val kdocText = if (psi is KtDeclaration) extractKDocText(psi) else null
+                    // Try to get documentation from the PSI
+                    val kdocText = extractSymbolDocumentation(symbol)
 
                     return buildString {
+                        // Show containing package/class for context
+                        val containerInfo = buildContainerInfo(symbol)
+                        if (containerInfo != null) {
+                            append(containerInfo)
+                            append("\n\n")
+                        }
                         append("```kotlin\n")
                         append(rendered)
                         append("\n```")
@@ -1854,18 +2071,174 @@ class CompilerBridge {
         }
 
         // Fallback: try expression type
-        if (refExpr is KtExpression) {
-            val type = refExpr.expressionType
-            if (type != null) {
-                val rendered = type.render(
-                    KaTypeRendererForSource.WITH_SHORT_NAMES,
-                    Variance.INVARIANT
-                )
-                return "```kotlin\n$rendered\n```"
-            }
+        val type = refExpr.expressionType
+        if (type != null) {
+            val rendered = type.render(
+                KaTypeRendererForSource.WITH_SHORT_NAMES,
+                Variance.INVARIANT
+            )
+            return "```kotlin\n$rendered\n```"
         }
 
         return null
+    }
+
+    /**
+     * Builds a container info line showing the package and/or containing class.
+     * Returns something like "(org.example)" or "(MyClass in org.example)".
+     * Must be called inside an `analyze` block.
+     */
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.buildContainerInfo(
+        symbol: KaDeclarationSymbol,
+    ): String? {
+        try {
+            // Get the containing symbol for context
+            val containingSymbol = try {
+                symbol.containingDeclaration
+            } catch (_: Exception) {
+                null
+            }
+
+            // Try to get the fully qualified name from the PSI
+            val psi = symbol.psi
+            val fqName = when (psi) {
+                is KtNamedDeclaration -> psi.fqName?.asString()
+                else -> null
+            }
+
+            if (fqName != null) {
+                val name = when (symbol) {
+                    is KaNamedSymbol -> symbol.name.asString()
+                    else -> null
+                }
+                val packageName = if (name != null && fqName.endsWith(".$name")) {
+                    fqName.removeSuffix(".$name")
+                } else {
+                    fqName.substringBeforeLast('.', "")
+                }
+                if (packageName.isNotEmpty()) {
+                    // Show containing class if applicable
+                    if (containingSymbol is KaNamedSymbol) {
+                        return "*(${containingSymbol.name.asString()} in $packageName)*"
+                    }
+                    return "*($packageName)*"
+                }
+            }
+
+            // Fallback: try to get package from containing class symbol chain
+            if (containingSymbol is KaNamedSymbol) {
+                val containerPsi = containingSymbol.psi
+                val containerFqName = (containerPsi as? KtNamedDeclaration)?.fqName?.asString()
+                if (containerFqName != null) {
+                    return "*(${containingSymbol.name.asString()} in ${containerFqName.substringBeforeLast('.', "")})*"
+                }
+                return "*(in ${containingSymbol.name.asString()})*"
+            }
+        } catch (_: Exception) {
+            // Ignore errors in container info — it's supplementary
+        }
+        return null
+    }
+
+    /**
+     * Extracts documentation for a symbol, trying multiple sources:
+     * 1. KDoc from the PSI (works for source declarations)
+     * 2. KDoc from decompiled stubs (works for Kotlin library declarations)
+     * 3. Javadoc-style comments from Java stubs
+     * Must be called inside an `analyze` block.
+     */
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.extractSymbolDocumentation(
+        symbol: KaDeclarationSymbol,
+    ): String? {
+        val psi = symbol.psi
+
+        // Source KDoc
+        if (psi is KtDeclaration) {
+            val kdoc = extractKDocText(psi)
+            if (kdoc != null) return kdoc
+        }
+
+        // For library symbols, try to find documentation from the decompiled source
+        // The Analysis API may expose decompiled declarations with KDoc from metadata
+        if (psi is KtDeclaration) {
+            // Try extracting from the raw text of the decompiled declaration
+            val docComment = extractDocCommentFromPsiText(psi)
+            if (docComment != null) return docComment
+        }
+
+        // Try Javadoc-style comments (for Java declarations accessed via Kotlin)
+        if (psi != null) {
+            val javadoc = extractJavadocFromPsi(psi)
+            if (javadoc != null) return javadoc
+        }
+
+        return null
+    }
+
+    /**
+     * Extracts documentation from the raw PSI text, handling cases where
+     * docComment returns null but the text itself contains documentation.
+     */
+    private fun extractDocCommentFromPsiText(declaration: KtDeclaration): String? {
+        try {
+            // Walk backwards through siblings looking for doc comments
+            var prev = declaration.prevSibling
+            while (prev != null) {
+                if (prev is PsiWhiteSpace) {
+                    prev = prev.prevSibling
+                    continue
+                }
+                if (prev is PsiComment) {
+                    val text = prev.text
+                    if (text.startsWith("/**")) {
+                        return parseDocCommentText(text)
+                    }
+                }
+                break
+            }
+        } catch (_: Exception) {
+            // Ignore
+        }
+        return null
+    }
+
+    /**
+     * Parses a doc comment string into clean documentation text.
+     * Strips comment markers and leading asterisks from each line.
+     */
+    private fun parseDocCommentText(comment: String): String? {
+        val lines = comment.removePrefix("/**").removeSuffix("*/")
+            .lines()
+            .map { it.trim().removePrefix("* ").removePrefix("*") }
+            .filter { it.isNotBlank() }
+        if (lines.isEmpty()) return null
+        return lines.joinToString("\n")
+    }
+
+    /**
+     * Tries to extract Javadoc from a Java PSI element.
+     */
+    private fun extractJavadocFromPsi(element: PsiElement): String? {
+        try {
+            // Check for PsiDocCommentOwner (Java interface)
+            val docOwnerClass = try {
+                Class.forName("com.intellij.psi.javadoc.PsiDocCommentOwner")
+            } catch (_: ClassNotFoundException) {
+                return null
+            }
+
+            if (!docOwnerClass.isInstance(element)) return null
+
+            val getDocComment = docOwnerClass.getMethod("getDocComment")
+            val docComment = getDocComment.invoke(element) ?: return null
+
+            val getText = docComment.javaClass.getMethod("getText")
+            val text = getText.invoke(docComment) as? String ?: return null
+
+            return parseDocCommentText(text)
+        } catch (_: Exception) {
+            return null
+        }
     }
 
     // --- Private helpers: completion ---
@@ -1880,7 +2253,7 @@ class CompilerBridge {
         while (current != null && current !is KtFile) {
             if (current is KtQualifiedExpression) {
                 val dotNode = current.operationTokenNode
-                if (dotNode != null && offset > dotNode.startOffset) {
+                if (offset > dotNode.startOffset) {
                     return current.receiverExpression
                 }
             }
@@ -2546,20 +2919,35 @@ class CompilerBridge {
     private fun findKtFile(session: StandaloneAnalysisAPISession, uri: String): KtFile? {
         val filePath = uriToPath(uri)
 
-        // First, look for the file in the session's discovered source files
-        val sessionFile = session.modulesWithFiles.entries
+        // Log all session files for debugging (first time only per session)
+        val allSessionFiles = session.modulesWithFiles.entries
             .flatMap { (_, files) -> files }
             .filterIsInstance<KtFile>()
+
+        System.err.println("CompilerBridge: findKtFile($uri) — resolved path=$filePath, session has ${allSessionFiles.size} file(s)")
+
+        // First, look for the file in the session's discovered source files
+        val sessionFile = allSessionFiles
             .find { it.virtualFile.path == filePath || it.name == filePath }
 
         if (sessionFile != null) {
+            System.err.println("CompilerBridge: findKtFile($uri) — FOUND in session: ${sessionFile.virtualFile.path}")
             return sessionFile
+        }
+
+        System.err.println("CompilerBridge: findKtFile($uri) — NOT in session. Session file paths:")
+        for (f in allSessionFiles.take(10)) {
+            System.err.println("  session file: ${f.virtualFile.path}")
+        }
+        if (allSessionFiles.size > 10) {
+            System.err.println("  ... and ${allSessionFiles.size - 10} more")
         }
 
         // If not found in session, try to create a KtFile from virtualFiles content
         val content = virtualFiles[uri]
         if (content != null) {
-            System.err.println("CompilerBridge: file not in session, creating from virtualFiles: $uri")
+            System.err.println("CompilerBridge: findKtFile($uri) — creating AD-HOC from virtualFiles (${content.length} chars)")
+            System.err.println("CompilerBridge: WARNING — ad-hoc files lack module context (classpath/deps), diagnostics may be incomplete")
             try {
                 val fileName = filePath.substringAfterLast('/')
                 val psiFactory = KtPsiFactory(session.project)
@@ -2572,7 +2960,8 @@ class CompilerBridge {
         // Last resort: try to read from disk if the file exists
         val file = File(filePath)
         if (file.exists() && file.extension == "kt") {
-            System.err.println("CompilerBridge: file not in session, creating from disk: $uri")
+            System.err.println("CompilerBridge: findKtFile($uri) — creating AD-HOC from disk: $filePath")
+            System.err.println("CompilerBridge: WARNING — ad-hoc files lack module context (classpath/deps), diagnostics may be incomplete")
             try {
                 val psiFactory = KtPsiFactory(session.project)
                 return psiFactory.createFile(file.name, file.readText())
@@ -2581,7 +2970,8 @@ class CompilerBridge {
             }
         }
 
-        System.err.println("CompilerBridge: file not found anywhere: $uri (path=$filePath)")
+        System.err.println("CompilerBridge: findKtFile($uri) — NOT FOUND anywhere (path=$filePath)")
+        System.err.println("CompilerBridge: virtualFiles keys: ${virtualFiles.keys}")
         return null
     }
 
