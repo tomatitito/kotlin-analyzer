@@ -41,13 +41,13 @@ impl KotlinLanguageServer {
 
     /// Publishes diagnostics for a document by requesting analysis from the sidecar.
     async fn analyze_document(&self, uri: &Url) {
-        tracing::info!("analyze_document: {}", uri);
+        tracing::debug!("analyze_document: {}", uri);
 
         let bridge = self.bridge.lock().await;
         let bridge = match bridge.as_ref() {
             Some(b) => b,
             None => {
-                tracing::warn!("analyze_document: bridge is None, skipping");
+                tracing::debug!("analyze_document: bridge is None (sidecar still starting), skipping");
                 return;
             }
         };
@@ -89,6 +89,7 @@ impl KotlinLanguageServer {
             .await
         {
             Ok(result) => {
+                tracing::info!("analyze_document: raw sidecar response for {}: {}", uri, result);
                 let diagnostics = self.parse_diagnostics(&result);
                 tracing::info!("analyze_document: {} returned {} diagnostics", uri, diagnostics.len());
                 for d in &diagnostics {
@@ -271,10 +272,22 @@ impl LanguageServer for KotlinLanguageServer {
         tracing::info!("kotlin-analyzer: initializing");
 
         // Store project root (project model resolution happens in initialized())
+        // Walk up from the rootUri to find the actual project root containing
+        // build system markers. Zed sometimes sets rootUri to a deep source
+        // directory (e.g. when opening a single file), so we need to find the
+        // real project root that has build.gradle.kts, pom.xml, etc.
         if let Some(root_uri) = params.root_uri {
             if let Ok(path) = root_uri.to_file_path() {
+                let resolved = project::find_project_root(&path);
+                if resolved != path {
+                    tracing::info!(
+                        "resolved project root from {} to {}",
+                        path.display(),
+                        resolved.display()
+                    );
+                }
                 let mut project_root = self.project_root.lock().await;
-                *project_root = Some(path);
+                *project_root = Some(resolved);
             }
         }
 
@@ -432,12 +445,13 @@ impl LanguageServer for KotlinLanguageServer {
         // the client's response) from within a notification handler deadlocks.
         let client = self.client.clone();
         let bridge_holder = Arc::clone(&self.bridge);
+        let documents_holder = Arc::clone(&self.documents);
         let config = self.config.lock().await.clone();
         let project_root = self.project_root.lock().await.clone();
 
-        tracing::info!("About to spawn background task for sidecar startup");
+        tracing::debug!("about to spawn background task for sidecar startup");
         tokio::spawn(async move {
-            tracing::info!("initialized: background task started - spawned successfully");
+            tracing::debug!("initialized: background task started");
 
             // Create progress token
             let token = NumberOrString::String("kotlin-analyzer-startup".to_string());
@@ -475,10 +489,10 @@ impl LanguageServer for KotlinLanguageServer {
 
             // Resolve project model first so we can pass it to the sidecar
             let project_model = if let Some(ref root) = project_root {
-                tracing::info!("resolving project model for {:?}", root);
+                tracing::debug!("resolving project model for {:?}", root);
                 match project::resolve_project(root, &config) {
                     Ok(model) => {
-                        tracing::info!(
+                        tracing::debug!(
                             "project resolved: {} source roots, {} classpath entries, {} compiler flags",
                             model.source_roots.len(),
                             model.classpath.len(),
@@ -505,7 +519,7 @@ impl LanguageServer for KotlinLanguageServer {
                     }
                 }
             } else {
-                tracing::info!("no project root, using stdlib-only analysis");
+                tracing::debug!("no project root, using stdlib-only analysis");
                 None
             };
 
@@ -576,7 +590,7 @@ impl LanguageServer for KotlinLanguageServer {
             };
 
             tracing::debug!("sidecar JAR found at {:?}", sidecar_jar);
-            tracing::info!("Creating Bridge with sidecar JAR and java path");
+            tracing::debug!("creating Bridge with sidecar JAR and java path");
             let bridge = Bridge::new(sidecar_jar, java_path, config);
 
             // Store the bridge BEFORE starting so LSP requests that arrive
@@ -614,11 +628,11 @@ impl LanguageServer for KotlinLanguageServer {
             // KtPsiFactory. This is faster than scanning the entire project root
             // and works well for basic features (hover, completion, diagnostics).
             if source_roots.is_empty() {
-                tracing::info!("no source roots found, sidecar will use per-file fallback");
+                tracing::debug!("no source roots found, sidecar will use per-file fallback");
             }
 
-            tracing::info!(
-                "Starting sidecar with project_root={}, classpath={} entries, source_roots={:?}",
+            tracing::debug!(
+                "starting sidecar with project_root={}, classpath={} entries, source_roots={:?}",
                 project_root_str, classpath.len(), source_roots
             );
 
@@ -646,6 +660,59 @@ impl LanguageServer for KotlinLanguageServer {
                             )),
                         })
                         .await;
+
+                    // Replay all open documents: send didOpen + analyze for each
+                    // file that was opened before the sidecar was ready.
+                    let open_docs: Vec<(Url, String, i32)> = {
+                        let docs = documents_holder.lock().await;
+                        docs.all()
+                            .map(|(uri, doc)| (uri.clone(), doc.text.clone(), doc.version))
+                            .collect()
+                    };
+
+                    if !open_docs.is_empty() {
+                        tracing::info!("replaying {} open document(s) after sidecar startup", open_docs.len());
+                    }
+
+                    let bridge_ref = bridge_holder.lock().await;
+                    if let Some(bridge) = bridge_ref.as_ref() {
+                        for (uri, text, version) in &open_docs {
+                            tracing::debug!("replay: sending didOpen for {}", uri);
+                            let _ = bridge.notify(
+                                "textDocument/didOpen",
+                                Some(serde_json::json!({
+                                    "uri": uri.as_str(),
+                                    "version": version,
+                                    "text": text,
+                                })),
+                            ).await;
+
+                            // Send didChange + analyze
+                            let _ = bridge.notify(
+                                "textDocument/didChange",
+                                Some(serde_json::json!({
+                                    "uri": uri.as_str(),
+                                    "version": version,
+                                    "text": text,
+                                })),
+                            ).await;
+
+                            match bridge.request(
+                                "analyze",
+                                Some(serde_json::json!({ "uri": uri.as_str() })),
+                            ).await {
+                                Ok(result) => {
+                                    let diagnostics = parse_diagnostics_static(&result);
+                                    tracing::info!("replay: {} returned {} diagnostics", uri, diagnostics.len());
+                                    client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("replay: analysis failed for {}: {}", uri, e);
+                                }
+                            }
+                        }
+                    }
+                    drop(bridge_ref);
                 }
                 Err(e) => {
                     tracing::error!("failed to start sidecar: {:?}", e);
@@ -693,7 +760,7 @@ impl LanguageServer for KotlinLanguageServer {
         let text = params.text_document.text.clone();
         let version = params.text_document.version;
 
-        tracing::info!("did_open: {} (version {}, {} bytes)", uri, version, text.len());
+        tracing::debug!("did_open: {} (version {}, {} bytes)", uri, version, text.len());
 
         {
             let mut documents = self.documents.lock().await;
@@ -746,19 +813,21 @@ impl LanguageServer for KotlinLanguageServer {
         }
 
         // Notify sidecar
-        let bridge = self.bridge.lock().await;
-        if let Some(bridge) = bridge.as_ref() {
-            let _ = bridge
-                .notify(
-                    "textDocument/didClose",
-                    Some(serde_json::json!({
-                        "uri": uri.as_str(),
-                    })),
-                )
-                .await;
+        {
+            let bridge = self.bridge.lock().await;
+            if let Some(bridge) = bridge.as_ref() {
+                let _ = bridge
+                    .notify(
+                        "textDocument/didClose",
+                        Some(serde_json::json!({
+                            "uri": uri.as_str(),
+                        })),
+                    )
+                    .await;
+            }
         }
 
-        // Clear diagnostics for closed document
+        // Clear diagnostics for closed document (bridge lock released)
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
@@ -798,7 +867,7 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        tracing::info!("hover request: {}:{}:{}", uri, position.line, position.character);
+        tracing::debug!("hover request: {}:{}:{}", uri, position.line, position.character);
 
         let bridge = self.bridge.lock().await;
         let bridge = match bridge.as_ref() {
@@ -810,7 +879,7 @@ impl LanguageServer for KotlinLanguageServer {
         };
 
         let sidecar_state = bridge.state().await;
-        tracing::info!("hover: sidecar state is {:?}", sidecar_state);
+        tracing::debug!("hover: sidecar state is {:?}", sidecar_state);
 
         match bridge
             .request(
@@ -824,7 +893,7 @@ impl LanguageServer for KotlinLanguageServer {
             .await
         {
             Ok(result) => {
-                tracing::info!("hover: sidecar returned: {}", result);
+                tracing::debug!("hover: sidecar returned: {}", result);
                 if let Some(contents) = result.get("contents").and_then(|c| c.as_str()) {
                     Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
@@ -1052,7 +1121,7 @@ impl LanguageServer for KotlinLanguageServer {
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         if let Ok(config) = serde_json::from_value::<Config>(params.settings) {
-            tracing::info!("configuration updated");
+            tracing::debug!("configuration updated");
             let mut c = self.config.lock().await;
             *c = config.clone();
 
@@ -1072,12 +1141,13 @@ impl LanguageServer for KotlinLanguageServer {
 
             let path_str = path.to_string_lossy();
 
-            // Check if it's a build file
-            if path_str.ends_with(".gradle")
+            // Check if it's a build file (ignore our own init script to avoid loops)
+            let is_build_file = (path_str.ends_with(".gradle")
                 || path_str.ends_with(".gradle.kts")
-                || path_str.ends_with("gradle.properties")
-            {
-                tracing::info!("build file changed: {}, triggering project re-resolution", path_str);
+                || path_str.ends_with("gradle.properties"))
+                && !path_str.ends_with(".kotlin-analyzer-init.gradle");
+            if is_build_file {
+                tracing::debug!("build file changed: {}, triggering project re-resolution", path_str);
 
                 let project_root = self.project_root.lock().await.clone();
                 if let Some(root) = project_root {
@@ -1087,7 +1157,7 @@ impl LanguageServer for KotlinLanguageServer {
                     tokio::spawn(async move {
                         match project::resolve_project(&root, &config) {
                             Ok(model) => {
-                                tracing::info!("project re-resolved after build file change");
+                                tracing::debug!("project re-resolved after build file change");
                                 let cache_dir = root.join(".kotlin-analyzer");
                                 if let Err(e) = project::save_cache(&model, &cache_dir) {
                                     tracing::warn!("failed to cache project model: {}", e);
@@ -1106,7 +1176,7 @@ impl LanguageServer for KotlinLanguageServer {
                     });
                 }
             } else if path_str.ends_with(".editorconfig") {
-                tracing::info!(".editorconfig changed: {}", path_str);
+                tracing::debug!(".editorconfig changed: {}", path_str);
                 // External formatters pick up .editorconfig automatically, nothing to do
             }
         }
@@ -1194,7 +1264,9 @@ impl LanguageServer for KotlinLanguageServer {
             .await
         {
             Ok(result) => {
+                tracing::info!("code_action: raw sidecar response for {}: {}", uri, result);
                 let actions = self.parse_code_actions(&result);
+                tracing::info!("code_action: parsed {} action(s) for {} at L{}:{}", actions.len(), uri, range.start.line, range.start.character);
                 if actions.is_empty() {
                     Ok(None)
                 } else {
@@ -1202,7 +1274,7 @@ impl LanguageServer for KotlinLanguageServer {
                 }
             }
             Err(e) => {
-                tracing::warn!("code_action failed: {}", e);
+                tracing::warn!("code_action failed for {}: {}", uri, e);
                 Ok(None)
             }
         }

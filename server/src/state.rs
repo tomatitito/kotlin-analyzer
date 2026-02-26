@@ -45,6 +45,10 @@ impl DocumentStore {
         self.documents.values()
     }
 
+    pub fn all(&self) -> impl Iterator<Item = (&Url, &Document)> {
+        self.documents.iter()
+    }
+
     #[allow(dead_code)]
     pub fn is_open(&self, uri: &Url) -> bool {
         self.documents.contains_key(uri)

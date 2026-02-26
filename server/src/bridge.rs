@@ -50,7 +50,7 @@ pub struct Bridge {
 impl Bridge {
     /// Creates a new bridge but does not start the sidecar yet.
     pub fn new(sidecar_jar: PathBuf, java_path: PathBuf, config: Config) -> Self {
-        tracing::info!("Bridge::new called with sidecar_jar: {:?}, java_path: {:?}", sidecar_jar, java_path);
+        tracing::debug!("Bridge::new called with sidecar_jar: {:?}, java_path: {:?}", sidecar_jar, java_path);
         let (request_tx, _request_rx) = mpsc::channel(32);
         let (state_watch_tx, state_watch_rx) = watch::channel(SidecarState::Stopped);
 
@@ -197,7 +197,7 @@ impl Bridge {
     ) -> Result<(), Error> {
         {
             Self::set_state(&self.state, &self.state_watch_tx, SidecarState::Starting).await;
-            tracing::info!("Sidecar state changed to Starting");
+            tracing::debug!("sidecar state changed to Starting");
         }
 
         let config = self.config.lock().await.clone();
@@ -258,7 +258,7 @@ impl Bridge {
 
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
-            tracing::info!("Sidecar reader task started, waiting for messages from sidecar...");
+            tracing::debug!("sidecar reader task started");
             loop {
                 tokio::select! {
                     result = jsonrpc::read_message(&mut reader) => {
@@ -285,7 +285,7 @@ impl Bridge {
                         }
                     }
                     _ = shutdown.notified() => {
-                        tracing::info!("Sidecar reader task shutting down");
+                        tracing::debug!("sidecar reader task shutting down");
                         break;
                     }
                 }
@@ -325,7 +325,7 @@ impl Bridge {
 
         let id = self.next_id();
         let request = Request::new(id, "initialize", Some(init_params.clone()));
-        tracing::info!("Sending initialize request to sidecar with id {} and params: {:?}", id, init_params);
+        tracing::debug!("sending initialize request to sidecar with id {}", id);
 
         let (response_tx, response_rx) = oneshot::channel();
         {
@@ -337,14 +337,14 @@ impl Bridge {
         tx.send(request)
             .await
             .map_err(|_| BridgeError::Crashed("request channel closed".into()))?;
-        tracing::info!("Initialize request sent to sidecar, waiting for response...");
+        tracing::debug!("initialize request sent to sidecar, waiting for response");
 
         // Wait for initialize response with timeout
         match time::timeout(Duration::from_secs(30), response_rx).await {
-            Ok(Ok(Ok(result))) => {
-                tracing::info!("sidecar initialized successfully with result: {:?}", result);
+            Ok(Ok(Ok(_result))) => {
+                tracing::debug!("sidecar initialized successfully");
                 Self::set_state(&self.state, &self.state_watch_tx, SidecarState::Ready).await;
-                tracing::info!("Sidecar state changed to Ready");
+                tracing::info!("sidecar ready");
 
                 // Start health check heartbeat
                 Self::start_health_check(
@@ -398,7 +398,7 @@ impl Bridge {
                 return Err(BridgeError::NotReady("sidecar is Degraded".into()).into());
             }
             SidecarState::Starting => {
-                tracing::info!("waiting for sidecar to become Ready (current: {:?})", current);
+                tracing::debug!("waiting for sidecar to become Ready (current: {:?})", current);
             }
         }
 
@@ -539,7 +539,7 @@ impl Bridge {
                     error.code, error.message
                 ))))
             } else {
-                tracing::info!("Sidecar returned success for request {}", id);
+                tracing::debug!("sidecar returned success for request {}", id);
                 Ok(response.result.unwrap_or(Value::Null))
             };
             let _ = req.response_tx.send(result);
