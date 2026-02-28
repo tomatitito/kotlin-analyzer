@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use lsp_types::Url;
+use tower_lsp::lsp_types::{Diagnostic, Url};
 
 /// Stores the full text and version for every open document.
 /// This is the single source of truth for document state —
@@ -8,6 +8,9 @@ use lsp_types::Url;
 #[derive(Debug, Default)]
 pub struct DocumentStore {
     documents: HashMap<Url, Document>,
+    /// Cached diagnostics per URI — persists across didClose/didOpen cycles
+    /// so that diagnostics survive tab switches in Zed.
+    diagnostics: HashMap<Url, Vec<Diagnostic>>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +55,14 @@ impl DocumentStore {
     #[allow(dead_code)]
     pub fn is_open(&self, uri: &Url) -> bool {
         self.documents.contains_key(uri)
+    }
+
+    pub fn set_diagnostics(&mut self, uri: Url, diags: Vec<Diagnostic>) {
+        self.diagnostics.insert(uri, diags);
+    }
+
+    pub fn get_diagnostics(&self, uri: &Url) -> Option<&Vec<Diagnostic>> {
+        self.diagnostics.get(uri)
     }
 }
 

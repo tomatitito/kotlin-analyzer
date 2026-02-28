@@ -56,6 +56,8 @@ dependencies {
     // Testing
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.3")
+    testImplementation("net.jqwik:jqwik:1.9.2")
+    testImplementation("net.jqwik:jqwik-kotlin:1.9.2")
 }
 
 application {

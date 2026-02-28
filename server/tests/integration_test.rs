@@ -198,6 +198,44 @@ impl LspTestClient {
         }
     }
 
+    /// Drain messages for the given duration, collecting notifications with the specified method.
+    /// Server-initiated requests are answered with empty results.
+    fn collect_notifications(
+        &mut self,
+        method: &str,
+        timeout: Duration,
+    ) -> Vec<Value> {
+        let mut notifications = Vec::new();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(msg) => {
+                    // Answer server requests
+                    if let (Some(id), Some(_)) = (msg.get("id"), msg.get("method")) {
+                        let reply = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": null
+                        });
+                        let _ = self.write_message(&reply);
+                    }
+                    // Collect matching notifications (no id = notification)
+                    if let Some(m) = msg.get("method").and_then(|m| m.as_str()) {
+                        if m == method && msg.get("id").is_none() {
+                            notifications.push(msg);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        notifications
+    }
+
     fn initialize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let params = json!({
             "processId": std::process::id(),
@@ -451,5 +489,165 @@ fun main() {
         items.is_some() && !items.unwrap().is_empty(),
         "Completion should return String methods but got none or empty. Response: {:?}",
         response.get("result")
+    );
+}
+
+// Plan: code-actions-not-showing.md
+// Code actions don't appear in Zed despite being implemented in the sidecar.
+
+#[test]
+fn test_code_actions_returned_for_expression_body() {
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize()
+        .expect("Failed to initialize LSP server");
+
+    let test_code = "fun add(a: Int, b: Int): Int = a + b\n";
+    let uri = "file:///tmp/test-code-action.kt";
+    client
+        .open_document(uri, test_code)
+        .expect("Failed to open document");
+
+    // Request code actions at the "fun" keyword (line 0, character 0)
+    let params = json!({
+        "textDocument": { "uri": uri },
+        "range": {
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 0 }
+        },
+        "context": {
+            "diagnostics": []
+        }
+    });
+
+    let response = client
+        .send_request("textDocument/codeAction", params)
+        .expect("Code action request failed");
+
+    let result = response.get("result");
+
+    // Result should be a non-null, non-empty array of code actions
+    let actions = result
+        .and_then(|r| if r.is_null() { None } else { r.as_array() });
+
+    assert!(
+        actions.is_some() && !actions.unwrap().is_empty(),
+        "Code action response should contain actions for an expression-body function, \
+         but got: {:?}",
+        result
+    );
+
+    // At least one action should be the "Convert to block body" refactoring
+    let has_convert = actions.unwrap().iter().any(|a| {
+        a.get("title")
+            .and_then(|t| t.as_str())
+            .map(|t| t.contains("Convert to block body"))
+            .unwrap_or(false)
+    });
+
+    assert!(
+        has_convert,
+        "Should include 'Convert to block body' action, got: {:?}",
+        actions
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.get("title").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+// --- Regression tests for active plans ---
+// These tests reproduce known bugs from plans/active/.
+// Each test should FAIL until its corresponding issue is fixed.
+
+// Plan: diagnostics-disappear-on-file-switch.md
+// didClose publishes empty diagnostics, clearing errors from the problems panel.
+
+#[test]
+fn test_diagnostics_persist_after_did_close() {
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize()
+        .expect("Failed to initialize LSP server");
+
+    // Send didOpen with a type error (don't use open_document — it drains notifications)
+    let test_code = "fun main() {\n    val x: Int = \"not an int\"\n}\n";
+    let uri = "file:///tmp/test-diag-persist.kt";
+
+    client
+        .send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "kotlin",
+                    "version": 1,
+                    "text": test_code
+                }
+            }),
+        )
+        .expect("Failed to send didOpen");
+
+    // Collect publishDiagnostics — should eventually include errors for our file
+    let diags_after_open = client.collect_notifications(
+        "textDocument/publishDiagnostics",
+        Duration::from_secs(10),
+    );
+
+    let has_errors = diags_after_open.iter().any(|n| {
+        if let Some(params) = n.get("params") {
+            let diag_uri = params
+                .get("uri")
+                .and_then(|u| u.as_str())
+                .unwrap_or("");
+            if let Some(diagnostics) = params.get("diagnostics").and_then(|d| d.as_array()) {
+                return diag_uri.contains("test-diag-persist") && !diagnostics.is_empty();
+            }
+        }
+        false
+    });
+
+    assert!(
+        has_errors,
+        "Should receive non-empty diagnostics after opening file with type error. \
+         Got {} notification(s): {:?}",
+        diags_after_open.len(),
+        diags_after_open
+    );
+
+    // Now close the file
+    client
+        .send_notification(
+            "textDocument/didClose",
+            json!({
+                "textDocument": { "uri": uri }
+            }),
+        )
+        .expect("Failed to send didClose");
+
+    // Collect any publishDiagnostics emitted after didClose
+    let diags_after_close = client.collect_notifications(
+        "textDocument/publishDiagnostics",
+        Duration::from_secs(3),
+    );
+
+    // The server should NOT clear diagnostics on didClose
+    let cleared = diags_after_close.iter().any(|n| {
+        if let Some(params) = n.get("params") {
+            let diag_uri = params
+                .get("uri")
+                .and_then(|u| u.as_str())
+                .unwrap_or("");
+            if let Some(diagnostics) = params.get("diagnostics").and_then(|d| d.as_array()) {
+                return diag_uri.contains("test-diag-persist") && diagnostics.is_empty();
+            }
+        }
+        false
+    });
+
+    assert!(
+        !cleared,
+        "Server should NOT publish empty diagnostics on didClose — \
+         diagnostics should persist across file switches"
     );
 }

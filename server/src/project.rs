@@ -155,15 +155,37 @@ allprojects {
                 sb.append("CLASSPATH_ERROR=${e.message}\n")
             }
 
-            // Compiler flags
+            // Compiler flags — try multiple APIs for compatibility
+            def flagsFound = new LinkedHashSet()
+            // 1. New API: task.compilerOptions (Kotlin 1.8+)
             try {
                 project.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).each { task ->
                     task.compilerOptions.freeCompilerArgs.get().each { flag ->
-                        sb.append("COMPILER_FLAG=${flag}\n")
+                        flagsFound.add(flag)
                     }
                 }
-            } catch (Exception e) {
-                // Kotlin plugin not applied to this module
+            } catch (Exception e) {}
+            // 2. Old API: task.kotlinOptions (pre-1.8 projects)
+            if (flagsFound.isEmpty()) {
+                try {
+                    project.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).each { task ->
+                        task.kotlinOptions.freeCompilerArgs.each { flag ->
+                            flagsFound.add(flag)
+                        }
+                    }
+                } catch (Exception e) {}
+            }
+            // 3. Top-level kotlin { compilerOptions { } } extension (Kotlin 2.0+)
+            try {
+                def kotlinExt = project.extensions.findByName("kotlin")
+                if (kotlinExt != null) {
+                    kotlinExt.compilerOptions.freeCompilerArgs.get().each { flag ->
+                        flagsFound.add(flag)
+                    }
+                }
+            } catch (Exception e) {}
+            flagsFound.each { flag ->
+                sb.append("COMPILER_FLAG=${flag}\n")
             }
 
             // Kotlin version

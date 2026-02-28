@@ -13,6 +13,8 @@ import org.jetbrains.kotlin.analysis.api.renderer.declarations.impl.KaDeclaratio
 import org.jetbrains.kotlin.analysis.api.renderer.types.impl.KaTypeRendererForSource
 import org.jetbrains.kotlin.analysis.api.resolution.KaFunctionCall
 import org.jetbrains.kotlin.analysis.api.resolution.KaSuccessCallInfo
+import org.jetbrains.kotlin.analysis.api.platform.projectStructure.KotlinProjectStructureProvider
+import org.jetbrains.kotlin.analysis.api.projectStructure.KaModule
 import org.jetbrains.kotlin.analysis.api.standalone.StandaloneAnalysisAPISession
 import org.jetbrains.kotlin.analysis.api.standalone.buildStandaloneAnalysisAPISession
 import org.jetbrains.kotlin.analysis.api.symbols.*
@@ -42,8 +44,10 @@ import java.nio.file.Paths
  */
 class CompilerBridge {
     private var session: StandaloneAnalysisAPISession? = null
+    private var sourceModule: KaModule? = null
     private var disposable = Disposer.newDisposable("compiler-bridge")
     private val virtualFiles = mutableMapOf<String, String>() // uri -> content
+    private val symbolIndex = SymbolIndex()
 
     /**
      * Initializes the Analysis API session with the given project configuration.
@@ -73,6 +77,12 @@ class CompilerBridge {
                 languageFeatures[feature] = LanguageFeature.State.ENABLED
             }
         }
+        if (languageFeatures.isNotEmpty()) {
+            System.err.println("CompilerBridge: languageFeatures=${languageFeatures.keys}")
+        }
+        if (compilerFlags.isNotEmpty()) {
+            System.err.println("CompilerBridge: compilerFlags=$compilerFlags")
+        }
 
         val effectiveSourceRoots = if (sourceRoots.isNotEmpty()) {
             sourceRoots.map { Paths.get(it) }.filter { it.toFile().exists() }
@@ -95,6 +105,10 @@ class CompilerBridge {
         // Log Spring-related JARs for diagnostic visibility
         classpath.filter { "spring" in it.lowercase() }.forEach {
             System.err.println("CompilerBridge: spring JAR on classpath: $it")
+        }
+        // Log Arrow-related JARs for context/raise DSL diagnostics
+        classpath.filter { "arrow" in it.lowercase() }.forEach {
+            System.err.println("CompilerBridge: arrow JAR on classpath: $it")
         }
         System.err.println("CompilerBridge: stdlibJars=${stdlibJars.size} jars")
         System.err.println("CompilerBridge: jdkHome=$jdkHome")
@@ -169,9 +183,16 @@ class CompilerBridge {
                         addRegularDependency(dep)
                     }
                 }
+                sourceModule = mainModule
                 addModule(mainModule)
             }
         }
+
+        // Register a custom module provider that maps KtPsiFactory files (LightVirtualFile)
+        // to the source module. Without this, KtPsiFactory files fall into the default
+        // "not under content root" module which lacks custom language settings like
+        // -Xcontext-parameters.
+        registerVirtualFileModuleProvider()
 
         val elapsed = System.currentTimeMillis() - startTime
         System.err.println("CompilerBridge: session created in ${elapsed}ms")
@@ -188,6 +209,10 @@ class CompilerBridge {
         if (allFiles.size > 20) {
             System.err.println("  ... and ${allFiles.size - 20} more")
         }
+
+        // Build the symbol index from all discovered files
+        symbolIndex.rebuildFromSession(session!!)
+        System.err.println("CompilerBridge: symbol index built with ${symbolIndex.size()} declarations")
     }
 
     /**
@@ -195,6 +220,21 @@ class CompilerBridge {
      */
     fun updateFile(uri: String, text: String) {
         virtualFiles[uri] = text
+        updateFileInSession(uri, text)
+
+        // Re-index the file with updated content
+        val currentSession = session
+        if (currentSession != null) {
+            try {
+                val filePath = uriToPath(uri)
+                val fileName = filePath.substringAfterLast('/')
+                val psiFactory = KtPsiFactory(currentSession.project)
+                val ktFile = psiFactory.createFile(fileName, text)
+                symbolIndex.indexFile(uri, ktFile)
+            } catch (e: Exception) {
+                System.err.println("CompilerBridge: failed to re-index $uri: ${e.message}")
+            }
+        }
     }
 
     /**
@@ -202,6 +242,7 @@ class CompilerBridge {
      */
     fun removeFile(uri: String) {
         virtualFiles.remove(uri)
+        symbolIndex.removeFile(uri)
     }
 
     /**
@@ -227,18 +268,54 @@ class CompilerBridge {
 
         System.err.println("CompilerBridge: analyze($uri) — found KtFile: ${ktFile.virtualFile?.path ?: "(ad-hoc)"}, name=${ktFile.name}")
 
+        // Log content source for debugging
+        val isVirtualFile = virtualFiles.containsKey(uri) &&
+            findKtFileInSession(currentSession, uri)?.text != virtualFiles[uri]
+        System.err.println("CompilerBridge: analyze($uri) — using ${if (isVirtualFile) "virtual" else "session"} content (${ktFile.text.length} chars)")
+
+        // For virtual files (content differs from session), collect names declared in the file.
+        // The standalone Analysis API can't resolve same-file declarations for non-session files,
+        // so we filter out false UNRESOLVED_REFERENCE diagnostics for names that ARE declared
+        // within the file (they would resolve correctly in a full session).
+        val declaredNames = if (isVirtualFile) collectDeclaredNames(ktFile) else emptySet()
+        if (isVirtualFile && declaredNames.isNotEmpty()) {
+            System.err.println("CompilerBridge: analyze($uri) — virtual file declares: $declaredNames (will filter false UNRESOLVED_REFERENCE)")
+        }
+
         try {
             analyze(ktFile) {
+                val analysisStart = System.currentTimeMillis()
                 val diagnostics = ktFile.collectDiagnostics(
                     KaDiagnosticCheckerFilter.EXTENDED_AND_COMMON_CHECKERS
                 )
+                val analysisElapsed = System.currentTimeMillis() - analysisStart
 
-                System.err.println("CompilerBridge: analyze($uri) — collectDiagnostics returned ${diagnostics.size} diagnostic(s)")
+                System.err.println("CompilerBridge: analyze($uri) — collectDiagnostics took ${analysisElapsed}ms, returned ${diagnostics.size} diagnostic(s)")
                 for (d in diagnostics) {
                     System.err.println("  [${d.severity}] ${d.factoryName}: ${d.defaultMessage} at ${d.textRanges.firstOrNull()}")
                 }
 
                 for (diagnostic in diagnostics) {
+                    // Filter false UNRESOLVED_REFERENCE for virtual files: if the unresolved
+                    // name is declared in the same file, it's a false positive caused by the
+                    // standalone API's inability to resolve same-file declarations in non-session files.
+                    if (isVirtualFile && diagnostic.factoryName == "UNRESOLVED_REFERENCE" && declaredNames.isNotEmpty()) {
+                        // Extract the unresolved name from the message ("Unresolved reference 'name'")
+                        // or from the text range as fallback
+                        val unresolvedName = diagnostic.defaultMessage
+                            ?.let { Regex("'(\\w+)'").find(it)?.groupValues?.get(1) }
+                            ?: diagnostic.textRanges.firstOrNull()?.let { range ->
+                                ktFile.text.substring(
+                                    range.startOffset,
+                                    minOf(range.endOffset, ktFile.text.length)
+                                )
+                            }
+                        if (unresolvedName != null && unresolvedName in declaredNames) {
+                            System.err.println("CompilerBridge: analyze($uri) — suppressing false UNRESOLVED_REFERENCE for '$unresolvedName' (declared in same file)")
+                            continue
+                        }
+                    }
+
                     val diagObj = JsonObject()
 
                     diagObj.addProperty("severity", diagnostic.severity.name)
@@ -290,6 +367,7 @@ class CompilerBridge {
      */
     fun hover(uri: String, line: Int, character: Int): JsonObject {
         val result = JsonObject()
+        val perfStart = System.currentTimeMillis()
 
         val currentSession = session ?: return result
         val ktFile = findKtFile(currentSession, uri) ?: return result
@@ -342,6 +420,7 @@ class CompilerBridge {
             System.err.println("CompilerBridge: hover failed: ${e.javaClass.name}: ${e.message}")
         }
 
+        System.err.println("[PERF] method=hover uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
         return result
     }
 
@@ -352,6 +431,7 @@ class CompilerBridge {
     fun completion(uri: String, line: Int, character: Int): JsonObject {
         val result = JsonObject()
         val itemsArray = JsonArray()
+        val perfStart = System.currentTimeMillis()
 
         val currentSession = session ?: run {
             result.add("items", itemsArray)
@@ -384,12 +464,19 @@ class CompilerBridge {
                 } else {
                     // Scope-based completion: gather declarations from enclosing scopes
                     collectScopeCompletions(ktFile, element, itemsArray)
+
+                    // Append unimported symbols from the index
+                    val prefix = extractCompletionPrefix(element, offset)
+                    if (prefix.isNotEmpty()) {
+                        appendUnimportedCompletions(ktFile, prefix, itemsArray)
+                    }
                 }
             }
         } catch (e: Throwable) {
             System.err.println("CompilerBridge: completion failed: ${e.javaClass.name}: ${e.message}")
         }
 
+        System.err.println("[PERF] method=completion uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
         result.add("items", itemsArray)
         return result
     }
@@ -400,6 +487,7 @@ class CompilerBridge {
     fun definition(uri: String, line: Int, character: Int): JsonObject {
         val result = JsonObject()
         val locationsArray = JsonArray()
+        val perfStart = System.currentTimeMillis()
 
         val currentSession = session ?: run {
             result.add("locations", locationsArray)
@@ -462,6 +550,7 @@ class CompilerBridge {
             System.err.println("CompilerBridge: definition failed: ${e.javaClass.name}: ${e.message}")
         }
 
+        System.err.println("[PERF] method=definition uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
         result.add("locations", locationsArray)
         return result
     }
@@ -474,6 +563,7 @@ class CompilerBridge {
     fun references(uri: String, line: Int, character: Int): JsonObject {
         val result = JsonObject()
         val locationsArray = JsonArray()
+        val perfStart = System.currentTimeMillis()
 
         val currentSession = session ?: run {
             result.add("locations", locationsArray)
@@ -485,85 +575,99 @@ class CompilerBridge {
         }
 
         try {
+            // Step 1: Find the target declaration in the current file and extract its identity
+            var targetName: String? = null
+            var targetFilePath: String? = null
+            var targetOffset: Int? = null
+
             analyze(ktFile) {
-                val offset = lineColToOffset(ktFile, line, character) ?: run {
-                    result.add("locations", locationsArray)
-                    return@analyze
+                val offset = lineColToOffset(ktFile, line, character) ?: return@analyze
+                val element = ktFile.findElementAt(offset) ?: return@analyze
+                val targetDeclaration = findTargetDeclaration(element) ?: return@analyze
+
+                // Extract identity: the declaration's name, containing file, and offset
+                targetName = (targetDeclaration as? KtNamedDeclaration)?.name
+                    ?: targetDeclaration.text?.take(50)
+                val containingFile = targetDeclaration.containingFile as? KtFile
+                targetFilePath = containingFile?.virtualFile?.path
+                targetOffset = targetDeclaration.textOffset
+
+                // Also add the declaration itself as a reference location
+                val declDocument = containingFile?.viewProvider?.document
+                if (declDocument != null) {
+                    val declLine = declDocument.getLineNumber(targetDeclaration.textOffset) + 1
+                    val declLineStart = declDocument.getLineStartOffset(declDocument.getLineNumber(targetDeclaration.textOffset))
+                    val declCol = targetDeclaration.textOffset - declLineStart
+                    val declLoc = JsonObject()
+                    declLoc.addProperty("uri", "file://${containingFile.virtualFile.path}")
+                    declLoc.addProperty("line", declLine)
+                    declLoc.addProperty("column", declCol)
+                    locationsArray.add(declLoc)
                 }
+            }
 
-                // Find the declaration at the cursor position
-                val element = ktFile.findElementAt(offset) ?: run {
-                    result.add("locations", locationsArray)
-                    return@analyze
-                }
+            if (targetName == null || targetFilePath == null) {
+                result.add("locations", locationsArray)
+                return result
+            }
 
-                val targetDeclaration = findTargetDeclaration(element)
-                if (targetDeclaration == null) {
-                    result.add("locations", locationsArray)
-                    return@analyze
-                }
+            // Step 2: Search ALL session files for references to the target
+            val allSessionFiles = currentSession.modulesWithFiles.entries
+                .flatMap { (_, files) -> files }
+                .filterIsInstance<KtFile>()
 
-                val document = ktFile.viewProvider.document
-                if (document == null) {
-                    result.add("locations", locationsArray)
-                    return@analyze
-                }
+            for (sessionFile in allSessionFiles) {
+                try {
+                    analyze(sessionFile) {
+                        val nameExprs = PsiTreeUtil.collectElementsOfType(
+                            sessionFile, KtSimpleNameExpression::class.java
+                        )
 
-                // Walk the entire file's PSI tree looking for references to the target
-                val allReferences = PsiTreeUtil.collectElementsOfType(
-                    ktFile, KtSimpleNameExpression::class.java
-                )
+                        for (nameExpr in nameExprs) {
+                            if (nameExpr.getReferencedName() != targetName) continue
 
-                for (nameExpr in allReferences) {
-                    try {
-                        for (ref in nameExpr.references) {
-                            val resolved = ref.resolve()
-                            if (resolved != null && resolved == targetDeclaration) {
-                                val refOffset = nameExpr.textOffset
-                                val refLine = document.getLineNumber(refOffset) + 1
-                                val refLineStart = document.getLineStartOffset(
-                                    document.getLineNumber(refOffset)
-                                )
-                                val refCol = refOffset - refLineStart
+                            try {
+                                for (ref in nameExpr.references) {
+                                    val resolved = ref.resolve() ?: continue
+                                    val resolvedFile = resolved.containingFile as? KtFile ?: continue
+                                    // Match by file path + offset to identify the same declaration
+                                    if (resolvedFile.virtualFile.path == targetFilePath &&
+                                        resolved.textOffset == targetOffset) {
+                                        val doc = sessionFile.viewProvider.document ?: continue
+                                        val refOffset = nameExpr.textOffset
+                                        val refLine = doc.getLineNumber(refOffset) + 1
+                                        val refLineStart = doc.getLineStartOffset(doc.getLineNumber(refOffset))
+                                        val refCol = refOffset - refLineStart
 
-                                val loc = JsonObject()
-                                loc.addProperty("uri", "file://${ktFile.virtualFile.path}")
-                                loc.addProperty("line", refLine)
-                                loc.addProperty("column", refCol)
-                                locationsArray.add(loc)
+                                        val loc = JsonObject()
+                                        loc.addProperty("uri", "file://${sessionFile.virtualFile.path}")
+                                        loc.addProperty("line", refLine)
+                                        loc.addProperty("column", refCol)
+
+                                        // Avoid duplicates
+                                        val isDup = (0 until locationsArray.size()).any { i ->
+                                            val existing = locationsArray[i].asJsonObject
+                                            existing.get("uri")?.asString == loc.get("uri")?.asString &&
+                                                existing.get("line")?.asInt == refLine &&
+                                                existing.get("column")?.asInt == refCol
+                                        }
+                                        if (!isDup) locationsArray.add(loc)
+                                    }
+                                }
+                            } catch (_: Exception) {
+                                // Skip references that fail to resolve
                             }
                         }
-                    } catch (_: Exception) {
-                        // Skip references that fail to resolve
                     }
-                }
-
-                // Also include the declaration itself
-                val declOffset = targetDeclaration.textOffset
-                val declLine = document.getLineNumber(declOffset) + 1
-                val declLineStart = document.getLineStartOffset(
-                    document.getLineNumber(declOffset)
-                )
-                val declCol = declOffset - declLineStart
-
-                val declLoc = JsonObject()
-                declLoc.addProperty("uri", "file://${ktFile.virtualFile.path}")
-                declLoc.addProperty("line", declLine)
-                declLoc.addProperty("column", declCol)
-
-                // Add declaration location if not already present
-                val alreadyIncluded = (0 until locationsArray.size()).any { i ->
-                    val loc = locationsArray[i].asJsonObject
-                    loc.get("line")?.asInt == declLine && loc.get("column")?.asInt == declCol
-                }
-                if (!alreadyIncluded) {
-                    locationsArray.add(declLoc)
+                } catch (_: Exception) {
+                    // Skip files that fail to analyze
                 }
             }
         } catch (e: Throwable) {
             System.err.println("CompilerBridge: references failed: ${e.javaClass.name}: ${e.message}")
         }
 
+        System.err.println("[PERF] method=references uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
         result.add("locations", locationsArray)
         return result
     }
@@ -726,7 +830,7 @@ class CompilerBridge {
                     return@analyze
                 }
 
-                val fileUri = "file://${ktFile.virtualFile.path}"
+                val fileUri = ktFile.virtualFile?.path?.let { "file://$it" } ?: uri
 
                 // Collect all locations that need renaming (references + declaration)
                 val renameOffsets = mutableSetOf<Int>()
@@ -818,6 +922,7 @@ class CompilerBridge {
     fun codeActions(uri: String, line: Int, character: Int): JsonObject {
         val result = JsonObject()
         val actionsArray = JsonArray()
+        val perfStart = System.currentTimeMillis()
 
         System.err.println("CompilerBridge: codeActions($uri, line=$line, char=$character)")
 
@@ -845,7 +950,7 @@ class CompilerBridge {
                     return@analyze
                 }
 
-                val fileUri = "file://${ktFile.virtualFile.path}"
+                val fileUri = ktFile.virtualFile?.path?.let { "file://$it" } ?: uri
 
                 // 1. Diagnostic-based code actions
                 try {
@@ -910,26 +1015,51 @@ class CompilerBridge {
                                 minOf(textRange.endOffset, ktFile.text.length)
                             )
 
-                            val action = JsonObject()
-                            action.addProperty("title", "Add import for '$unresolvedText'")
-                            action.addProperty("kind", "quickfix")
-
-                            val actionEdits = JsonArray()
+                            val importCandidates = findImportCandidates(unresolvedText)
                             val importInsertLine = findImportInsertLine(ktFile, document)
 
-                            val importEdit = JsonObject()
-                            importEdit.addProperty("uri", fileUri)
-                            val importRange = JsonObject()
-                            importRange.addProperty("startLine", importInsertLine)
-                            importRange.addProperty("startColumn", 0)
-                            importRange.addProperty("endLine", importInsertLine)
-                            importRange.addProperty("endColumn", 0)
-                            importEdit.add("range", importRange)
-                            importEdit.addProperty("newText", "import $unresolvedText\n")
-                            actionEdits.add(importEdit)
+                            if (importCandidates.isNotEmpty()) {
+                                for (fqn in importCandidates) {
+                                    val action = JsonObject()
+                                    action.addProperty("title", "Import '$fqn'")
+                                    action.addProperty("kind", "quickfix")
 
-                            action.add("edits", actionEdits)
-                            actionsArray.add(action)
+                                    val actionEdits = JsonArray()
+                                    val importEdit = JsonObject()
+                                    importEdit.addProperty("uri", fileUri)
+                                    val importRange = JsonObject()
+                                    importRange.addProperty("startLine", importInsertLine)
+                                    importRange.addProperty("startColumn", 0)
+                                    importRange.addProperty("endLine", importInsertLine)
+                                    importRange.addProperty("endColumn", 0)
+                                    importEdit.add("range", importRange)
+                                    importEdit.addProperty("newText", "import $fqn\n")
+                                    actionEdits.add(importEdit)
+
+                                    action.add("edits", actionEdits)
+                                    actionsArray.add(action)
+                                }
+                            } else {
+                                // Fallback: offer the short name import
+                                val action = JsonObject()
+                                action.addProperty("title", "Add import for '$unresolvedText'")
+                                action.addProperty("kind", "quickfix")
+
+                                val actionEdits = JsonArray()
+                                val importEdit = JsonObject()
+                                importEdit.addProperty("uri", fileUri)
+                                val importRange = JsonObject()
+                                importRange.addProperty("startLine", importInsertLine)
+                                importRange.addProperty("startColumn", 0)
+                                importRange.addProperty("endLine", importInsertLine)
+                                importRange.addProperty("endColumn", 0)
+                                importEdit.add("range", importRange)
+                                importEdit.addProperty("newText", "import $unresolvedText\n")
+                                actionEdits.add(importEdit)
+
+                                action.add("edits", actionEdits)
+                                actionsArray.add(action)
+                            }
                         }
                     }
                 } catch (e: Exception) {
@@ -945,6 +1075,9 @@ class CompilerBridge {
                     // Convert between expression body and block body for functions
                     addConvertBodyAction(element, document, fileUri, actionsArray)
                 }
+
+                // 3. Source actions: Organize imports
+                addOrganizeImportsAction(ktFile, document, fileUri, actionsArray)
             }
         } catch (e: Throwable) {
             System.err.println("CompilerBridge: codeActions failed: ${e.javaClass.name}: ${e.message}")
@@ -957,6 +1090,7 @@ class CompilerBridge {
             System.err.println("  action[$i]: ${action.get("title")?.asString} (kind=${action.get("kind")?.asString})")
         }
 
+        System.err.println("[PERF] method=codeActions uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
         result.add("actions", actionsArray)
         return result
     }
@@ -1123,6 +1257,58 @@ class CompilerBridge {
     }
 
     /**
+     * Adds "Organize imports" source action that sorts and deduplicates import statements.
+     */
+    private fun addOrganizeImportsAction(
+        ktFile: KtFile,
+        document: com.intellij.openapi.editor.Document,
+        fileUri: String,
+        actionsArray: JsonArray,
+    ) {
+        val importList = ktFile.importList ?: return
+        val imports = importList.imports
+        if (imports.isEmpty()) return
+
+        // Collect and sort unique import paths
+        val importPaths = imports.mapNotNull { it.importedFqName?.asString() }.distinct().sorted()
+
+        // Check if already organized
+        val currentPaths = imports.mapNotNull { it.importedFqName?.asString() }
+        if (currentPaths == importPaths) return  // Already organized
+
+        // Build the new import block text
+        val newImportText = importPaths.joinToString("\n") { "import $it" }
+
+        // Calculate the range of the existing import block
+        val firstImport = imports.first()
+        val lastImport = imports.last()
+        val startLine = document.getLineNumber(firstImport.textRange.startOffset) + 1
+        val startCol = 0
+        val endLine = document.getLineNumber(lastImport.textRange.endOffset) + 1
+        val endLineStart = document.getLineStartOffset(document.getLineNumber(lastImport.textRange.endOffset))
+        val endCol = lastImport.textRange.endOffset - endLineStart
+
+        val action = JsonObject()
+        action.addProperty("title", "Organize imports")
+        action.addProperty("kind", "source.organizeImports")
+
+        val editsArray = JsonArray()
+        val edit = JsonObject()
+        edit.addProperty("uri", fileUri)
+        val range = JsonObject()
+        range.addProperty("startLine", startLine)
+        range.addProperty("startColumn", startCol)
+        range.addProperty("endLine", endLine)
+        range.addProperty("endColumn", endCol)
+        edit.add("range", range)
+        edit.addProperty("newText", newImportText)
+        editsArray.add(edit)
+
+        action.add("edits", editsArray)
+        actionsArray.add(action)
+    }
+
+    /**
      * Provides workspace-wide symbol search.
      * Walks all KtFiles in the session and collects declarations matching the query.
      * Results are limited to 100 symbols.
@@ -1130,69 +1316,24 @@ class CompilerBridge {
     fun workspaceSymbols(query: String): JsonObject {
         val result = JsonObject()
         val symbolsArray = JsonArray()
-
-        val currentSession = session ?: run {
-            result.add("symbols", symbolsArray)
-            return result
-        }
+        val perfStart = System.currentTimeMillis()
 
         try {
-            val allKtFiles = currentSession.modulesWithFiles.entries
-                .flatMap { (_, files) -> files }
-                .filterIsInstance<KtFile>()
-
-            val lowerQuery = query.lowercase()
-            var count = 0
-
-            for (ktFile in allKtFiles) {
-                if (count >= 100) break
-
-                val declarations = PsiTreeUtil.collectElementsOfType(
-                    ktFile, KtNamedDeclaration::class.java
-                )
-
-                for (declaration in declarations) {
-                    if (count >= 100) break
-
-                    val name = declaration.name ?: continue
-
-                    // Case-insensitive substring match
-                    if (lowerQuery.isNotEmpty() && !name.lowercase().contains(lowerQuery)) continue
-
-                    val kind = when (declaration) {
-                        is KtClassOrObject -> when {
-                            declaration is KtObjectDeclaration -> "object"
-                            declaration is KtEnumEntry -> "enumMember"
-                            (declaration as? KtClass)?.isInterface() == true -> "interface"
-                            (declaration as? KtClass)?.isEnum() == true -> "enum"
-                            else -> "class"
-                        }
-                        is KtNamedFunction -> "function"
-                        is KtProperty -> "property"
-                        is KtTypeAlias -> "typeAlias"
-                        else -> continue // Skip other declaration types (parameters, etc.)
-                    }
-
-                    val document = ktFile.viewProvider.document ?: continue
-                    val declOffset = declaration.textOffset
-                    val declLine = document.getLineNumber(declOffset) + 1
-                    val declLineStart = document.getLineStartOffset(document.getLineNumber(declOffset))
-                    val declCol = declOffset - declLineStart
-
-                    val symbolObj = JsonObject()
-                    symbolObj.addProperty("name", name)
-                    symbolObj.addProperty("kind", kind)
-                    symbolObj.addProperty("uri", "file://${ktFile.virtualFile.path}")
-                    symbolObj.addProperty("line", declLine)
-                    symbolObj.addProperty("column", declCol)
-                    symbolsArray.add(symbolObj)
-                    count++
-                }
+            val indexed = symbolIndex.searchSymbols(query)
+            for (decl in indexed) {
+                val symbolObj = JsonObject()
+                symbolObj.addProperty("name", decl.shortName)
+                symbolObj.addProperty("kind", decl.kind)
+                symbolObj.addProperty("uri", decl.uri)
+                symbolObj.addProperty("line", decl.line)
+                symbolObj.addProperty("column", decl.column)
+                symbolsArray.add(symbolObj)
             }
         } catch (e: Throwable) {
             System.err.println("CompilerBridge: workspaceSymbols failed: ${e.javaClass.name}: ${e.message}")
         }
 
+        System.err.println("[PERF] method=workspaceSymbols elapsed=${System.currentTimeMillis() - perfStart}ms")
         result.add("symbols", symbolsArray)
         return result
     }
@@ -1398,7 +1539,7 @@ class CompilerBridge {
                     return@analyze
                 }
 
-                val fileUri = "file://${ktFile.virtualFile.path}"
+                val fileUri = ktFile.virtualFile?.path?.let { "file://$it" } ?: uri
 
                 // Collect classes, interfaces, and objects for "N references" lenses
                 val classOrObjects = PsiTreeUtil.collectElementsOfType(
@@ -2002,11 +2143,21 @@ class CompilerBridge {
     private fun org.jetbrains.kotlin.analysis.api.KaSession.buildDeclarationHover(
         declaration: KtNamedDeclaration,
     ): String? {
-        val symbol = declaration.symbol
-        val rendered = try {
-            symbol.render(KaDeclarationRendererForSource.WITH_SHORT_NAMES)
+        val symbol = try {
+            declaration.symbol
         } catch (_: Exception) {
-            // Fallback to PSI text if rendering fails
+            null
+        }
+
+        val rendered = if (symbol != null) {
+            try {
+                symbol.render(KaDeclarationRendererForSource.WITH_SHORT_NAMES)
+            } catch (_: Exception) {
+                val text = declaration.text?.take(300) ?: return null
+                text.lines().first()
+            }
+        } else {
+            // Symbol resolution failed (e.g., virtual file) — use PSI text
             val text = declaration.text?.take(300) ?: return null
             text.lines().first()
         }
@@ -2014,18 +2165,43 @@ class CompilerBridge {
         val kdocText = extractKDocText(declaration)
 
         return buildString {
-            // Show containing package/class for context
-            val containerInfo = buildContainerInfo(symbol)
-            if (containerInfo != null) {
-                append(containerInfo)
-                append("\n\n")
+            if (symbol != null) {
+                // Show containing package/class for context
+                val containerInfo = buildContainerInfo(symbol)
+                if (containerInfo != null) {
+                    append(containerInfo)
+                    append("\n\n")
+                }
+
+                // Build code block with optional annotations prefix
+                val annotationsBlock = buildAnnotationsBlock(symbol)
+                val supertypesLine = buildSupertypesLine(symbol)
+                append("```kotlin\n")
+                if (annotationsBlock != null) {
+                    append(annotationsBlock)
+                    append("\n")
+                }
+                append(rendered)
+                if (supertypesLine != null) {
+                    append("\n")
+                    append(supertypesLine)
+                }
+                append("\n```")
+
+                val sourceOrigin = buildSourceOrigin(symbol)
+                if (sourceOrigin != null) {
+                    append("\n\n---\n\n")
+                    append(sourceOrigin)
+                }
+            } else {
+                append("```kotlin\n")
+                append(rendered)
+                append("\n```")
             }
-            append("```kotlin\n")
-            append(rendered)
-            append("\n```")
+
             if (kdocText != null) {
                 append("\n\n---\n\n")
-                append(kdocText)
+                append(enrichKDocText(kdocText))
             }
         }
     }
@@ -2058,12 +2234,29 @@ class CompilerBridge {
                             append(containerInfo)
                             append("\n\n")
                         }
+
+                        val annotationsBlock = buildAnnotationsBlock(symbol)
+                        val supertypesLine = buildSupertypesLine(symbol)
                         append("```kotlin\n")
+                        if (annotationsBlock != null) {
+                            append(annotationsBlock)
+                            append("\n")
+                        }
                         append(rendered)
+                        if (supertypesLine != null) {
+                            append("\n")
+                            append(supertypesLine)
+                        }
                         append("\n```")
                         if (kdocText != null) {
                             append("\n\n---\n\n")
-                            append(kdocText)
+                            append(enrichKDocText(kdocText))
+                        }
+
+                        val sourceOrigin = buildSourceOrigin(symbol)
+                        if (sourceOrigin != null) {
+                            append("\n\n---\n\n")
+                            append(sourceOrigin)
                         }
                     }
                 }
@@ -2138,6 +2331,119 @@ class CompilerBridge {
             // Ignore errors in container info — it's supplementary
         }
         return null
+    }
+
+    /**
+     * Builds meta-annotation lines for annotation classes and annotated declarations.
+     * Shows annotations like @Target, @Retention, @Component etc. inside the code block.
+     */
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.buildAnnotationsBlock(
+        symbol: KaDeclarationSymbol,
+    ): String? {
+        try {
+            val annotations = symbol.annotations
+            if (annotations.isEmpty()) return null
+
+            val relevantAnnotations = annotations.mapNotNull { annotation ->
+                val shortName = annotation.classId?.shortClassName?.asString() ?: return@mapNotNull null
+                // Show useful meta-annotations and framework composition annotations
+                when (shortName) {
+                    "Target", "Retention", "Documented", "Repeatable",
+                    "MustBeDocumented", "Inherited",
+                    "Component", "Service", "Repository", "Controller",
+                    "RestController", "Configuration", "Bean", "Qualifier",
+                    "Deprecated", "JvmStatic", "JvmOverloads", "JvmField",
+                    "Suppress", "Serializable" -> {
+                        val args = annotation.arguments.mapNotNull { arg ->
+                            val name = arg.name?.asString()
+                            val value = try {
+                                arg.expression.toString()
+                                    .removePrefix("KaAnnotationValue.")
+                                    .removeSuffix(")")
+                                    .substringAfter("(")
+                            } catch (_: Exception) { null }
+                            if (name != null && value != null) "$name = $value"
+                            else value ?: name
+                        }
+                        if (args.isNotEmpty()) "@$shortName(${args.joinToString(", ")})"
+                        else "@$shortName"
+                    }
+                    else -> null
+                }
+            }
+
+            if (relevantAnnotations.isEmpty()) return null
+            return relevantAnnotations.joinToString("\n")
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    /**
+     * Builds a supertypes line for classes/interfaces (e.g., ": Interface1, Interface2").
+     * Skips implicit Any supertype.
+     */
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.buildSupertypesLine(
+        symbol: KaDeclarationSymbol,
+    ): String? {
+        try {
+            if (symbol !is KaNamedClassSymbol) return null
+            val supertypes = symbol.superTypes
+                .mapNotNull { type ->
+                    val rendered = type.render(
+                        KaTypeRendererForSource.WITH_SHORT_NAMES,
+                        Variance.INVARIANT
+                    )
+                    // Skip implicit Any and Annotation
+                    if (rendered == "Any" || rendered == "Annotation") null else rendered
+                }
+            if (supertypes.isEmpty()) return null
+            return ": ${supertypes.joinToString(", ")}"
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    /**
+     * Builds source origin info for library symbols (JAR path or coordinates).
+     */
+    private fun buildSourceOrigin(symbol: KaDeclarationSymbol): String? {
+        try {
+            val psi = symbol.psi ?: return null
+            val vf = psi.containingFile?.virtualFile ?: return null
+            val path = vf.path ?: return null
+
+            // Only show for library symbols (inside JARs or Gradle caches)
+            if (!path.contains(".jar") && !path.contains(".gradle")) return null
+
+            // Extract JAR filename from path
+            val jarName = path.substringAfterLast('/')
+                .let { if (it.contains("!")) path.substringBefore("!").substringAfterLast('/') else it }
+
+            if (jarName.endsWith(".jar")) {
+                return "*From: $jarName*"
+            }
+        } catch (_: Exception) {}
+        return null
+    }
+
+    /**
+     * Enhances KDoc text with richer formatting:
+     * - Converts [ClassName] bracket references to inline code
+     * - Converts @author, @since, @see tags to bold labels
+     */
+    private fun enrichKDocText(text: String): String {
+        return text
+            // Convert [org.foo.Bar] to `Bar`
+            .replace(Regex("\\[([\\w.]+)]")) { match ->
+                val ref = match.groupValues[1]
+                val shortName = ref.substringAfterLast('.')
+                "`$shortName`"
+            }
+            // Format @author tags
+            .replace(Regex("(?m)^\\*\\*@author\\*\\*\\s*(.+)")) { "**Author:** ${it.groupValues[1]}" }
+            .replace(Regex("(?m)^\\*\\*@since\\*\\*\\s*(.+)")) { "**Since:** ${it.groupValues[1]}" }
+            .replace(Regex("(?m)^\\*\\*@see\\*\\*\\s*(.+)")) { "**See also:** `${it.groupValues[1].trim()}`" }
     }
 
     /**
@@ -2493,6 +2799,65 @@ class CompilerBridge {
     }
 
     /**
+     * Extracts the identifier prefix being typed at the cursor position.
+     * Looks at the raw file text before the cursor to find the identifier being typed.
+     */
+    private fun extractCompletionPrefix(element: PsiElement, offset: Int): String {
+        val fileText = element.containingFile?.text ?: return ""
+        // Walk backwards from the cursor offset to find the start of the identifier
+        var start = offset
+        while (start > 0 && (fileText[start - 1].isLetterOrDigit() || fileText[start - 1] == '_')) {
+            start--
+        }
+        if (start >= offset) return ""
+        return fileText.substring(start, offset)
+    }
+
+    /**
+     * Appends completion items for unimported symbols that match the prefix.
+     * Each item includes additionalTextEdits to auto-insert the import statement.
+     */
+    private fun appendUnimportedCompletions(ktFile: KtFile, prefix: String, itemsArray: JsonArray) {
+        val existingLabels = (0 until itemsArray.size())
+            .map { itemsArray[it].asJsonObject.get("label")?.asString ?: "" }
+            .toSet()
+
+        val existingImports = ktFile.importDirectives
+            .mapNotNull { it.importedFqName?.asString() }
+            .toSet()
+
+        val candidates = symbolIndex.searchSymbols(prefix, limit = 20)
+            .filter { it.fqn != null && it.fqn !in existingImports && it.shortName !in existingLabels }
+
+        if (candidates.isEmpty()) return
+
+        val document = ktFile.viewProvider.document ?: return
+        val importLine = findImportInsertLine(ktFile, document)
+
+        for (decl in candidates) {
+            val item = JsonObject()
+            item.addProperty("label", decl.shortName)
+            item.addProperty("kind", decl.kind)
+            item.addProperty("detail", decl.fqn)
+            item.addProperty("insertText", decl.shortName)
+            item.addProperty("sortText", "z_${decl.shortName}") // rank after imported symbols
+
+            // additionalTextEdits: insert the import statement
+            val editsArray = JsonArray()
+            val edit = JsonObject()
+            edit.addProperty("newText", "import ${decl.fqn}\n")
+            edit.addProperty("line", importLine)
+            edit.addProperty("column", 0)
+            edit.addProperty("endLine", importLine)
+            edit.addProperty("endColumn", 0)
+            editsArray.add(edit)
+            item.add("additionalTextEdits", editsArray)
+
+            itemsArray.add(item)
+        }
+    }
+
+    /**
      * Fallback: walks up the PSI tree to collect named declarations in enclosing scopes.
      */
     private fun collectPsiScopeCompletions(element: PsiElement, itemsArray: JsonArray) {
@@ -2695,6 +3060,20 @@ class CompilerBridge {
         }
 
         return count
+    }
+
+    // --- Private helpers: auto-import ---
+
+    /**
+     * Searches all files in the session for top-level declarations matching the given short name.
+     * Returns a list of fully-qualified names that could be imported.
+     */
+    private fun findImportCandidates(shortName: String): List<String> {
+        return symbolIndex.findByShortName(shortName)
+            .mapNotNull { it.fqn }
+            .filter { it != shortName }
+            .distinct()
+            .sorted()
     }
 
     // --- Private helpers: semantic tokens ---
@@ -2916,23 +3295,149 @@ class CompilerBridge {
         return content + extraSections.toString()
     }
 
+    /**
+     * Registers a custom module provider that maps KtPsiFactory files (backed by LightVirtualFile)
+     * to the source module. This ensures that analyze() on KtPsiFactory files enters the source
+     * module's context, inheriting its LanguageVersionSettings (including -Xcontext-parameters).
+     *
+     * Without this, KtPsiFactory files are not in any module's contentScope and fall into the
+     * default "not under content root" module which uses default language settings.
+     */
+    private fun registerVirtualFileModuleProvider() {
+        val currentSession = session ?: return
+        val module = sourceModule ?: return
+        val project = currentSession.project
+
+        try {
+            val originalProvider = KotlinProjectStructureProvider.getInstance(project)
+
+            val customProvider = object : KotlinProjectStructureProvider {
+                override fun getModule(element: PsiElement, useSiteModule: KaModule?): KaModule {
+                    val file = element.containingFile
+                    if (file != null) {
+                        val vf = file.virtualFile
+                        // Map KtPsiFactory-created files to the source module so they inherit
+                        // its language settings and get full FIR resolution (class-body, etc.).
+                        // This covers both non-physical files (virtualFile == null) and physical
+                        // files backed by LightVirtualFile (from createPhysicalFile).
+                        if (vf == null || vf is com.intellij.testFramework.LightVirtualFile) {
+                            return module
+                        }
+                    }
+                    return originalProvider.getModule(element, useSiteModule)
+                }
+
+                override fun getImplementingModules(module: KaModule): List<KaModule> {
+                    return originalProvider.getImplementingModules(module)
+                }
+            }
+
+            // Replace the service: unregister old, register new
+            val mockClass = Class.forName("com.intellij.mock.MockComponentManager")
+            val picoField = mockClass.getDeclaredField("picoContainer")
+            picoField.isAccessible = true
+            val container = picoField.get(project)
+            val unregisterMethod = container.javaClass.getMethod("unregisterComponent", Any::class.java)
+            unregisterMethod.invoke(container, KotlinProjectStructureProvider::class.java.name)
+
+            val registerMethod = mockClass.getMethod(
+                "registerService", Class::class.java, Any::class.java
+            )
+            registerMethod.invoke(project, KotlinProjectStructureProvider::class.java, customProvider)
+
+            System.err.println("CompilerBridge: registered custom KotlinProjectStructureProvider for virtual file support")
+        } catch (e: Exception) {
+            System.err.println("CompilerBridge: WARNING — failed to register custom module provider: ${e.javaClass.name}: ${e.message}")
+        }
+    }
+
+    /**
+     * Finds a KtFile in the session's discovered source files only (no ad-hoc fallbacks).
+     * Used by updateFileInSession to locate the in-session PSI file for document updates.
+     */
+    private fun findKtFileInSession(session: StandaloneAnalysisAPISession, uri: String): KtFile? {
+        val filePath = uriToPath(uri)
+        return session.modulesWithFiles.entries
+            .flatMap { (_, files) -> files }
+            .filterIsInstance<KtFile>()
+            .find { it.virtualFile.path == filePath || it.name == filePath }
+    }
+
+    /**
+     * Notifies that a file's content has been updated.
+     * Content is stored in virtualFiles and used by findKtFile() to create a
+     * LightVirtualFile-backed KtFile through PsiManager for proper FIR resolution.
+     */
+    private fun updateFileInSession(uri: String, text: String) {
+        System.err.println("CompilerBridge: updateFile($uri) — stored in virtualFiles (${text.length} chars)")
+    }
+
+    /**
+     * Cache of LightVirtualFile-backed KtFiles for virtual content.
+     * Reused across calls to avoid creating new files on every access.
+     * Invalidated when virtualFiles content changes (checked by content equality).
+     */
+    private val lightFileCache = mutableMapOf<String, Pair<String, KtFile>>() // uri -> (content, ktFile)
+
     private fun findKtFile(session: StandaloneAnalysisAPISession, uri: String): KtFile? {
         val filePath = uriToPath(uri)
 
-        // Log all session files for debugging (first time only per session)
         val allSessionFiles = session.modulesWithFiles.entries
             .flatMap { (_, files) -> files }
             .filterIsInstance<KtFile>()
 
         System.err.println("CompilerBridge: findKtFile($uri) — resolved path=$filePath, session has ${allSessionFiles.size} file(s)")
 
-        // First, look for the file in the session's discovered source files
-        val sessionFile = allSessionFiles
-            .find { it.virtualFile.path == filePath || it.name == filePath }
+        val virtualContent = virtualFiles[uri]
 
-        if (sessionFile != null) {
-            System.err.println("CompilerBridge: findKtFile($uri) — FOUND in session: ${sessionFile.virtualFile.path}")
-            return sessionFile
+        // If no virtual content, use the session file (on-disk content)
+        if (virtualContent == null) {
+            val sessionFile = allSessionFiles
+                .find { it.virtualFile.path == filePath || it.name == filePath }
+            if (sessionFile != null) {
+                System.err.println("CompilerBridge: findKtFile($uri) — FOUND in session: ${sessionFile.virtualFile.path}")
+                return sessionFile
+            }
+        } else {
+            // Check if session file has matching content (no edits pending)
+            val sessionFile = allSessionFiles
+                .find { it.virtualFile.path == filePath || it.name == filePath }
+            if (sessionFile != null && sessionFile.text == virtualContent) {
+                System.err.println("CompilerBridge: findKtFile($uri) — session file content matches virtualFiles, using session file")
+                return sessionFile
+            }
+
+            // Content differs or file not in session — create a LightVirtualFile-backed
+            // KtFile through PsiManager. This gives a proper VFS-backed file that the
+            // custom KotlinProjectStructureProvider maps to the source module, enabling
+            // full FIR resolution including class-body members.
+            val cached = lightFileCache[uri]
+            if (cached != null && cached.first == virtualContent) {
+                System.err.println("CompilerBridge: findKtFile($uri) — using cached LightVirtualFile (${virtualContent.length} chars)")
+                return cached.second
+            }
+
+            System.err.println("CompilerBridge: findKtFile($uri) — creating LightVirtualFile (${virtualContent.length} chars)")
+            try {
+                val fileName = filePath.substringAfterLast('/')
+                val lightVf = com.intellij.testFramework.LightVirtualFile(fileName, virtualContent)
+                val psiFile = com.intellij.psi.PsiManager.getInstance(session.project).findFile(lightVf)
+                if (psiFile is KtFile) {
+                    lightFileCache[uri] = virtualContent to psiFile
+                    return psiFile
+                }
+                System.err.println("CompilerBridge: LightVirtualFile did not produce KtFile: ${psiFile?.javaClass?.name}")
+            } catch (e: Exception) {
+                System.err.println("CompilerBridge: LightVirtualFile failed: ${e.javaClass.name}: ${e.message}")
+            }
+
+            // Fallback: KtPsiFactory (loses module context but better than nothing)
+            try {
+                val psiFactory = KtPsiFactory(session.project)
+                return psiFactory.createPhysicalFile(filePath.substringAfterLast('/'), virtualContent)
+            } catch (e: Exception) {
+                System.err.println("CompilerBridge: failed to create KtFile from virtualFiles: ${e.message}")
+            }
         }
 
         System.err.println("CompilerBridge: findKtFile($uri) — NOT in session. Session file paths:")
@@ -2943,28 +3448,18 @@ class CompilerBridge {
             System.err.println("  ... and ${allSessionFiles.size - 10} more")
         }
 
-        // If not found in session, try to create a KtFile from virtualFiles content
-        val content = virtualFiles[uri]
-        if (content != null) {
-            System.err.println("CompilerBridge: findKtFile($uri) — creating AD-HOC from virtualFiles (${content.length} chars)")
-            System.err.println("CompilerBridge: WARNING — ad-hoc files lack module context (classpath/deps), diagnostics may be incomplete")
-            try {
-                val fileName = filePath.substringAfterLast('/')
-                val psiFactory = KtPsiFactory(session.project)
-                return psiFactory.createFile(fileName, content)
-            } catch (e: Exception) {
-                System.err.println("CompilerBridge: failed to create KtFile from virtualFiles: ${e.message}")
-            }
-        }
-
-        // Last resort: try to read from disk if the file exists
+        // Last resort: try to read from disk if the file exists.
         val file = File(filePath)
         if (file.exists() && file.extension == "kt") {
-            System.err.println("CompilerBridge: findKtFile($uri) — creating AD-HOC from disk: $filePath")
-            System.err.println("CompilerBridge: WARNING — ad-hoc files lack module context (classpath/deps), diagnostics may be incomplete")
+            System.err.println("CompilerBridge: findKtFile($uri) — creating from disk: $filePath")
+            try {
+                val lightVf = com.intellij.testFramework.LightVirtualFile(file.name, file.readText())
+                val psiFile = com.intellij.psi.PsiManager.getInstance(session.project).findFile(lightVf)
+                if (psiFile is KtFile) return psiFile
+            } catch (_: Exception) {}
             try {
                 val psiFactory = KtPsiFactory(session.project)
-                return psiFactory.createFile(file.name, file.readText())
+                return psiFactory.createPhysicalFile(file.name, file.readText())
             } catch (e: Exception) {
                 System.err.println("CompilerBridge: failed to create KtFile from disk: ${e.message}")
             }
@@ -2973,6 +3468,35 @@ class CompilerBridge {
         System.err.println("CompilerBridge: findKtFile($uri) — NOT FOUND anywhere (path=$filePath)")
         System.err.println("CompilerBridge: virtualFiles keys: ${virtualFiles.keys}")
         return null
+    }
+
+    /**
+     * Collects all names declared in a KtFile — top-level declarations, class members,
+     * constructor parameters. Used to filter false UNRESOLVED_REFERENCE diagnostics for
+     * virtual files where the standalone API can't resolve same-file declarations.
+     */
+    private fun collectDeclaredNames(ktFile: KtFile): Set<String> {
+        val names = mutableSetOf<String>()
+        for (decl in ktFile.declarations) {
+            when (decl) {
+                is KtClassOrObject -> {
+                    decl.name?.let { names.add(it) }
+                    // Class members (properties, functions)
+                    for (member in decl.declarations) {
+                        (member as? KtNamedDeclaration)?.name?.let { names.add(it) }
+                    }
+                    // Constructor parameters
+                    (decl as? KtClass)?.primaryConstructorParameters?.forEach { param ->
+                        param.name?.let { names.add(it) }
+                    }
+                }
+                is KtNamedFunction -> decl.name?.let { names.add(it) }
+                is KtProperty -> decl.name?.let { names.add(it) }
+                is KtTypeAlias -> decl.name?.let { names.add(it) }
+                else -> {}
+            }
+        }
+        return names
     }
 
     private fun uriToPath(uri: String): String {
@@ -2984,10 +3508,23 @@ class CompilerBridge {
     }
 
     private fun lineColToOffset(ktFile: KtFile, line: Int, character: Int): Int? {
-        val document = ktFile.viewProvider.document ?: return null
-        if (line < 1 || line > document.lineCount) return null
-        val lineStartOffset = document.getLineStartOffset(line - 1)
-        return lineStartOffset + character
+        val document = ktFile.viewProvider.document
+        if (document != null) {
+            if (line < 1 || line > document.lineCount) return null
+            val lineStartOffset = document.getLineStartOffset(line - 1)
+            return lineStartOffset + character
+        }
+        // Fallback for LightVirtualFile-backed files where document may be null:
+        // compute offset from raw text
+        val text = ktFile.text
+        var currentLine = 1
+        var offset = 0
+        while (offset < text.length && currentLine < line) {
+            if (text[offset] == '\n') currentLine++
+            offset++
+        }
+        if (currentLine != line) return null
+        return offset + character
     }
 
     private fun findKotlinStdlibJars(): List<Path> {

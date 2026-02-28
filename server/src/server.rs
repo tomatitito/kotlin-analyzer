@@ -95,6 +95,11 @@ impl KotlinLanguageServer {
                 for d in &diagnostics {
                     tracing::info!("  diagnostic: {:?} at L{}:{} - {}", d.severity, d.range.start.line, d.range.start.character, d.message);
                 }
+                // Cache diagnostics so they survive didClose/didOpen tab switches
+                {
+                    let mut documents = self.documents.lock().await;
+                    documents.set_diagnostics(uri.clone(), diagnostics.clone());
+                }
                 self.client
                     .publish_diagnostics(uri.clone(), diagnostics, None)
                     .await;
@@ -352,7 +357,14 @@ impl LanguageServer for KotlinLanguageServer {
                 references_provider: Some(OneOf::Left(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Left(true)),
-                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                    code_action_kinds: Some(vec![
+                        CodeActionKind::QUICKFIX,
+                        CodeActionKind::REFACTOR,
+                        CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                    ]),
+                    ..Default::default()
+                })),
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(false),
                 }),
@@ -762,8 +774,17 @@ impl LanguageServer for KotlinLanguageServer {
 
         tracing::debug!("did_open: {} (version {}, {} bytes)", uri, version, text.len());
 
+        // Re-publish cached diagnostics immediately so they appear instantly on tab switch
         {
             let mut documents = self.documents.lock().await;
+            if let Some(cached) = documents.get_diagnostics(&uri).cloned() {
+                if !cached.is_empty() {
+                    tracing::debug!("did_open: re-publishing {} cached diagnostics for {}", cached.len(), uri);
+                    self.client
+                        .publish_diagnostics(uri.clone(), cached, None)
+                        .await;
+                }
+            }
             documents.open(uri.clone(), text.clone(), version);
         }
 
@@ -783,7 +804,7 @@ impl LanguageServer for KotlinLanguageServer {
         }
         drop(bridge);
 
-        // Trigger analysis
+        // Trigger fresh analysis (will update the cache when complete)
         self.analyze_document(&uri).await;
     }
 
@@ -827,8 +848,10 @@ impl LanguageServer for KotlinLanguageServer {
             }
         }
 
-        // Clear diagnostics for closed document (bridge lock released)
-        self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        // Do NOT clear diagnostics on didClose — Zed sends didClose when switching
+        // tabs, and clearing diagnostics here causes them to disappear. Cached
+        // diagnostics will be re-published on the next didOpen.
+        tracing::debug!("did_close: keeping cached diagnostics for {}", uri);
     }
 
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
@@ -1679,11 +1702,41 @@ impl KotlinLanguageServer {
                     .and_then(|t| t.as_str())
                     .map(String::from);
 
+                let sort_text = item
+                    .get("sortText")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
+
+                let additional_text_edits = item
+                    .get("additionalTextEdits")
+                    .and_then(|a| a.as_array())
+                    .map(|edits| {
+                        edits
+                            .iter()
+                            .filter_map(|e| {
+                                let new_text = e.get("newText")?.as_str()?.to_string();
+                                let line = e.get("line")?.as_u64()?.saturating_sub(1) as u32;
+                                let col = e.get("column")?.as_u64()? as u32;
+                                let end_line = e.get("endLine")?.as_u64()?.saturating_sub(1) as u32;
+                                let end_col = e.get("endColumn")?.as_u64()? as u32;
+                                Some(TextEdit {
+                                    range: Range {
+                                        start: Position::new(line, col),
+                                        end: Position::new(end_line, end_col),
+                                    },
+                                    new_text,
+                                })
+                            })
+                            .collect()
+                    });
+
                 Some(CompletionItem {
                     label,
                     kind,
                     detail,
                     insert_text,
+                    sort_text,
+                    additional_text_edits,
                     ..Default::default()
                 })
             })
