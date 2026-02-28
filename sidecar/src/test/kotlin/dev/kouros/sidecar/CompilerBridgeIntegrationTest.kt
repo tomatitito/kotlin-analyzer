@@ -765,4 +765,81 @@ class CompilerBridgeIntegrationTest {
             }"
         )
     }
+
+    // --- Hover: Annotated declarations ---
+
+    @Test
+    fun `hover - deprecated class shows annotation and KDoc`() {
+        // Annotated.kt line 8: "@Deprecated(...)"
+        // line 8: "class OldGreeter(val name: String) {"
+        //                ^6 (0-based)
+        val uri = "file://$testSourceDir/Annotated.kt"
+        val result = bridge.hover(uri, line = 8, character = 6)
+
+        val contents = result.get("contents")?.asString
+        assertNotNull(contents, "hover should return contents for @Deprecated class")
+        assertTrue(
+            contents.contains("OldGreeter"),
+            "hover should mention 'OldGreeter', got: $contents"
+        )
+        assertTrue(
+            contents.contains("@Deprecated"),
+            "hover should show @Deprecated annotation, got: $contents"
+        )
+        assertTrue(
+            contents.contains("Test Author") || contents.contains("@author"),
+            "hover should show @author tag from KDoc, got: $contents"
+        )
+    }
+
+    @Test
+    fun `hover - deprecated function shows annotation`() {
+        // Annotated.kt line 10: "    @Deprecated("Use newGreet() instead")"
+        // line 11: "    fun greet(): String = "Hello, $name!""
+        //                  ^8 (0-based)
+        val uri = "file://$testSourceDir/Annotated.kt"
+        val result = bridge.hover(uri, line = 10, character = 8)
+
+        val contents = result.get("contents")?.asString
+        assertNotNull(contents, "hover should return contents for @Deprecated function")
+        assertTrue(
+            contents.contains("greet") || contents.contains("@Deprecated"),
+            "hover should mention 'greet' or '@Deprecated', got: $contents"
+        )
+    }
+
+    @Test
+    fun `hover - annotation reference shows annotation type info`() {
+        // Hover on "@Deprecated" annotation usage (line 7, col 2 = on "D" of Deprecated)
+        // Annotated.kt line 7: "@Deprecated("Use NewGreeter instead", ...)"
+        val uri = "file://$testSourceDir/Annotated.kt"
+        val result = bridge.hover(uri, line = 7, character = 2)
+
+        val contents = result.get("contents")?.asString
+        assertNotNull(contents, "hover should return contents for @Deprecated annotation reference")
+        assertTrue(
+            contents.contains("annotation class Deprecated"),
+            "hover should show annotation class declaration, got: $contents"
+        )
+        assertTrue(
+            contents.contains("kotlin"),
+            "hover should show kotlin package info, got: $contents"
+        )
+    }
+
+    @Test
+    fun `hover - stdlib reference shows documentation`() {
+        // Hover on 'String' in OldGreeter(val name: String)
+        // Annotated.kt line 8: "class OldGreeter(val name: String) {"
+        //                                               ^30 (0-based)
+        val uri = "file://$testSourceDir/Annotated.kt"
+        val result = bridge.hover(uri, line = 8, character = 30)
+
+        val contents = result.get("contents")?.asString
+        assertNotNull(contents, "hover should return contents for String type reference")
+        assertTrue(
+            contents.contains("String") || contents.contains("kotlin"),
+            "hover should mention 'String' or its package, got: $contents"
+        )
+    }
 }

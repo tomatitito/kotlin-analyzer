@@ -107,13 +107,16 @@ Further optimization can be deferred to post-v1.
 - Core LSP features (hover, rename, go-to-definition, references)
 - Request buffering and crash recovery
 - Pre-commit hooks
-- Integration tests (14 sidecar tests)
+- Integration tests (39 sidecar tests, all passing)
 - Performance targets met
 - v0.2.0 release created (stable baseline)
 - Documentation and build instructions updated
 - Error handling for missing JVM/JAR (user-facing messages via LSP)
 - Zero compiler warnings
 - Enhanced hover: package/container info, documentation from library symbols (KDoc + Javadoc)
+- Rich annotation hover: meta-annotations (@Target, @Retention, @MustBeDocumented, @Component), supertypes, source origin
+- Annotation entry hover: special PSI walk-up handler for `KtAnnotationEntry` resolves to annotation CLASS
+- Library symbol hover: classId-based package resolution, origin-based source identification (kotlin-stdlib, JAR files)
 - Code actions: refactoring actions (add explicit type, convert expression/block body), line-level diagnostic matching
 - Logging cleanup: per-request logs moved to debug level, only lifecycle events at info
 - Spring Boot annotation support (classpath extraction + multi-module parser fixes)
@@ -124,7 +127,7 @@ Further optimization can be deferred to post-v1.
 - Binary install documented as symlink (required for sidecar JAR discovery)
 - Project root discovery: server walks up from rootUri to find actual project root (fixes incorrect classpath/source root when Zed passes a deep source directory)
 - Startup race condition: `analyze_document` no longer logs WARN when bridge is initializing (expected during startup)
-- Integration tests fixed: proper channel-based LSP message handling (notifications vs requests), all 4 integration tests pass
+- Integration tests fixed: proper channel-based LSP message handling (notifications vs requests), all tests pass
 - `did_save` handler: triggers re-analysis on save (was missing, caused tower-lsp WARN spam)
 - Logging: remaining per-request INFO logs (analyze_document raw response, code_action response) moved to DEBUG
 

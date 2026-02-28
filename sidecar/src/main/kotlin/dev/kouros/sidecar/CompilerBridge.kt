@@ -380,6 +380,15 @@ class CompilerBridge {
                 // Walk up to find the nearest meaningful element
                 var current: PsiElement? = element
                 while (current != null) {
+                    // Handle annotation entries specially — show the annotation CLASS info
+                    if (current is org.jetbrains.kotlin.psi.KtAnnotationEntry) {
+                        val hoverText = buildAnnotationEntryHover(current)
+                        if (hoverText != null) {
+                            result.addProperty("contents", hoverText)
+                            return@analyze
+                        }
+                    }
+
                     if (current is KtNamedDeclaration) {
                         val hoverText = buildDeclarationHover(current)
                         if (hoverText != null) {
@@ -389,27 +398,35 @@ class CompilerBridge {
                     }
 
                     if (current is KtReferenceExpression) {
-                        // Try to resolve the reference to get declaration info
-                        val hoverText = buildReferenceHover(current)
-                        if (hoverText != null) {
-                            result.addProperty("contents", hoverText)
-                            return@analyze
+                        // If inside an annotation entry, let the annotation entry handler
+                        // (found when walking further up) show annotation class info instead
+                        val insideAnnotation = PsiTreeUtil.getParentOfType(current, org.jetbrains.kotlin.psi.KtAnnotationEntry::class.java) != null
+                        if (!insideAnnotation) {
+                            val hoverText = buildReferenceHover(current)
+                            if (hoverText != null) {
+                                result.addProperty("contents", hoverText)
+                                return@analyze
+                            }
                         }
                     }
 
                     if (current is KtExpression) {
-                        try {
-                            val type = current.expressionType
-                            if (type != null) {
-                                val rendered = type.render(
-                                    KaTypeRendererForSource.WITH_SHORT_NAMES,
-                                    Variance.INVARIANT
-                                )
-                                result.addProperty("contents", "```kotlin\n$rendered\n```")
-                                return@analyze
+                        // If inside an annotation entry, skip — let the annotation handler deal with it
+                        val insideAnnotationExpr = PsiTreeUtil.getParentOfType(current, org.jetbrains.kotlin.psi.KtAnnotationEntry::class.java) != null
+                        if (!insideAnnotationExpr) {
+                            try {
+                                val type = current.expressionType
+                                if (type != null) {
+                                    val rendered = type.render(
+                                        KaTypeRendererForSource.WITH_SHORT_NAMES,
+                                        Variance.INVARIANT
+                                    )
+                                    result.addProperty("contents", "```kotlin\n$rendered\n```")
+                                    return@analyze
+                                }
+                            } catch (_: Exception) {
+                                // expressionType may not be available for all expressions
                             }
-                        } catch (_: Exception) {
-                            // expressionType may not be available for all expressions
                         }
                     }
 
@@ -2176,17 +2193,34 @@ class CompilerBridge {
                 // Build code block with optional annotations prefix
                 val annotationsBlock = buildAnnotationsBlock(symbol)
                 val supertypesLine = buildSupertypesLine(symbol)
+
+                // Strip annotations from the rendered output to avoid duplication
+                // when buildAnnotationsBlock provides cleaner annotation rendering
+                val cleanRendered = if (annotationsBlock != null) {
+                    rendered.lines()
+                        .dropWhile { it.trimStart().startsWith("@") }
+                        .joinToString("\n")
+                } else {
+                    rendered
+                }
+
                 append("```kotlin\n")
                 if (annotationsBlock != null) {
                     append(annotationsBlock)
                     append("\n")
                 }
-                append(rendered)
+                append(cleanRendered)
                 if (supertypesLine != null) {
                     append("\n")
                     append(supertypesLine)
                 }
                 append("\n```")
+
+                // Documentation before source origin (matches IntelliJ layout)
+                if (kdocText != null) {
+                    append("\n\n---\n\n")
+                    append(enrichKDocText(kdocText))
+                }
 
                 val sourceOrigin = buildSourceOrigin(symbol)
                 if (sourceOrigin != null) {
@@ -2197,11 +2231,11 @@ class CompilerBridge {
                 append("```kotlin\n")
                 append(rendered)
                 append("\n```")
-            }
 
-            if (kdocText != null) {
-                append("\n\n---\n\n")
-                append(enrichKDocText(kdocText))
+                if (kdocText != null) {
+                    append("\n\n---\n\n")
+                    append(enrichKDocText(kdocText))
+                }
             }
         }
     }
@@ -2237,12 +2271,22 @@ class CompilerBridge {
 
                         val annotationsBlock = buildAnnotationsBlock(symbol)
                         val supertypesLine = buildSupertypesLine(symbol)
+
+                        // Strip annotations from the rendered output to avoid duplication
+                        val cleanRendered = if (annotationsBlock != null) {
+                            rendered.lines()
+                                .dropWhile { it.trimStart().startsWith("@") }
+                                .joinToString("\n")
+                        } else {
+                            rendered
+                        }
+
                         append("```kotlin\n")
                         if (annotationsBlock != null) {
                             append(annotationsBlock)
                             append("\n")
                         }
-                        append(rendered)
+                        append(cleanRendered)
                         if (supertypesLine != null) {
                             append("\n")
                             append(supertypesLine)
@@ -2274,6 +2318,89 @@ class CompilerBridge {
         }
 
         return null
+    }
+
+    /**
+     * Builds hover text for an annotation entry (e.g., @RestController, @Deprecated).
+     * Resolves to the annotation CLASS and shows its meta-annotations, documentation,
+     * supertypes, and source origin — matching IntelliJ's annotation hover behavior.
+     */
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.buildAnnotationEntryHover(
+        annotationEntry: org.jetbrains.kotlin.psi.KtAnnotationEntry,
+    ): String? {
+        try {
+            // Resolve the annotation type reference to the annotation class
+            val typeRef = annotationEntry.typeReference ?: return null
+            val type = typeRef.type
+            val classSymbol = (type as? org.jetbrains.kotlin.analysis.api.types.KaClassType)
+                ?.symbol as? KaNamedClassSymbol ?: return null
+
+            // Get the annotation class PSI for KDoc extraction
+            val psi = classSymbol.psi as? KtDeclaration
+
+            // Render the annotation class declaration
+            val rendered = classSymbol.render(
+                KaDeclarationRendererForSource.WITH_SHORT_NAMES
+            )
+
+            // Build container info (package)
+            val containerInfo = buildContainerInfo(classSymbol)
+
+            // Build meta-annotations (e.g., @Target, @Retention for annotation classes)
+            val annotationsBlock = buildAnnotationsBlock(classSymbol)
+
+            // Build supertypes
+            val supertypesLine = buildSupertypesLine(classSymbol)
+
+            // Strip annotations from the rendered output to avoid duplication
+            val cleanRendered = if (annotationsBlock != null) {
+                rendered.lines()
+                    .dropWhile { it.trimStart().startsWith("@") }
+                    .joinToString("\n")
+            } else {
+                rendered
+            }
+
+            // Extract documentation (KDoc, decompiled stubs, Javadoc)
+            val kdocText = if (psi != null) extractKDocText(psi) else null
+            val symbolDoc = extractSymbolDocumentation(classSymbol)
+            val documentation = kdocText ?: symbolDoc
+
+            // Build source origin
+            val sourceOrigin = buildSourceOrigin(classSymbol)
+
+            return buildString {
+                if (containerInfo != null) {
+                    append(containerInfo)
+                    append("\n\n")
+                }
+
+                append("```kotlin\n")
+                if (annotationsBlock != null) {
+                    append(annotationsBlock)
+                    append("\n")
+                }
+                append(cleanRendered)
+                if (supertypesLine != null) {
+                    append("\n")
+                    append(supertypesLine)
+                }
+                append("\n```")
+
+                if (documentation != null) {
+                    append("\n\n---\n\n")
+                    append(enrichKDocText(documentation))
+                }
+
+                if (sourceOrigin != null) {
+                    append("\n\n---\n\n")
+                    append(sourceOrigin)
+                }
+            }
+        } catch (e: Exception) {
+            System.err.println("CompilerBridge: buildAnnotationEntryHover failed: ${e.javaClass.name}: ${e.message}")
+            return null
+        }
     }
 
     /**
@@ -2327,6 +2454,22 @@ class CompilerBridge {
                 }
                 return "*(in ${containingSymbol.name.asString()})*"
             }
+
+            // Fallback for library symbols (no PSI): use classId or callableId
+            if (symbol is KaClassLikeSymbol) {
+                val classId = symbol.classId
+                if (classId != null) {
+                    val pkg = classId.packageFqName.asString()
+                    if (pkg.isNotEmpty()) return "*($pkg)*"
+                }
+            }
+            if (symbol is KaCallableSymbol) {
+                val callableId = symbol.callableId
+                if (callableId != null) {
+                    val pkg = callableId.packageName.asString()
+                    if (pkg.isNotEmpty()) return "*($pkg)*"
+                }
+            }
         } catch (_: Exception) {
             // Ignore errors in container info — it's supplementary
         }
@@ -2357,10 +2500,7 @@ class CompilerBridge {
                         val args = annotation.arguments.mapNotNull { arg ->
                             val name = arg.name?.asString()
                             val value = try {
-                                arg.expression.toString()
-                                    .removePrefix("KaAnnotationValue.")
-                                    .removeSuffix(")")
-                                    .substringAfter("(")
+                                renderAnnotationArgValue(arg.expression)
                             } catch (_: Exception) { null }
                             if (name != null && value != null) "$name = $value"
                             else value ?: name
@@ -2376,6 +2516,41 @@ class CompilerBridge {
             return relevantAnnotations.joinToString("\n")
         } catch (_: Exception) {
             return null
+        }
+    }
+
+    /**
+     * Renders an annotation argument value to a human-readable string.
+     * Handles enum entries, arrays, constants, class literals, and nested annotations.
+     */
+    private fun renderAnnotationArgValue(value: org.jetbrains.kotlin.analysis.api.annotations.KaAnnotationValue): String {
+        return when (value) {
+            is org.jetbrains.kotlin.analysis.api.annotations.KaAnnotationValue.EnumEntryValue -> {
+                val callableId = value.callableId
+                "${callableId?.classId?.shortClassName?.asString() ?: ""}.${callableId?.callableName?.asString() ?: ""}"
+                    .removePrefix(".")
+            }
+            is org.jetbrains.kotlin.analysis.api.annotations.KaAnnotationValue.ArrayValue -> {
+                value.values.joinToString(", ", "[", "]") { renderAnnotationArgValue(it) }
+            }
+            is org.jetbrains.kotlin.analysis.api.annotations.KaAnnotationValue.ClassLiteralValue -> {
+                "${value.classId?.shortClassName?.asString() ?: "?"}::class"
+            }
+            is org.jetbrains.kotlin.analysis.api.annotations.KaAnnotationValue.ConstantValue -> {
+                val raw = value.value.toString()
+                // Clean up KaConstantValue wrappers
+                raw.removePrefix("KaConstantValue.")
+                    .replace(Regex("^\\w+Value\\((.+)\\)$")) { it.groupValues[1] }
+            }
+            is org.jetbrains.kotlin.analysis.api.annotations.KaAnnotationValue.NestedAnnotationValue -> {
+                "@${value.annotation.classId?.shortClassName?.asString() ?: "?"}"
+            }
+            else -> {
+                // Fallback: clean up the toString
+                value.toString()
+                    .removePrefix("KaAnnotationValue.")
+                    .replace(Regex("^\\w+\\((.+)\\)$")) { it.groupValues[1] }
+            }
         }
     }
 
@@ -2409,9 +2584,26 @@ class CompilerBridge {
      */
     private fun buildSourceOrigin(symbol: KaDeclarationSymbol): String? {
         try {
-            val psi = symbol.psi ?: return null
-            val vf = psi.containingFile?.virtualFile ?: return null
-            val path = vf.path ?: return null
+            val psi = symbol.psi
+            val vf = psi?.containingFile?.virtualFile
+            val path = vf?.path
+
+            // For library symbols without PSI, use classId to identify the origin
+            if (path == null) {
+                if (symbol.origin.name.contains("LIBRARY", ignoreCase = true)) {
+                    // Try to identify the library from classId
+                    val classId = (symbol as? KaClassLikeSymbol)?.classId
+                    val pkg = classId?.packageFqName?.asString()
+                    if (pkg != null && pkg.startsWith("kotlin")) {
+                        return "*From: kotlin-stdlib*"
+                    }
+                    if (pkg != null) {
+                        return "*From: library ($pkg)*"
+                    }
+                    return "*From: library*"
+                }
+                return null
+            }
 
             // Only show for library symbols (inside JARs or Gradle caches)
             if (!path.contains(".jar") && !path.contains(".gradle")) return null
@@ -2440,10 +2632,11 @@ class CompilerBridge {
                 val shortName = ref.substringAfterLast('.')
                 "`$shortName`"
             }
-            // Format @author tags
+            // Format Javadoc-style tags into readable labels
             .replace(Regex("(?m)^\\*\\*@author\\*\\*\\s*(.+)")) { "**Author:** ${it.groupValues[1]}" }
             .replace(Regex("(?m)^\\*\\*@since\\*\\*\\s*(.+)")) { "**Since:** ${it.groupValues[1]}" }
             .replace(Regex("(?m)^\\*\\*@see\\*\\*\\s*(.+)")) { "**See also:** `${it.groupValues[1].trim()}`" }
+            .replace(Regex("(?m)^\\*\\*@version\\*\\*\\s*(.+)")) { "**Version:** ${it.groupValues[1]}" }
     }
 
     /**
@@ -3276,9 +3469,10 @@ class CompilerBridge {
 
         if (content.isEmpty()) return null
 
-        // Also collect tagged sections
-        val allSections = kdoc.getAllSections()
         val extraSections = StringBuilder()
+
+        // Collect standard KDoc tagged sections (@param, @return, @throws, etc.)
+        val allSections = kdoc.getAllSections()
         for (section in allSections) {
             if (section == defaultSection) continue
             val sectionName = section.name
@@ -3289,6 +3483,18 @@ class CompilerBridge {
                 } else {
                     extraSections.append("\n\n$sectionContent")
                 }
+            }
+        }
+
+        // Also extract Javadoc-style tags (@author, @since, @see) from raw KDoc text,
+        // since the Kotlin KDoc parser doesn't recognize these as section-creating tags
+        val rawText = kdoc.text ?: ""
+        val javadocTagPattern = Regex("""(?m)^\s*\*?\s*@(author|since|see|version)\s+(.+)""")
+        for (match in javadocTagPattern.findAll(rawText)) {
+            val tag = match.groupValues[1]
+            val value = match.groupValues[2].trim()
+            if (value.isNotEmpty()) {
+                extraSections.append("\n\n**@$tag** $value")
             }
         }
 
