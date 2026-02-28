@@ -17,9 +17,9 @@ These are firing correctly on every commit. No further action needed.
 
 #### End-to-End Diagnostics Verification
 **Visual verification in Zed (use `my-zed` to see LSP logs and JSON-RPC messages in the terminal):**
+- [x] Verify BasicConstructs.kt / Example.kt shows no squiggly lines (verified: 0 diagnostics on clean file)
 - [ ] Verify TypeMismatch.kt shows red squiggly lines
 - [ ] Verify UnusedVariable.kt shows warning indicators
-- [ ] Verify BasicConstructs.kt shows no squiggly lines
 - [ ] Verify compiler-flags files work correctly with/without flags
 
 ### Milestone 3: Remaining Items
@@ -125,6 +125,8 @@ Further optimization can be deferred to post-v1.
 - Project root discovery: server walks up from rootUri to find actual project root (fixes incorrect classpath/source root when Zed passes a deep source directory)
 - Startup race condition: `analyze_document` no longer logs WARN when bridge is initializing (expected during startup)
 - Integration tests fixed: proper channel-based LSP message handling (notifications vs requests), all 4 integration tests pass
+- `did_save` handler: triggers re-analysis on save (was missing, caused tower-lsp WARN spam)
+- Logging: remaining per-request INFO logs (analyze_document raw response, code_action response) moved to DEBUG
 
 ## Success Criteria for v1.0
 

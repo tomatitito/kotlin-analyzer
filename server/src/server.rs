@@ -89,11 +89,11 @@ impl KotlinLanguageServer {
             .await
         {
             Ok(result) => {
-                tracing::info!("analyze_document: raw sidecar response for {}: {}", uri, result);
+                tracing::debug!("analyze_document: raw sidecar response for {}: {}", uri, result);
                 let diagnostics = self.parse_diagnostics(&result);
-                tracing::info!("analyze_document: {} returned {} diagnostics", uri, diagnostics.len());
+                tracing::debug!("analyze_document: {} returned {} diagnostics", uri, diagnostics.len());
                 for d in &diagnostics {
-                    tracing::info!("  diagnostic: {:?} at L{}:{} - {}", d.severity, d.range.start.line, d.range.start.character, d.message);
+                    tracing::debug!("  diagnostic: {:?} at L{}:{} - {}", d.severity, d.range.start.line, d.range.start.character, d.message);
                 }
                 // Cache diagnostics so they survive didClose/didOpen tab switches
                 {
@@ -854,6 +854,14 @@ impl LanguageServer for KotlinLanguageServer {
         tracing::debug!("did_close: keeping cached diagnostics for {}", uri);
     }
 
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri;
+        tracing::debug!("did_save: {}", uri);
+
+        // Trigger fresh analysis on save (bypasses debounce for immediate feedback)
+        self.analyze_document(&uri).await;
+    }
+
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
@@ -1287,9 +1295,9 @@ impl LanguageServer for KotlinLanguageServer {
             .await
         {
             Ok(result) => {
-                tracing::info!("code_action: raw sidecar response for {}: {}", uri, result);
+                tracing::debug!("code_action: raw sidecar response for {}: {}", uri, result);
                 let actions = self.parse_code_actions(&result);
-                tracing::info!("code_action: parsed {} action(s) for {} at L{}:{}", actions.len(), uri, range.start.line, range.start.character);
+                tracing::debug!("code_action: parsed {} action(s) for {} at L{}:{}", actions.len(), uri, range.start.line, range.start.character);
                 if actions.is_empty() {
                     Ok(None)
                 } else {
