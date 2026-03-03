@@ -28,3 +28,10 @@ spike/analysis-api/.gradle/
 extension.wasm
 grammars/
 .kotlin-analyzer/
+
+# Test fixture build caches
+tests/fixtures/**/.gradle/
+
+# Sidecar test artifacts
+sidecar/.jqwik-database
+sidecar/org/
