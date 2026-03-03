@@ -362,6 +362,128 @@ class CompilerBridge {
     }
 
     /**
+     * Analyzes all source files in the session and returns diagnostics for each.
+     * Used for project-wide diagnostics after initial startup.
+     */
+    fun analyzeAll(): JsonObject {
+        val result = JsonObject()
+        val filesArray = JsonArray()
+
+        val currentSession = session
+        if (currentSession == null) {
+            System.err.println("CompilerBridge: analyzeAll() — session is NULL, returning empty")
+            result.add("files", filesArray)
+            return result
+        }
+
+        val allKtFiles = currentSession.modulesWithFiles.entries
+            .flatMap { (_, files) -> files }
+            .filterIsInstance<KtFile>()
+
+        System.err.println("CompilerBridge: analyzeAll() — ${allKtFiles.size} file(s) in session")
+
+        var analyzedCount = 0
+        var errorCount = 0
+        var warningCount = 0
+
+        for (ktFile in allKtFiles) {
+            val filePath = ktFile.virtualFile.path
+
+            // Skip Gradle build scripts (.gradle.kts and .kts in buildSrc/gradle dirs)
+            if (filePath.endsWith(".gradle.kts") ||
+                (filePath.endsWith(".kts") && ("/buildSrc/" in filePath || "/gradle/" in filePath))) {
+                System.err.println("CompilerBridge: analyzeAll() — skipping build script: $filePath")
+                continue
+            }
+
+            // Skip files in build/output directories
+            if ("/build/" in filePath || "/.gradle/" in filePath) continue
+
+            val fileUri = "file://$filePath"
+
+            // Use virtual content if the file is open in the editor
+            val effectiveKtFile = if (virtualFiles.containsKey(fileUri)) {
+                findKtFile(currentSession, fileUri) ?: ktFile
+            } else {
+                ktFile
+            }
+
+            val fileObj = JsonObject()
+            fileObj.addProperty("uri", fileUri)
+            val diagnosticsArray = JsonArray()
+
+            try {
+                analyze(effectiveKtFile) {
+                    val analysisStart = System.currentTimeMillis()
+                    val diagnostics = effectiveKtFile.collectDiagnostics(
+                        KaDiagnosticCheckerFilter.EXTENDED_AND_COMMON_CHECKERS
+                    )
+                    val analysisElapsed = System.currentTimeMillis() - analysisStart
+
+                    if (diagnostics.isNotEmpty()) {
+                        System.err.println("CompilerBridge: analyzeAll() — $filePath: ${diagnostics.size} diagnostic(s) in ${analysisElapsed}ms")
+                    }
+
+                    for (diagnostic in diagnostics) {
+                        val diagObj = JsonObject()
+                        diagObj.addProperty("severity", diagnostic.severity.name)
+                        diagObj.addProperty("message", diagnostic.defaultMessage)
+                        diagObj.addProperty("code", diagnostic.factoryName)
+
+                        val textRange = diagnostic.textRanges.firstOrNull()
+                        if (textRange != null) {
+                            try {
+                                val document = effectiveKtFile.viewProvider.document
+                                if (document != null) {
+                                    val startLine = document.getLineNumber(textRange.startOffset) + 1
+                                    val startLineOffset = document.getLineStartOffset(
+                                        document.getLineNumber(textRange.startOffset)
+                                    )
+                                    val startCol = textRange.startOffset - startLineOffset
+
+                                    val endLine = document.getLineNumber(textRange.endOffset) + 1
+                                    val endLineOffset = document.getLineStartOffset(
+                                        document.getLineNumber(textRange.endOffset)
+                                    )
+                                    val endCol = textRange.endOffset - endLineOffset
+
+                                    diagObj.addProperty("line", startLine)
+                                    diagObj.addProperty("column", startCol)
+                                    diagObj.addProperty("endLine", endLine)
+                                    diagObj.addProperty("endColumn", endCol)
+                                }
+                            } catch (_: Exception) {
+                                // Position extraction failed, skip position info
+                            }
+                        }
+
+                        diagnosticsArray.add(diagObj)
+
+                        when (diagnostic.severity.name) {
+                            "ERROR" -> errorCount++
+                            "WARNING" -> warningCount++
+                        }
+                    }
+                }
+            } catch (e: Throwable) {
+                System.err.println("CompilerBridge: analyzeAll() — error analyzing $filePath: ${e.javaClass.name}: ${e.message}")
+            }
+
+            fileObj.add("diagnostics", diagnosticsArray)
+            filesArray.add(fileObj)
+            analyzedCount++
+        }
+
+        System.err.println("CompilerBridge: analyzeAll() — analyzed $analyzedCount files, $errorCount errors, $warningCount warnings")
+
+        result.add("files", filesArray)
+        result.addProperty("totalFiles", analyzedCount)
+        result.addProperty("totalErrors", errorCount)
+        result.addProperty("totalWarnings", warningCount)
+        return result
+    }
+
+    /**
      * Provides hover information at the given position.
      * Returns type/signature information with KDoc documentation when available.
      */
@@ -374,8 +496,16 @@ class CompilerBridge {
 
         try {
             analyze(ktFile) {
-                val offset = lineColToOffset(ktFile, line, character) ?: return@analyze
-                val element = ktFile.findElementAt(offset) ?: return@analyze
+                val offset = lineColToOffset(ktFile, line, character)
+                if (offset == null) {
+                    System.err.println("CompilerBridge: hover — lineColToOffset=null (line=$line, char=$character, fileLines=${ktFile.text.lines().size})")
+                    return@analyze
+                }
+                val element = ktFile.findElementAt(offset)
+                if (element == null) {
+                    System.err.println("CompilerBridge: hover — findElementAt=null (offset=$offset, textLen=${ktFile.text.length})")
+                    return@analyze
+                }
 
                 // Walk up to find the nearest meaningful element
                 var current: PsiElement? = element
@@ -2210,7 +2340,9 @@ class CompilerBridge {
                     append("\n")
                 }
                 append(cleanRendered)
-                if (supertypesLine != null) {
+                // Only add supertypes line if the rendered declaration doesn't already contain them
+                val declarationLine = cleanRendered.lines().lastOrNull { it.isNotBlank() } ?: ""
+                if (supertypesLine != null && !declarationLine.contains(":")) {
                     append("\n")
                     append(supertypesLine)
                 }
@@ -2250,7 +2382,14 @@ class CompilerBridge {
         // Try to resolve via references
         for (ref in refExpr.references) {
             if (ref is KtReference) {
-                val symbol = ref.resolveToSymbol()
+                var symbol = ref.resolveToSymbol()
+                // For constructor calls, show the containing class instead of the constructor
+                if (symbol is KaConstructorSymbol) {
+                    val containingClass = symbol.containingDeclaration
+                    if (containingClass is KaDeclarationSymbol) {
+                        symbol = containingClass
+                    }
+                }
                 if (symbol is KaDeclarationSymbol) {
                     val rendered = try {
                         symbol.render(KaDeclarationRendererForSource.WITH_SHORT_NAMES)
@@ -2287,7 +2426,9 @@ class CompilerBridge {
                             append("\n")
                         }
                         append(cleanRendered)
-                        if (supertypesLine != null) {
+                        // Only add supertypes line if the rendered declaration doesn't already contain them
+                        val refDeclLine = cleanRendered.lines().lastOrNull { it.isNotBlank() } ?: ""
+                        if (supertypesLine != null && !refDeclLine.contains(":")) {
                             append("\n")
                             append(supertypesLine)
                         }
@@ -2381,7 +2522,9 @@ class CompilerBridge {
                     append("\n")
                 }
                 append(cleanRendered)
-                if (supertypesLine != null) {
+                // Only add supertypes line if the rendered declaration doesn't already contain them
+                val annotDeclLine = cleanRendered.lines().lastOrNull { it.isNotBlank() } ?: ""
+                if (supertypesLine != null && !annotDeclLine.contains(":")) {
                     append("\n")
                     append(supertypesLine)
                 }
@@ -2452,6 +2595,16 @@ class CompilerBridge {
                 if (containerFqName != null) {
                     return "*(${containingSymbol.name.asString()} in ${containerFqName.substringBeforeLast('.', "")})*"
                 }
+                // Fallback for library symbols: use classId to get package
+                if (containingSymbol is KaClassLikeSymbol) {
+                    val classId = (containingSymbol as KaClassLikeSymbol).classId
+                    if (classId != null) {
+                        val pkg = classId.packageFqName.asString()
+                        if (pkg.isNotEmpty()) {
+                            return "*(${containingSymbol.name.asString()} in $pkg)*"
+                        }
+                    }
+                }
                 return "*(in ${containingSymbol.name.asString()})*"
             }
 
@@ -2487,29 +2640,33 @@ class CompilerBridge {
             val annotations = symbol.annotations
             if (annotations.isEmpty()) return null
 
+            // Blocklist of noisy/internal annotations to suppress
+            val suppressedPackages = setOf(
+                "kotlin.jvm.internal",
+            )
+            val suppressedNames = setOf(
+                "SinceKotlin", "WasExperimental",
+            )
+
             val relevantAnnotations = annotations.mapNotNull { annotation ->
-                val shortName = annotation.classId?.shortClassName?.asString() ?: return@mapNotNull null
-                // Show useful meta-annotations and framework composition annotations
-                when (shortName) {
-                    "Target", "Retention", "Documented", "Repeatable",
-                    "MustBeDocumented", "Inherited",
-                    "Component", "Service", "Repository", "Controller",
-                    "RestController", "Configuration", "Bean", "Qualifier",
-                    "Deprecated", "JvmStatic", "JvmOverloads", "JvmField",
-                    "Suppress", "Serializable" -> {
-                        val args = annotation.arguments.mapNotNull { arg ->
-                            val name = arg.name?.asString()
-                            val value = try {
-                                renderAnnotationArgValue(arg.expression)
-                            } catch (_: Exception) { null }
-                            if (name != null && value != null) "$name = $value"
-                            else value ?: name
-                        }
-                        if (args.isNotEmpty()) "@$shortName(${args.joinToString(", ")})"
-                        else "@$shortName"
-                    }
-                    else -> null
+                val classId = annotation.classId ?: return@mapNotNull null
+                val shortName = classId.shortClassName.asString()
+                val packageName = classId.packageFqName.asString()
+
+                // Skip internal/noise annotations
+                if (packageName in suppressedPackages) return@mapNotNull null
+                if (shortName in suppressedNames) return@mapNotNull null
+
+                val args = annotation.arguments.mapNotNull { arg ->
+                    val name = arg.name?.asString()
+                    val value = try {
+                        renderAnnotationArgValue(arg.expression)
+                    } catch (_: Exception) { null }
+                    if (name != null && value != null) "$name = $value"
+                    else value ?: name
                 }
+                if (args.isNotEmpty()) "@$shortName(${args.joinToString(", ")})"
+                else "@$shortName"
             }
 
             if (relevantAnnotations.isEmpty()) return null
@@ -3716,7 +3873,10 @@ class CompilerBridge {
     private fun lineColToOffset(ktFile: KtFile, line: Int, character: Int): Int? {
         val document = ktFile.viewProvider.document
         if (document != null) {
-            if (line < 1 || line > document.lineCount) return null
+            if (line < 1 || line > document.lineCount) {
+                System.err.println("CompilerBridge: lineColToOffset — line $line out of range (1..${document.lineCount}), doc path")
+                return null
+            }
             val lineStartOffset = document.getLineStartOffset(line - 1)
             return lineStartOffset + character
         }
@@ -3729,7 +3889,10 @@ class CompilerBridge {
             if (text[offset] == '\n') currentLine++
             offset++
         }
-        if (currentLine != line) return null
+        if (currentLine != line) {
+            System.err.println("CompilerBridge: lineColToOffset — fallback: line $line not found (reached line $currentLine at offset $offset, textLen=${text.length})")
+            return null
+        }
         return offset + character
     }
 

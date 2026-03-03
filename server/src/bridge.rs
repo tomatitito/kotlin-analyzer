@@ -193,6 +193,7 @@ impl Bridge {
         &self,
         project_root: Option<&str>,
         classpath: &[String],
+        compiler_flags: &[String],
         source_roots: &[String],
     ) -> Result<(), Error> {
         {
@@ -318,7 +319,7 @@ impl Bridge {
         let init_params = serde_json::json!({
             "projectRoot": project_root.unwrap_or(""),
             "classpath": classpath,
-            "compilerFlags": config.compiler_flags,
+            "compilerFlags": compiler_flags,
             "jdkHome": config.java_home.unwrap_or_default(),
             "sourceRoots": source_roots,
         });
@@ -437,10 +438,15 @@ impl Bridge {
     /// If the sidecar is still starting, waits up to 30 seconds for it to
     /// become Ready before sending the request.
     pub async fn request(&self, method: &str, params: Option<Value>) -> Result<Value, Error> {
-        // Wait for sidecar to be ready (buffers during startup)
+        self.request_with_timeout(method, params, Duration::from_secs(60)).await
+    }
+
+    /// Sends a JSON-RPC request with a custom response timeout.
+    /// Used for long-running operations like project-wide analysis.
+    pub async fn request_with_timeout(&self, method: &str, params: Option<Value>, timeout: Duration) -> Result<Value, Error> {
         self.wait_for_ready(Duration::from_secs(30)).await?;
 
-        tracing::debug!("Sending request '{}' to sidecar", method);
+        tracing::debug!("Sending request '{}' to sidecar (timeout: {:?})", method, timeout);
 
         let id = self.next_id();
         let request = Request::new(id, method, params);
@@ -458,10 +464,10 @@ impl Bridge {
             .await
             .map_err(|_| BridgeError::Crashed("request channel closed".into()))?;
 
-        match time::timeout(Duration::from_secs(60), response_rx).await {
+        match time::timeout(timeout, response_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(BridgeError::Crashed("response channel dropped".into()).into()),
-            Err(_) => Err(BridgeError::Timeout(60000).into()),
+            Err(_) => Err(BridgeError::Timeout(timeout.as_millis() as u64).into()),
         }
     }
 

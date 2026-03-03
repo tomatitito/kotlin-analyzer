@@ -43,6 +43,13 @@ impl KotlinLanguageServer {
     async fn analyze_document(&self, uri: &Url) {
         tracing::debug!("analyze_document: {}", uri);
 
+        // Skip .kts build scripts — they produce hundreds of false positives
+        // because Gradle DSL scripts need a runtime environment the sidecar doesn't replicate.
+        if is_gradle_script(uri) {
+            tracing::debug!("analyze_document: skipping build script {}", uri);
+            return;
+        }
+
         let bridge = self.bridge.lock().await;
         let bridge = match bridge.as_ref() {
             Some(b) => b,
@@ -183,6 +190,10 @@ impl KotlinLanguageServer {
                     }
                     _ = tokio::time::sleep(debounce_duration), if pending.is_some() => {
                         if let Some(uri) = pending.take() {
+                            // Skip Gradle build scripts
+                            if is_gradle_script(&uri) {
+                                continue;
+                            }
                             let bridge = bridge.lock().await;
                             if let Some(bridge) = bridge.as_ref() {
                                 if bridge.state().await == SidecarState::Ready {
@@ -219,6 +230,19 @@ impl KotlinLanguageServer {
         });
 
         tx
+    }
+}
+
+/// Returns true if the URI points to a Gradle build script (.gradle.kts in any
+/// location, or .kts files inside buildSrc/ or gradle/ directories).
+fn is_gradle_script(uri: &Url) -> bool {
+    if let Ok(path) = uri.to_file_path() {
+        let path_str = path.to_string_lossy();
+        path_str.ends_with(".gradle.kts")
+            || (path_str.ends_with(".kts")
+                && (path_str.contains("/buildSrc/") || path_str.contains("/gradle/")))
+    } else {
+        false
     }
 }
 
@@ -622,17 +646,18 @@ impl LanguageServer for KotlinLanguageServer {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            let (classpath, source_roots) = match &project_model {
+            let (classpath, compiler_flags, source_roots) = match &project_model {
                 Some(model) => {
                     let cp: Vec<String> = model.classpath.iter()
                         .map(|p| p.to_string_lossy().to_string())
                         .collect();
+                    let cf: Vec<String> = model.compiler_flags.clone();
                     let sr: Vec<String> = model.source_roots.iter()
                         .map(|p| p.to_string_lossy().to_string())
                         .collect();
-                    (cp, sr)
+                    (cp, cf, sr)
                 }
-                None => (Vec::new(), Vec::new()),
+                None => (Vec::new(), Vec::new(), Vec::new()),
             };
 
             // Note: when no source roots are found (no build system), the sidecar
@@ -655,6 +680,7 @@ impl LanguageServer for KotlinLanguageServer {
                 bridge.start(
                     Some(project_root_str.as_str()),
                     &classpath,
+                    &compiler_flags,
                     &source_roots,
                 ).await
             };
@@ -725,6 +751,170 @@ impl LanguageServer for KotlinLanguageServer {
                         }
                     }
                     drop(bridge_ref);
+
+                    // --- Project-wide background analysis ---
+                    let bg_bridge = Arc::clone(&bridge_holder);
+                    let bg_documents = Arc::clone(&documents_holder);
+                    let bg_client = client.clone();
+                    tokio::spawn(async move {
+                        // Small delay to let open-file diagnostics settle
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+
+                        // Create progress token for background analysis
+                        let bg_token = NumberOrString::String("kotlin-analyzer-background".to_string());
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            bg_client.send_request::<lsp_types::request::WorkDoneProgressCreate>(
+                                WorkDoneProgressCreateParams {
+                                    token: bg_token.clone(),
+                                },
+                            ),
+                        ).await;
+
+                        bg_client
+                            .send_notification::<lsp_types::notification::Progress>(ProgressParams {
+                                token: bg_token.clone(),
+                                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                                    WorkDoneProgressBegin {
+                                        title: "Analyzing project".to_string(),
+                                        message: Some("Running diagnostics on all source files...".to_string()),
+                                        percentage: Some(0),
+                                        cancellable: Some(false),
+                                    },
+                                )),
+                            })
+                            .await;
+
+                        // Call analyzeAll with a generous timeout (5 minutes)
+                        let analyze_result = {
+                            let bridge = bg_bridge.lock().await;
+                            match bridge.as_ref() {
+                                Some(b) => {
+                                    if b.state().await != SidecarState::Ready {
+                                        tracing::warn!("background analysis: sidecar not ready, skipping");
+                                        None
+                                    } else {
+                                        Some(b.request_with_timeout(
+                                            "analyzeAll",
+                                            None,
+                                            Duration::from_secs(300),
+                                        ).await)
+                                    }
+                                }
+                                None => None,
+                            }
+                        };
+
+                        match analyze_result {
+                            Some(Ok(result)) => {
+                                let files = result.get("files").and_then(|f| f.as_array());
+                                let total_files = result.get("totalFiles").and_then(|t| t.as_u64()).unwrap_or(0);
+                                let total_errors = result.get("totalErrors").and_then(|e| e.as_u64()).unwrap_or(0);
+                                let total_warnings = result.get("totalWarnings").and_then(|w| w.as_u64()).unwrap_or(0);
+
+                                if let Some(files) = files {
+                                    let mut processed = 0u64;
+                                    let mut _published = 0u64;
+                                    for file_entry in files {
+                                        processed += 1;
+
+                                        let uri_str = match file_entry.get("uri").and_then(|u| u.as_str()) {
+                                            Some(u) => u,
+                                            None => continue,
+                                        };
+
+                                        let uri = match Url::parse(uri_str) {
+                                            Ok(u) => u,
+                                            Err(e) => {
+                                                tracing::warn!("background analysis: invalid URI from sidecar: {:?} ({})", uri_str, e);
+                                                continue;
+                                            }
+                                        };
+
+                                        // Skip files that are currently open — their diagnostics
+                                        // from the replay loop are fresher
+                                        {
+                                            let docs = bg_documents.lock().await;
+                                            if docs.get(&uri).is_some() {
+                                                continue;
+                                            }
+                                        }
+
+                                        let diagnostics = parse_diagnostics_static(file_entry);
+
+                                        // Only publish and cache files with actual diagnostics
+                                        if !diagnostics.is_empty() {
+                                            {
+                                                let mut docs = bg_documents.lock().await;
+                                                docs.set_diagnostics(uri.clone(), diagnostics.clone());
+                                            }
+                                            bg_client.publish_diagnostics(uri, diagnostics, None).await;
+                                            _published += 1;
+                                        }
+
+                                        // Report progress periodically
+                                        if total_files > 0 && processed % 10 == 0 {
+                                            let pct = ((processed as f64 / total_files as f64) * 100.0) as u32;
+                                            bg_client
+                                                .send_notification::<lsp_types::notification::Progress>(ProgressParams {
+                                                    token: bg_token.clone(),
+                                                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                                                        WorkDoneProgressReport {
+                                                            message: Some(format!("Processed {}/{} files", processed, total_files)),
+                                                            percentage: Some(pct),
+                                                            cancellable: Some(false),
+                                                        },
+                                                    )),
+                                                })
+                                                .await;
+                                        }
+                                    }
+
+                                    let summary = format!(
+                                        "Complete — {} error(s), {} warning(s) in {} file(s)",
+                                        total_errors, total_warnings, total_files
+                                    );
+                                    tracing::info!("background analysis: {}", summary);
+
+                                    bg_client
+                                        .send_notification::<lsp_types::notification::Progress>(ProgressParams {
+                                            token: bg_token.clone(),
+                                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                                WorkDoneProgressEnd {
+                                                    message: Some(summary),
+                                                },
+                                            )),
+                                        })
+                                        .await;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("background analysis failed: {}", e);
+                                bg_client
+                                    .send_notification::<lsp_types::notification::Progress>(ProgressParams {
+                                        token: bg_token.clone(),
+                                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                            WorkDoneProgressEnd {
+                                                message: Some(format!("Failed: {}", e)),
+                                            },
+                                        )),
+                                    })
+                                    .await;
+                            }
+                            None => {
+                                bg_client
+                                    .send_notification::<lsp_types::notification::Progress>(ProgressParams {
+                                        token: bg_token.clone(),
+                                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                            WorkDoneProgressEnd {
+                                                message: Some("Skipped — sidecar not ready".to_string()),
+                                            },
+                                        )),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
                 }
                 Err(e) => {
                     tracing::error!("failed to start sidecar: {:?}", e);

@@ -52,6 +52,7 @@ class AnalysisServer(
             "textDocument/didChange" -> handleDidChange(request)
             "textDocument/didClose" -> handleDidClose(request)
             "analyze" -> handleAnalyze(request)
+            "analyzeAll" -> handleAnalyzeAll(request)
             "hover" -> handleHover(request)
             "completion" -> handleCompletion(request)
             "definition" -> handleDefinition(request)
@@ -145,6 +146,11 @@ class AnalysisServer(
         }
 
         val result = bridge.analyze(uri)
+        transport.sendResult(request.id, result)
+    }
+
+    private fun handleAnalyzeAll(request: JsonRpcRequest) {
+        val result = bridge.analyzeAll()
         transport.sendResult(request.id, result)
     }
 
