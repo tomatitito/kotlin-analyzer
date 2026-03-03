@@ -526,7 +526,7 @@ impl LanguageServer for KotlinLanguageServer {
             // Resolve project model first so we can pass it to the sidecar
             let project_model = if let Some(ref root) = project_root {
                 tracing::debug!("resolving project model for {:?}", root);
-                match project::resolve_project(root, &config) {
+                match project::resolve_project_with_fallback(root, &config) {
                     Ok(model) => {
                         tracing::debug!(
                             "project resolved: {} source roots, {} classpath entries, {} compiler flags",
@@ -534,12 +534,6 @@ impl LanguageServer for KotlinLanguageServer {
                             model.classpath.len(),
                             model.compiler_flags.len()
                         );
-
-                        // Cache the project model
-                        let cache_dir = root.join(".kotlin-analyzer");
-                        if let Err(e) = project::save_cache(&model, &cache_dir) {
-                            tracing::warn!("failed to cache project model: {}", e);
-                        }
 
                         Some(model)
                     }
@@ -653,6 +647,7 @@ impl LanguageServer for KotlinLanguageServer {
                         .collect();
                     let cf: Vec<String> = model.compiler_flags.clone();
                     let sr: Vec<String> = model.source_roots.iter()
+                        .chain(model.generated_source_roots.iter())
                         .map(|p| p.to_string_lossy().to_string())
                         .collect();
                     (cp, cf, sr)
@@ -1376,13 +1371,9 @@ impl LanguageServer for KotlinLanguageServer {
                     let client = self.client.clone();
 
                     tokio::spawn(async move {
-                        match project::resolve_project(&root, &config) {
-                            Ok(model) => {
+                        match project::resolve_project_with_fallback(&root, &config) {
+                            Ok(_model) => {
                                 tracing::debug!("project re-resolved after build file change");
-                                let cache_dir = root.join(".kotlin-analyzer");
-                                if let Err(e) = project::save_cache(&model, &cache_dir) {
-                                    tracing::warn!("failed to cache project model: {}", e);
-                                }
                             }
                             Err(e) => {
                                 tracing::warn!("project re-resolution failed: {}", e);

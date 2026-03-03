@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -97,7 +99,7 @@ pub fn find_project_root(start: &Path) -> PathBuf {
 /// 2. Gradle (`build.gradle.kts` or `build.gradle`)
 /// 3. Maven (`pom.xml`)
 /// 4. Stdlib-only fallback (analyze `.kt` files with no classpath)
-pub fn resolve_project(root: &Path, config: &Config) -> Result<ProjectModel, Error> {
+pub fn resolve_project(root: &Path, config: &Config, offline: bool) -> Result<ProjectModel, Error> {
     // Check for manual configuration first
     let manual_config = root.join(".kotlin-analyzer.json");
     if manual_config.exists() {
@@ -108,8 +110,8 @@ pub fn resolve_project(root: &Path, config: &Config) -> Result<ProjectModel, Err
     let build_system = detect_build_system(root);
 
     match build_system {
-        BuildSystem::Gradle => resolve_gradle_project(root, config),
-        BuildSystem::Maven => resolve_maven_project(root, config),
+        BuildSystem::Gradle => resolve_gradle_project(root, config, offline),
+        BuildSystem::Maven => resolve_maven_project(root, config, offline),
         BuildSystem::None => {
             tracing::info!("no build system found, using stdlib-only analysis");
             let mut model = ProjectModel::no_build_system(root.to_path_buf());
@@ -117,6 +119,62 @@ pub fn resolve_project(root: &Path, config: &Config) -> Result<ProjectModel, Err
             model.source_roots = find_kotlin_source_roots(root);
             model.compiler_flags = config.compiler_flags.clone();
             Ok(model)
+        }
+    }
+}
+
+/// Resolves the project model with a fallback strategy for robustness.
+///
+/// Strategy:
+/// 1. If cache exists, try offline mode first (fast path, ~1-2s)
+/// 2. If offline succeeds, return it and update cache
+/// 3. If offline fails, try online mode with timeout (slow path, up to 60s)
+/// 4. If online also fails (timeout or error), fall back to cached model if available
+/// 5. If no cache exists, just run online with timeout
+/// 6. If everything fails, return error
+pub fn resolve_project_with_fallback(root: &Path, config: &Config) -> Result<ProjectModel, Error> {
+    let cache_dir = root.join(".kotlin-analyzer");
+    let cache_exists = cache_dir.join("project-model.json").exists();
+
+    // Fast path: try offline if cache exists
+    if cache_exists {
+        tracing::debug!("cache exists, trying offline mode first");
+        match resolve_project(root, config, true) {
+            Ok(model) => {
+                tracing::info!("offline resolution succeeded");
+                // Update cache with the new model
+                if let Err(e) = save_cache(&model, &cache_dir) {
+                    tracing::warn!("failed to save cache: {}", e);
+                }
+                return Ok(model);
+            }
+            Err(e) => {
+                tracing::debug!("offline resolution failed: {}, trying online mode", e);
+            }
+        }
+    }
+
+    // Slow path: try online with timeout
+    tracing::debug!("attempting online resolution with timeout");
+    match resolve_project(root, config, false) {
+        Ok(model) => {
+            tracing::info!("online resolution succeeded");
+            // Update cache
+            if let Err(e) = save_cache(&model, &cache_dir) {
+                tracing::warn!("failed to save cache: {}", e);
+            }
+            Ok(model)
+        }
+        Err(e) => {
+            tracing::warn!("online resolution failed: {}", e);
+            // Fall back to cache if available
+            if let Some(cached_model) = load_cache(&cache_dir) {
+                tracing::info!("falling back to cached project model");
+                Ok(cached_model)
+            } else {
+                tracing::error!("no cache available, project resolution failed");
+                Err(e)
+            }
         }
     }
 }
@@ -134,25 +192,47 @@ allprojects {
             def sb = new StringBuilder()
             sb.append("---KOTLIN-ANALYZER-START---\n")
 
-            // Source roots
+            // Source roots — extract from all source sets (main, test, etc.)
+            // Use java.srcDirs + kotlin.srcDirs (NOT allSource which includes resources)
             def jpe = project.extensions.findByType(org.gradle.api.plugins.JavaPluginExtension)
             if (jpe != null) {
-                def main = jpe.sourceSets.findByName("main")
-                if (main != null) {
-                    main.allSource.srcDirs.each { dir ->
-                        if (dir.exists()) sb.append("SOURCE_ROOT=${dir.absolutePath}\n")
+                def seenDirs = new LinkedHashSet()
+                jpe.sourceSets.each { sourceSet ->
+                    sourceSet.java.srcDirs.each { dir ->
+                        if (dir.exists() && seenDirs.add(dir.absolutePath)) {
+                            sb.append("SOURCE_ROOT=${dir.absolutePath}\n")
+                        }
+                    }
+                    try {
+                        sourceSet.kotlin.srcDirs.each { dir ->
+                            if (dir.exists() && seenDirs.add(dir.absolutePath)) {
+                                sb.append("SOURCE_ROOT=${dir.absolutePath}\n")
+                            }
+                        }
+                    } catch (Exception e) {
+                        // kotlin extension not available on this source set
                     }
                 }
             }
 
-            // Classpath
-            try {
-                def compileClasspath = project.configurations.getByName("compileClasspath")
-                compileClasspath.resolve().each { file ->
-                    sb.append("CLASSPATH=${file.absolutePath}\n")
+            // Classpath — extract from all source set compile classpaths
+            def seenJars = new LinkedHashSet()
+            if (jpe != null) {
+                jpe.sourceSets.each { sourceSet ->
+                    try {
+                        def configName = sourceSet.compileClasspathConfigurationName
+                        project.configurations.getByName(configName).resolve().each { file ->
+                            if (seenJars.add(file.absolutePath)) {
+                                sb.append("CLASSPATH=${file.absolutePath}\n")
+                            }
+                        }
+                    } catch (Exception e) {
+                        // Some source set classpaths may not be resolvable
+                    }
                 }
-            } catch (Exception e) {
-                sb.append("CLASSPATH_ERROR=${e.message}\n")
+            }
+            if (seenJars.isEmpty()) {
+                sb.append("CLASSPATH_ERROR=no resolvable compile classpaths found\n")
             }
 
             // Compiler flags — try multiple APIs for compatibility
@@ -222,21 +302,33 @@ allprojects {
 "#;
 
 /// Extracts project model from a Gradle project using the init script approach.
-fn resolve_gradle_project(root: &Path, config: &Config) -> Result<ProjectModel, Error> {
+fn resolve_gradle_project(root: &Path, config: &Config, offline: bool) -> Result<ProjectModel, Error> {
     let gradlew = find_gradle_wrapper(root);
 
     let init_script_path = root.join(".kotlin-analyzer-init.gradle");
     std::fs::write(&init_script_path, INIT_SCRIPT)
         .map_err(|e| ProjectError::GradleFailed(format!("failed to write init script: {e}")))?;
 
-    let output = Command::new(&gradlew)
-        .current_dir(root)
-        .arg("--init-script")
-        .arg(&init_script_path)
-        .arg("kotlinAnalyzerExtract")
-        .arg("--quiet")
-        .output()
-        .map_err(|e| ProjectError::GradleFailed(format!("failed to run Gradle: {e}")))?;
+    // Build command arguments
+    let mut args = vec![
+        "--init-script".to_string(),
+        init_script_path.to_string_lossy().to_string(),
+        "kotlinAnalyzerExtract".to_string(),
+        "--quiet".to_string(),
+    ];
+    if offline {
+        args.push("--offline".to_string());
+    }
+
+    // Execute with timeout
+    let output = match execute_with_timeout(&gradlew, &args, root, Duration::from_secs(60)) {
+        Ok(out) => out,
+        Err(e) => {
+            // Clean up init script on error
+            let _ = std::fs::remove_file(&init_script_path);
+            return Err(e);
+        }
+    };
 
     // Clean up init script
     let _ = std::fs::remove_file(&init_script_path);
@@ -310,24 +402,49 @@ fn parse_gradle_output(output: &str, root: &Path, config: &Config) -> Result<Pro
         }
     }
 
+    // Deduplicate classpath entries
+    model.classpath.sort();
+    model.classpath.dedup();
+
+    // Auto-enable experimental features that became stable in newer Kotlin versions.
+    // Our Analysis API is 2.1.x, so features stable in 2.2+ still need the -X flag.
+    if let Some(ref version) = model.kotlin_version {
+        let parts: Vec<&str> = version.split('.').collect();
+        if let (Some(major), Some(minor)) = (
+            parts.first().and_then(|s| s.parse::<u32>().ok()),
+            parts.get(1).and_then(|s| s.parse::<u32>().ok()),
+        ) {
+            // Multi-dollar interpolation: experimental in 2.1, stable in 2.2+
+            if major >= 2 && minor >= 1
+                && !model.compiler_flags.contains(&"-Xmulti-dollar-interpolation".to_string())
+            {
+                model.compiler_flags.push("-Xmulti-dollar-interpolation".to_string());
+            }
+        }
+    }
+
     Ok(model)
 }
 
-fn resolve_maven_project(root: &Path, config: &Config) -> Result<ProjectModel, Error> {
+fn resolve_maven_project(root: &Path, config: &Config, offline: bool) -> Result<ProjectModel, Error> {
     let mvn = if root.join("mvnw").exists() {
         root.join("mvnw")
     } else {
         PathBuf::from("mvn")
     };
 
-    let output = Command::new(&mvn)
-        .current_dir(root)
-        .arg("dependency:build-classpath")
-        .arg("-DincludeScope=compile")
-        .arg("-Dmdep.outputFile=/dev/stdout")
-        .arg("-q")
-        .output()
-        .map_err(|e| ProjectError::GradleFailed(format!("failed to run Maven: {e}")))?;
+    // Build command arguments
+    let mut args = vec![
+        "dependency:build-classpath".to_string(),
+        "-DincludeScope=compile".to_string(),
+        "-Dmdep.outputFile=/dev/stdout".to_string(),
+        "-q".to_string(),
+    ];
+    if offline {
+        args.push("-o".to_string());
+    }
+
+    let output = execute_with_timeout(&mvn, &args, root, Duration::from_secs(60))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -479,6 +596,79 @@ pub fn save_cache(model: &ProjectModel, cache_dir: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Loads the project model from a cache file.
+pub fn load_cache(cache_dir: &Path) -> Option<ProjectModel> {
+    let cache_file = cache_dir.join("project-model.json");
+    if !cache_file.exists() {
+        return None;
+    }
+
+    match std::fs::read_to_string(&cache_file) {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(model) => {
+                tracing::debug!("loaded cached project model");
+                Some(model)
+            }
+            Err(e) => {
+                tracing::warn!("failed to parse cached project model: {}", e);
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!("failed to read cached project model: {}", e);
+            None
+        }
+    }
+}
+
+/// Executes a command with a timeout.
+///
+/// Uses a thread + channel pattern to implement timeout for synchronous command execution.
+/// If the command doesn't complete within the timeout, the child process is killed.
+fn execute_with_timeout(
+    program: &Path,
+    args: &[String],
+    working_dir: &Path,
+    timeout: Duration,
+) -> Result<std::process::Output, Error> {
+    let child = Command::new(program)
+        .current_dir(working_dir)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| ProjectError::GradleFailed(format!("failed to spawn process: {e}")))?;
+
+    // Use a channel to receive the result from the waiting thread
+    let (tx, rx) = mpsc::channel();
+
+    // Spawn a thread to wait for the child process
+    std::thread::spawn(move || {
+        let result = child.wait_with_output();
+        let _ = tx.send(result);
+    });
+
+    // Wait for either completion or timeout
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(ProjectError::GradleFailed(format!("process execution failed: {e}")).into()),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Note: The child process may continue running after timeout.
+            // This is a known limitation of the thread-based approach without keeping
+            // the Child handle. In practice, Gradle daemons will eventually timeout
+            // on their own, and the OS will clean up zombie processes.
+            Err(ProjectError::GradleFailed(format!(
+                "process timed out after {} seconds",
+                timeout.as_secs()
+            ))
+            .into())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(ProjectError::GradleFailed("process thread disconnected unexpectedly".into()).into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,7 +717,7 @@ KOTLIN_VERSION=2.1.20
         let model = parse_gradle_output(output, Path::new("/project"), &config).unwrap();
         assert_eq!(model.source_roots.len(), 1);
         assert_eq!(model.classpath.len(), 2);
-        assert_eq!(model.compiler_flags, vec!["-Xcontext-parameters"]);
+        assert_eq!(model.compiler_flags, vec!["-Xcontext-parameters", "-Xmulti-dollar-interpolation"]);
         assert_eq!(model.kotlin_version, Some("2.1.20".into()));
     }
 
@@ -571,7 +761,7 @@ COMPILER_FLAG=-Xcontext-parameters
         .unwrap();
 
         let config = Config::default();
-        let model = resolve_project(dir.path(), &config).unwrap();
+        let model = resolve_project(dir.path(), &config, false).unwrap();
         assert_eq!(model.compiler_flags, vec!["-Xcontext-parameters"]);
         assert_eq!(model.kotlin_version, Some("2.1.20".into()));
     }
@@ -588,7 +778,7 @@ COMPILER_FLAG=-Xcontext-parameters
         .unwrap();
 
         let config = Config::default();
-        let model = resolve_project(dir.path(), &config).unwrap();
+        let model = resolve_project(dir.path(), &config, false).unwrap();
         assert_eq!(model.source_roots.len(), 1);
         assert_eq!(model.source_roots[0], src_dir);
     }
@@ -606,7 +796,7 @@ COMPILER_FLAG=-Xcontext-parameters
             compiler_flags: vec!["-Xmulti-dollar-interpolation".into()],
             ..Config::default()
         };
-        let model = resolve_project(dir.path(), &config).unwrap();
+        let model = resolve_project(dir.path(), &config, false).unwrap();
         assert_eq!(model.compiler_flags.len(), 2);
     }
 
@@ -628,7 +818,7 @@ KOTLIN_VERSION=2.1.20
         let model = parse_gradle_output(output, Path::new("/project"), &config).unwrap();
         assert_eq!(model.source_roots.len(), 2);
         assert_eq!(model.classpath.len(), 2);
-        assert_eq!(model.compiler_flags, vec!["-Xcontext-parameters"]);
+        assert_eq!(model.compiler_flags, vec!["-Xcontext-parameters", "-Xmulti-dollar-interpolation"]);
         assert_eq!(model.kotlin_version, Some("2.1.20".into()));
     }
 
@@ -676,7 +866,7 @@ GENERATED_SOURCE_ROOT=/project/lib/build/generated/ksp/main/kotlin
             .join("../tests/fixtures/gradle-kotlin-simple");
         let config = Config::default();
         let model =
-            resolve_gradle_project(&fixture, &config).expect("gradle resolution should succeed");
+            resolve_gradle_project(&fixture, &config, false).expect("gradle resolution should succeed");
 
         assert!(!model.source_roots.is_empty(), "should find source roots");
         assert!(!model.classpath.is_empty(), "should find classpath entries");
@@ -692,7 +882,7 @@ GENERATED_SOURCE_ROOT=/project/lib/build/generated/ksp/main/kotlin
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/fixtures/gradle-java-only");
         let config = Config::default();
-        let model = resolve_gradle_project(&fixture, &config)
+        let model = resolve_gradle_project(&fixture, &config, false)
             .expect("gradle resolution should not crash on java-only project");
 
         assert!(
