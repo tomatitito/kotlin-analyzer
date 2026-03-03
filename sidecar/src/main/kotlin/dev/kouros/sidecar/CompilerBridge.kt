@@ -34,6 +34,7 @@ import org.jetbrains.kotlin.platform.jvm.JvmPlatforms
 import org.jetbrains.kotlin.psi.*
 import org.jetbrains.kotlin.types.Variance
 import java.io.File
+import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 
@@ -49,6 +50,21 @@ class CompilerBridge {
     private val virtualFiles = mutableMapOf<String, String>() // uri -> content
     private val symbolIndex = SymbolIndex()
 
+    // Temp directory for virtual files so FIR can discover them as source root files
+    private var virtualFileTempDir: Path? = null
+    // URIs of virtual files written to the temp dir during the current session generation
+    private val virtualFilesOnDisk = mutableSetOf<String>()
+    // Maps virtual file URI to its path on disk in the temp dir
+    private val virtualFileDiskPaths = mutableMapOf<String, String>()
+    // When true, the session must be rebuilt before next analysis (new virtual files appeared)
+    private var sessionDirty = false
+    // Stored init params for session rebuilds
+    private var initProjectRoot = ""
+    private var initClasspath = emptyList<String>()
+    private var initCompilerFlags = emptyList<String>()
+    private var initJdkHome = ""
+    private var initSourceRoots = emptyList<String>()
+
     /**
      * Initializes the Analysis API session with the given project configuration.
      */
@@ -61,6 +77,28 @@ class CompilerBridge {
     ) {
         System.err.println("CompilerBridge: initializing session")
         val startTime = System.currentTimeMillis()
+
+        // Store init params for session rebuilds
+        initProjectRoot = projectRoot
+        initClasspath = classpath
+        initCompilerFlags = compilerFlags
+        initJdkHome = jdkHome
+        initSourceRoots = sourceRoots
+
+        // Create temp directory for virtual files
+        if (virtualFileTempDir == null) {
+            virtualFileTempDir = Files.createTempDirectory("kotlin-analyzer-virtual")
+            System.err.println("CompilerBridge: created virtual file temp dir: $virtualFileTempDir")
+        }
+
+        // Write any existing virtual files to temp dir before session init
+        for ((uri, text) in virtualFiles) {
+            writeVirtualFileToDisk(uri, text)
+        }
+        sessionDirty = false
+
+        // Clear cached LightVirtualFiles from previous session
+        lightFileCache.clear()
 
         // Clean up any previous session
         if (session != null) {
@@ -84,12 +122,19 @@ class CompilerBridge {
             System.err.println("CompilerBridge: compilerFlags=$compilerFlags")
         }
 
-        val effectiveSourceRoots = if (sourceRoots.isNotEmpty()) {
+        val baseSourceRoots = if (sourceRoots.isNotEmpty()) {
             sourceRoots.map { Paths.get(it) }.filter { it.toFile().exists() }
         } else if (projectRoot.isNotEmpty()) {
             findSourceRoots(Paths.get(projectRoot))
         } else {
             emptyList()
+        }
+
+        // Include the virtual file temp dir as a source root so FIR can discover virtual files
+        val effectiveSourceRoots = if (virtualFileTempDir != null && virtualFilesOnDisk.isNotEmpty()) {
+            baseSourceRoots + listOf(virtualFileTempDir!!)
+        } else {
+            baseSourceRoots
         }
 
         System.err.println("CompilerBridge: projectRoot=$projectRoot")
@@ -148,17 +193,21 @@ class CompilerBridge {
                     }
                 } else null
 
-                // Project classpath as library modules
-                val classpathModules = classpath
+                // Project classpath as a single flat library module
+                // Using one module with all JARs mirrors flat-classpath semantics
+                // and avoids JPMS module-info boundary issues (e.g. JUnit 6)
+                val classpathRoots = classpath
                     .map { Paths.get(it) }
                     .filter { it.toFile().exists() }
-                    .mapIndexed { index, jar ->
-                        buildKtLibraryModule {
-                            libraryName = "dep-$index"
+                val classpathModule = if (classpathRoots.isNotEmpty()) {
+                    buildKtLibraryModule {
+                        libraryName = "project-dependencies"
+                        for (jar in classpathRoots) {
                             addBinaryRoot(jar)
-                            platform = JvmPlatforms.defaultJvmPlatform
                         }
+                        platform = JvmPlatforms.defaultJvmPlatform
                     }
+                } else null
 
                 // Source module
                 val mainModule = buildKtSourceModule {
@@ -179,9 +228,7 @@ class CompilerBridge {
 
                     if (jdkModule != null) addRegularDependency(jdkModule)
                     if (stdlibModule != null) addRegularDependency(stdlibModule)
-                    for (dep in classpathModules) {
-                        addRegularDependency(dep)
-                    }
+                    if (classpathModule != null) addRegularDependency(classpathModule)
                 }
                 sourceModule = mainModule
                 addModule(mainModule)
@@ -222,6 +269,20 @@ class CompilerBridge {
         virtualFiles[uri] = text
         updateFileInSession(uri, text)
 
+        // Write virtual file to temp dir so FIR can discover it for cross-package resolution.
+        // Only needed for files that don't exist on disk in the session's source roots.
+        val wasOnDisk = uri in virtualFilesOnDisk
+        writeVirtualFileToDisk(uri, text)
+        val nowOnDisk = uri in virtualFilesOnDisk
+        if (nowOnDisk && !wasOnDisk) {
+            // New file appeared in temp dir — session must be rebuilt so FIR discovers it
+            sessionDirty = true
+            System.err.println("CompilerBridge: updateFile($uri) — new virtual file in temp dir, session marked dirty")
+        } else if (nowOnDisk && wasOnDisk) {
+            // Content changed for existing temp dir file — need rebuild since session caches file content
+            sessionDirty = true
+        }
+
         // Re-index the file with updated content
         val currentSession = session
         if (currentSession != null) {
@@ -243,12 +304,28 @@ class CompilerBridge {
     fun removeFile(uri: String) {
         virtualFiles.remove(uri)
         symbolIndex.removeFile(uri)
+        if (uri in virtualFilesOnDisk) {
+            virtualFilesOnDisk.remove(uri)
+            sessionDirty = true
+        }
+    }
+
+    /**
+     * Rebuilds the Analysis API session if virtual files have changed.
+     * This ensures FIR can discover all virtual files for cross-package resolution.
+     */
+    private fun ensureSessionCurrent() {
+        if (!sessionDirty || session == null) return
+        System.err.println("CompilerBridge: session dirty, rebuilding to pick up virtual file changes")
+        initialize(initProjectRoot, initClasspath, initCompilerFlags, initJdkHome, initSourceRoots)
     }
 
     /**
      * Analyzes a file and returns diagnostics.
      */
     fun analyze(uri: String): JsonObject {
+        ensureSessionCurrent()
+
         val result = JsonObject()
         val diagnosticsArray = JsonArray()
 
@@ -2437,6 +2514,18 @@ class CompilerBridge {
     fun shutdown() {
         session = null
         Disposer.dispose(disposable)
+        // Clean up virtual file temp directory
+        virtualFileTempDir?.let { dir ->
+            try {
+                dir.toFile().deleteRecursively()
+                System.err.println("CompilerBridge: deleted virtual file temp dir: $dir")
+            } catch (e: Exception) {
+                System.err.println("CompilerBridge: failed to delete temp dir: ${e.message}")
+            }
+        }
+        virtualFileTempDir = null
+        virtualFilesOnDisk.clear()
+        virtualFileDiskPaths.clear()
         System.err.println("CompilerBridge: session disposed")
     }
 
@@ -3895,6 +3984,42 @@ class CompilerBridge {
     }
 
     /**
+     * Writes a virtual file to the temp directory with package-based directory structure.
+     * This makes the file discoverable by FIR when the temp dir is a source root.
+     */
+    private fun writeVirtualFileToDisk(uri: String, text: String) {
+        val tempDir = virtualFileTempDir ?: return
+
+        // Skip files that already exist on disk — they're already in the session's source roots
+        val filePath = uriToPath(uri)
+        if (File(filePath).exists()) {
+            System.err.println("CompilerBridge: skipping temp dir write for $uri — file exists on disk")
+            return
+        }
+
+        // Extract package name from source to build directory structure
+        val packageName = Regex("""^\s*package\s+([\w.]+)""", RegexOption.MULTILINE)
+            .find(text)?.groupValues?.get(1) ?: ""
+        val packageDirs = packageName.replace('.', '/')
+
+        val fileName = filePath.substringAfterLast('/')
+
+        // Build target path: tempDir/package/dirs/FileName.kt
+        val targetDir = if (packageDirs.isNotEmpty()) {
+            tempDir.resolve(packageDirs)
+        } else {
+            tempDir
+        }
+        Files.createDirectories(targetDir)
+        val targetFile = targetDir.resolve(fileName)
+        Files.writeString(targetFile, text)
+        virtualFilesOnDisk.add(uri)
+        virtualFileDiskPaths[uri] = targetFile.toString()
+
+        System.err.println("CompilerBridge: wrote virtual file to disk: $targetFile")
+    }
+
+    /**
      * Cache of LightVirtualFile-backed KtFiles for virtual content.
      * Reused across calls to avoid creating new files on every access.
      * Invalidated when virtualFiles content changes (checked by content equality).
@@ -3921,11 +4046,15 @@ class CompilerBridge {
                 return sessionFile
             }
         } else {
-            // Check if session file has matching content (no edits pending)
+            // Check if session file has matching content — by original path or temp dir path
+            val tempDiskPath = virtualFileDiskPaths[uri]
             val sessionFile = allSessionFiles
-                .find { it.virtualFile.path == filePath || it.name == filePath }
+                .find {
+                    it.virtualFile.path == filePath || it.name == filePath ||
+                    (tempDiskPath != null && it.virtualFile.path == tempDiskPath)
+                }
             if (sessionFile != null && sessionFile.text == virtualContent) {
-                System.err.println("CompilerBridge: findKtFile($uri) — session file content matches virtualFiles, using session file")
+                System.err.println("CompilerBridge: findKtFile($uri) — session file content matches virtualFiles, using session file: ${sessionFile.virtualFile.path}")
                 return sessionFile
             }
 
