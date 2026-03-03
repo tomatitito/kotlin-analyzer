@@ -842,4 +842,70 @@ class CompilerBridgeIntegrationTest {
             "hover should mention 'String' or its package, got: $contents"
         )
     }
+
+    // --- Java-only project graceful handling ---
+
+    @Test
+    fun `java-only project - initialize and analyze without crash`() {
+        // Verify that the CompilerBridge handles a project with no Kotlin source files
+        // gracefully. This simulates a Java-only Gradle project.
+        bridge.shutdown()
+        bridge = CompilerBridge()
+
+        val javaOnlyDir = findJavaOnlyFixtureDir()
+        bridge.initialize(
+            projectRoot = javaOnlyDir,
+            classpath = emptyList(),
+            compilerFlags = emptyList(),
+            jdkHome = "",
+            sourceRoots = listOf(javaOnlyDir),
+        )
+
+        // Analyze a non-existent Kotlin file — should return empty diagnostics, not crash
+        val uri = "file://$javaOnlyDir/NonExistent.kt"
+        val result = bridge.analyze(uri)
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        assertNotNull(diagnostics, "diagnostics array should be present")
+        // Should not crash, may return empty diagnostics
+    }
+
+    @Test
+    fun `java-only project - hover on virtual Kotlin file works`() {
+        bridge.shutdown()
+        bridge = CompilerBridge()
+
+        val javaOnlyDir = findJavaOnlyFixtureDir()
+        bridge.initialize(
+            projectRoot = javaOnlyDir,
+            classpath = emptyList(),
+            compilerFlags = emptyList(),
+            jdkHome = "",
+            sourceRoots = listOf(javaOnlyDir),
+        )
+
+        // Inject a virtual Kotlin file and verify basic analysis works
+        val uri = "file://$javaOnlyDir/Test.kt"
+        val content = """
+            fun hello(): String = "world"
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.hover(uri, line = 1, character = 4)
+        val contents = result.get("contents")?.asString
+        assertNotNull(contents, "hover should return contents even in Java-only project")
+        assertTrue(
+            contents.contains("hello") || contents.contains("String"),
+            "hover should resolve the function, got: $contents"
+        )
+    }
+
+    private fun findJavaOnlyFixtureDir(): String {
+        var dir = java.io.File(System.getProperty("user.dir"))
+        while (dir.parentFile != null) {
+            val fixture = java.io.File(dir, "tests/fixtures/gradle-java-only/src/main/java")
+            if (fixture.exists()) return fixture.absolutePath
+            dir = dir.parentFile
+        }
+        error("Could not find tests/fixtures/gradle-java-only/ from ${System.getProperty("user.dir")}")
+    }
 }

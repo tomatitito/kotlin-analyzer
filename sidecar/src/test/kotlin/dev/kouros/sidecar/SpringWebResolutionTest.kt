@@ -258,6 +258,90 @@ class SpringWebResolutionTest {
         )
     }
 
+    // --- Go-to-definition parity tests ---
+
+    @Test
+    fun `definition - RestController annotation resolves to library`() {
+        val fixtureSourceDir = findFixtureDir() + "/src/main/kotlin"
+        bridge = CompilerBridge()
+        bridge.initialize(
+            projectRoot = fixtureSourceDir,
+            classpath = projectClasspath,
+            compilerFlags = projectCompilerFlags,
+            jdkHome = "",
+            sourceRoots = listOf(fixtureSourceDir),
+        )
+
+        // Example.kt line 14: "@RestController"
+        //                       ^1 (0-based, on "R" of RestController)
+        val uri = "file://$fixtureSourceDir/Example.kt"
+        val result = bridge.definition(uri, line = 14, character = 1)
+
+        val locations = result.getAsJsonArray("locations")
+        assertNotNull(locations, "locations array should be present")
+        System.err.println("DEFINITION @RestController: ${locations}")
+
+        // Go-to-definition should resolve to the Spring library source/decompiled class
+        assertTrue(
+            locations.size() > 0,
+            "should find at least one definition location for @RestController"
+        )
+    }
+
+    @Test
+    fun `definition - ResponseStatusException resolves to library`() {
+        val fixtureSourceDir = findFixtureDir() + "/src/main/kotlin"
+        bridge = CompilerBridge()
+        bridge.initialize(
+            projectRoot = fixtureSourceDir,
+            classpath = projectClasspath,
+            compilerFlags = projectCompilerFlags,
+            jdkHome = "",
+            sourceRoots = listOf(fixtureSourceDir),
+        )
+
+        // Example.kt line 29: "        throw ResponseStatusException(...)"
+        //                                ^14 (0-based, on "R")
+        val uri = "file://$fixtureSourceDir/Example.kt"
+        val result = bridge.definition(uri, line = 29, character = 14)
+
+        val locations = result.getAsJsonArray("locations")
+        assertNotNull(locations, "locations array should be present")
+        System.err.println("DEFINITION ResponseStatusException: ${locations}")
+
+        assertTrue(
+            locations.size() > 0,
+            "should find at least one definition location for ResponseStatusException"
+        )
+    }
+
+    // --- Completion parity tests ---
+
+    @Test
+    fun `completion - Spring annotation attributes available`() {
+        val fixtureSourceDir = findFixtureDir() + "/src/main/kotlin"
+        bridge = CompilerBridge()
+        bridge.initialize(
+            projectRoot = fixtureSourceDir,
+            classpath = projectClasspath,
+            compilerFlags = projectCompilerFlags,
+            jdkHome = "",
+            sourceRoots = listOf(fixtureSourceDir),
+        )
+
+        // Test completion inside @GetMapping annotation arguments
+        // Example.kt line 17: "    @GetMapping("/greet/{name}")"
+        //                           ^5 (on "G")
+        val uri = "file://$fixtureSourceDir/Example.kt"
+        val result = bridge.completion(uri, line = 17, character = 5)
+
+        val items = result.getAsJsonArray("items")
+        assertNotNull(items, "completion items array should be present")
+        // Completion at the annotation name position should return results
+        // (may include GetMapping itself or other annotations)
+        System.err.println("COMPLETION @GetMapping: ${items.size()} items")
+    }
+
     @Test
     fun `arrow recover with spring web produces zero errors`() {
         // The Rust server now correctly forwards project_model.compiler_flags

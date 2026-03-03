@@ -657,34 +657,66 @@ class CompilerBridge {
                     // Find the reference element
                     var current: PsiElement? = element
                     while (current != null) {
-                        if (current is KtReferenceExpression) {
-                            val references = current.references
-                            for (ref in references) {
-                                try {
-                                    val resolved = ref.resolve()
-                                    if (resolved != null) {
-                                        val file = resolved.containingFile
-                                        val textOffset = resolved.textOffset
-                                        val doc = file?.viewProvider?.document
-                                        val vfPath = file?.virtualFile?.path
-
-                                        if (file != null && doc != null) {
-                                            // For KtPsiFactory files, virtualFile.path may be null;
-                                            // fall back to the original URI (same-file reference)
-                                            val targetUri = if (vfPath != null && !vfPath.contains("dummy")) {
-                                                "file://$vfPath"
-                                            } else {
-                                                uri
-                                            }
-                                            val loc = JsonObject()
-                                            loc.addProperty("uri", targetUri)
-                                            loc.addProperty("line", doc.getLineNumber(textOffset) + 1)
-                                            loc.addProperty("column", textOffset - doc.getLineStartOffset(doc.getLineNumber(textOffset)))
-                                            locationsArray.add(loc)
-                                        }
+                        // Handle annotation entries: resolve to the annotation class
+                        if (current is org.jetbrains.kotlin.psi.KtAnnotationEntry) {
+                            try {
+                                val typeRef = current.typeReference
+                                val type = typeRef?.type
+                                val classSymbol = (type as? org.jetbrains.kotlin.analysis.api.types.KaClassType)
+                                    ?.symbol as? KaDeclarationSymbol
+                                if (classSymbol != null) {
+                                    val loc = buildDefinitionLocation(classSymbol, uri)
+                                    if (loc != null) {
+                                        locationsArray.add(loc)
                                     }
-                                } catch (e: Exception) {
-                                    System.err.println("CompilerBridge: definition ref.resolve() failed: ${e.message?.take(100)}")
+                                }
+                            } catch (e: Throwable) {
+                                System.err.println("CompilerBridge: definition annotation resolve failed: ${e.message?.take(100)}")
+                            }
+                            break
+                        }
+
+                        if (current is KtReferenceExpression) {
+                            // First try Analysis API resolution (handles library symbols better)
+                            var resolved = false
+                            for (ref in current.references) {
+                                if (ref is KtReference) {
+                                    try {
+                                        var symbol = ref.resolveToSymbol()
+                                        // For constructor calls, navigate to the class
+                                        if (symbol is KaConstructorSymbol) {
+                                            val container = symbol.containingDeclaration
+                                            if (container is KaDeclarationSymbol) {
+                                                symbol = container
+                                            }
+                                        }
+                                        if (symbol is KaDeclarationSymbol) {
+                                            val loc = buildDefinitionLocation(symbol, uri)
+                                            if (loc != null) {
+                                                locationsArray.add(loc)
+                                                resolved = true
+                                            }
+                                        }
+                                    } catch (e: Throwable) {
+                                        System.err.println("CompilerBridge: definition resolveToSymbol failed: ${e.javaClass.simpleName}: ${e.message?.take(100)}")
+                                    }
+                                }
+                            }
+
+                            // Fall back to PSI-based resolve if Analysis API didn't work
+                            if (!resolved) {
+                                for (ref in current.references) {
+                                    try {
+                                        val psiTarget = ref.resolve()
+                                        if (psiTarget != null) {
+                                            val loc = buildPsiDefinitionLocation(psiTarget, uri)
+                                            if (loc != null) {
+                                                locationsArray.add(loc)
+                                            }
+                                        }
+                                    } catch (e: Throwable) {
+                                        System.err.println("CompilerBridge: definition ref.resolve() failed: ${e.javaClass.simpleName}: ${e.message?.take(100)}")
+                                    }
                                 }
                             }
                             break
@@ -700,6 +732,133 @@ class CompilerBridge {
         System.err.println("[PERF] method=definition uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
         result.add("locations", locationsArray)
         return result
+    }
+
+    /**
+     * Builds a definition location from a KaDeclarationSymbol using the Analysis API.
+     * Handles both source files and library symbols (inside JARs).
+     */
+    private fun buildDefinitionLocation(symbol: KaDeclarationSymbol, fallbackUri: String): JsonObject? {
+        val isLibrary = try {
+            symbol.origin.name.contains("LIBRARY", ignoreCase = true)
+        } catch (_: Throwable) { false }
+
+        // For library symbols, try to build a location from PSI cautiously,
+        // then fall back to a synthetic location
+        if (isLibrary) {
+            // Try PSI-based location first (works for decompiled stubs with source)
+            val psi = try { symbol.psi } catch (_: Throwable) { null }
+            if (psi != null) {
+                try {
+                    val file = psi.containingFile
+                    val vf = file?.virtualFile
+                    val vfPath = vf?.path
+                    if (file != null && vfPath != null) {
+                        val textOffset = try { psi.textOffset } catch (_: Throwable) { 0 }
+                        val text = try { file.text } catch (_: Throwable) { null }
+                        if (text != null && textOffset <= text.length) {
+                            val beforeOffset = text.substring(0, textOffset)
+                            val lineNumber = beforeOffset.count { it == '\n' } + 1
+                            val lastNewline = beforeOffset.lastIndexOf('\n')
+                            val column = if (lastNewline >= 0) textOffset - lastNewline - 1 else textOffset
+
+                            val loc = JsonObject()
+                            loc.addProperty("uri", buildFileUri(vfPath))
+                            loc.addProperty("line", lineNumber)
+                            loc.addProperty("column", column)
+                            return loc
+                        }
+                    }
+                } catch (e: Throwable) {
+                    System.err.println("CompilerBridge: buildDefinitionLocation PSI access failed: ${e.javaClass.simpleName}")
+                }
+            }
+
+            // Synthetic location using classId
+            try {
+                val classId = when (symbol) {
+                    is KaClassLikeSymbol -> symbol.classId
+                    is KaCallableSymbol -> symbol.callableId?.classId
+                    else -> null
+                }
+                if (classId != null) {
+                    val loc = JsonObject()
+                    val pkg = classId.packageFqName.asString().replace('.', '/')
+                    val className = classId.shortClassName.asString()
+                    loc.addProperty("uri", "kotlin-analyzer:///library/$pkg/$className.class")
+                    loc.addProperty("line", 1)
+                    loc.addProperty("column", 0)
+                    return loc
+                }
+            } catch (e: Throwable) {
+                System.err.println("CompilerBridge: buildDefinitionLocation synthetic failed: ${e.message?.take(100)}")
+            }
+
+            return null
+        }
+
+        // For source symbols, use standard PSI location
+        val psi = try { symbol.psi } catch (_: Throwable) { null }
+        if (psi != null) {
+            return buildPsiDefinitionLocation(psi, fallbackUri)
+        }
+        return null
+    }
+
+    /**
+     * Builds a definition location from a resolved PsiElement (PSI-based fallback).
+     */
+    private fun buildPsiDefinitionLocation(psiTarget: PsiElement, fallbackUri: String): JsonObject? {
+        try {
+            val file = psiTarget.containingFile ?: return null
+            val textOffset = psiTarget.textOffset
+            val doc = file.viewProvider?.document
+            val vfPath = file.virtualFile?.path
+
+            if (doc != null) {
+                val targetUri = if (vfPath != null && !vfPath.contains("dummy")) {
+                    buildFileUri(vfPath)
+                } else {
+                    fallbackUri
+                }
+                val loc = JsonObject()
+                loc.addProperty("uri", targetUri)
+                loc.addProperty("line", doc.getLineNumber(textOffset) + 1)
+                loc.addProperty("column", textOffset - doc.getLineStartOffset(doc.getLineNumber(textOffset)))
+                return loc
+            }
+
+            // Fallback for JAR/library files
+            if (vfPath != null && file.text != null) {
+                val text = file.text
+                val beforeOffset = text.substring(0, minOf(textOffset, text.length))
+                val lineNumber = beforeOffset.count { it == '\n' } + 1
+                val lastNewline = beforeOffset.lastIndexOf('\n')
+                val column = if (lastNewline >= 0) textOffset - lastNewline - 1 else textOffset
+
+                val loc = JsonObject()
+                loc.addProperty("uri", buildFileUri(vfPath))
+                loc.addProperty("line", lineNumber)
+                loc.addProperty("column", column)
+                return loc
+            }
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: buildPsiDefinitionLocation failed: ${e.message?.take(100)}")
+        }
+        return null
+    }
+
+    /**
+     * Builds a file:// URI from a virtual file path, handling JAR paths.
+     */
+    private fun buildFileUri(vfPath: String): String {
+        return if (vfPath.contains("!/")) {
+            // JAR path: convert jar:///path/to/file.jar!/com/Foo.class to file URI
+            // Zed can open decompiled class files if the path is a real file
+            "file://$vfPath"
+        } else {
+            "file://$vfPath"
+        }
     }
 
     /**
