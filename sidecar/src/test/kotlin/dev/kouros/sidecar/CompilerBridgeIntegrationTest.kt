@@ -899,6 +899,280 @@ class CompilerBridgeIntegrationTest {
         )
     }
 
+    // --- Editor flow tests: simulate production didOpen/didChange + analyze ---
+    // In production, textDocument/didChange is ALWAYS sent before analyze, which
+    // stores the file content in virtualFiles. This path differs from calling
+    // analyze() directly (which uses the session file without virtual content).
+
+    @Test
+    fun `editor flow - cross-file reference resolves after updateFile with same content`() {
+        // Simulate what happens when the editor opens UserService.kt:
+        // 1. didChange sends the file's current content (same as disk)
+        // 2. analyze is called
+        // UserService.kt references User (from User.kt) — should resolve.
+        val userServiceUri = "file://$testSourceDir/UserService.kt"
+        val diskContent = java.io.File("$testSourceDir/UserService.kt").readText()
+
+        bridge.updateFile(userServiceUri, diskContent)
+
+        val result = bridge.analyze(userServiceUri)
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        val errors = diagnostics.filter {
+            it.asJsonObject.get("severity")?.asString == "ERROR"
+        }
+        assertEquals(
+            0, errors.size,
+            "UserService.kt with cross-file reference to User should have zero errors " +
+                "when analyzed via the editor flow (updateFile + analyze), got: ${
+                    errors.map {
+                        it.asJsonObject.let { o ->
+                            "[${o.get("code")?.asString}] ${o.get("message")?.asString}"
+                        }
+                    }
+                }"
+        )
+    }
+
+    @Test
+    fun `editor flow - clean file has no errors after updateFile with same content`() {
+        // Same as above but with Clean.kt (no cross-file references).
+        val uri = "file://$testSourceDir/Clean.kt"
+        val diskContent = java.io.File("$testSourceDir/Clean.kt").readText()
+
+        bridge.updateFile(uri, diskContent)
+
+        val result = bridge.analyze(uri)
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        val errors = diagnostics.filter {
+            it.asJsonObject.get("severity")?.asString == "ERROR"
+        }
+        assertEquals(
+            0, errors.size,
+            "Clean.kt should have zero errors when analyzed via editor flow, got: ${
+                errors.map {
+                    it.asJsonObject.let { o ->
+                        "[${o.get("code")?.asString}] ${o.get("message")?.asString}"
+                    }
+                }
+            }"
+        )
+    }
+
+    @Test
+    fun `editor flow - cross-package import resolves when analyzed directly from session`() {
+        // The files model/Person.kt and service/PersonService.kt are on disk
+        // in the test-sources directory and should be discovered by the session.
+        // When analyzed directly (no updateFile), cross-package imports should resolve.
+        val serviceUri = "file://$testSourceDir/service/PersonService.kt"
+
+        val result = bridge.analyze(serviceUri)
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        val errors = diagnostics.filter {
+            it.asJsonObject.get("severity")?.asString == "ERROR"
+        }
+
+        assertEquals(
+            0, errors.size,
+            "PersonService.kt (session file, direct analyze) should have zero errors, got: ${
+                errors.map {
+                    it.asJsonObject.let { o ->
+                        "[${o.get("code")?.asString}] ${o.get("message")?.asString}"
+                    }
+                }
+            }"
+        )
+    }
+
+    @Test
+    fun `editor flow - cross-package import resolves after updateFile with same content`() {
+        // Simulate the editor opening PersonService.kt: the editor sends
+        // textDocument/didChange with the disk content, then requests analysis.
+        // This is the EXACT production flow — updateFile is called before analyze.
+        val serviceUri = "file://$testSourceDir/service/PersonService.kt"
+        val diskContent = java.io.File("$testSourceDir/service/PersonService.kt").readText()
+
+        bridge.updateFile(serviceUri, diskContent)
+
+        val result = bridge.analyze(serviceUri)
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        val errors = diagnostics.filter {
+            it.asJsonObject.get("severity")?.asString == "ERROR"
+        }
+
+        assertEquals(
+            0, errors.size,
+            "PersonService.kt (editor flow, same-as-disk content) should have zero errors, got: ${
+                errors.map {
+                    it.asJsonObject.let { o ->
+                        "[${o.get("code")?.asString}] ${o.get("message")?.asString}"
+                    }
+                }
+            }"
+        )
+    }
+
+    @Test
+    fun `editor flow - virtual-only files cannot resolve cross-package imports`() {
+        // FUNDAMENTAL LIMITATION: When both files exist ONLY as virtual content
+        // (not on disk in session source roots), cross-package imports fail.
+        //
+        // This happens in production when:
+        // 1. Gradle extraction fails entirely → no source roots, all files virtual
+        // 2. Source root extraction is incomplete (e.g. only "main" extracted but
+        //    user opens files from "test" source set, or from an unrecognized module)
+        // 3. Multi-module project where module A depends on module B but B's source
+        //    roots are not in the session
+        //
+        // The LightVirtualFile is mapped to the source module via
+        // registerVirtualFileModuleProvider, but since the IMPORTED class is also
+        // not in the session, FIR cannot resolve the import.
+        //
+        // This test SHOULD pass when the issue is fixed (change assertTrue to
+        // assertEquals(0, errors.size, ...)).
+
+        val modelUri = "file://$testSourceDir/virtual/Item.kt"
+        val modelContent = """
+            package virtual_model
+
+            data class Item(val id: Long, val name: String, val price: Double)
+        """.trimIndent()
+        bridge.updateFile(modelUri, modelContent)
+
+        val serviceUri = "file://$testSourceDir/virtual/ItemService.kt"
+        val serviceContent = """
+            package virtual_service
+
+            import virtual_model.Item
+
+            class ItemService {
+                private val items = mutableListOf<Item>()
+
+                fun addItem(item: Item) {
+                    items.add(item)
+                }
+
+                fun findItem(id: Long): Item? {
+                    return items.find { it.id == id }
+                }
+            }
+        """.trimIndent()
+        bridge.updateFile(serviceUri, serviceContent)
+
+        val result = bridge.analyze(serviceUri)
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        val errors = diagnostics.filter {
+            it.asJsonObject.get("severity")?.asString == "ERROR"
+        }
+
+        // This test FAILS until the issue is fixed: virtual-only files that
+        // are not in the session source roots cannot resolve cross-package imports.
+        assertEquals(
+            0, errors.size,
+            "virtual-only files should resolve cross-package imports without errors, got: ${
+                errors.map {
+                    it.asJsonObject.let { o ->
+                        "[${o.get("code")?.asString}] ${o.get("message")?.asString}"
+                    }
+                }
+            }"
+        )
+    }
+
+    @Test
+    fun `editor flow - test file importing from main source set resolves`() {
+        // When only "main" source roots are extracted (current behavior), test
+        // files that import from main sources should still resolve those imports
+        // because the main source module contains the referenced declarations.
+        //
+        // The file is analyzed as a LightVirtualFile mapped to the source module
+        // via registerVirtualFileModuleProvider, which gives it access to session
+        // declarations.
+
+        val testFileUri = "file://$testSourceDir/test/UserServiceTest.kt"
+        val testContent = """
+            class UserServiceTest {
+                fun testAddUser() {
+                    val service = UserService()
+                    val user = User(1L, "Alice", "alice@example.com")
+                    service.addUser(user)
+                    val found = service.findUser(1L)
+                    println(found?.name)
+                }
+            }
+        """.trimIndent()
+        bridge.updateFile(testFileUri, testContent)
+
+        val result = bridge.analyze(testFileUri)
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        val errors = diagnostics.filter {
+            it.asJsonObject.get("severity")?.asString == "ERROR"
+        }
+
+        assertEquals(
+            0, errors.size,
+            "test file importing from main source set should resolve (User and UserService " +
+                "are in the session), got: ${
+                    errors.map {
+                        it.asJsonObject.let { o ->
+                            "[${o.get("code")?.asString}] ${o.get("message")?.asString}"
+                        }
+                    }
+                }"
+        )
+    }
+
+    @Test
+    fun `editor flow - file in source roots but with edited content still resolves cross-file imports`() {
+        // When the editor modifies a file (content differs from disk), the file
+        // goes through the LightVirtualFile path. Cross-file imports should still
+        // resolve because the other files are still in the session.
+        val serviceUri = "file://$testSourceDir/service/PersonService.kt"
+
+        // Send modified content that still has the same imports
+        val modifiedContent = """
+            package service
+
+            import model.Person
+
+            class PersonService {
+                private val people = mutableListOf<Person>()
+
+                fun addPerson(person: Person) {
+                    people.add(person)
+                }
+
+                fun findPerson(id: Long): Person? {
+                    return people.find { it.id == id }
+                }
+
+                fun allPeople(): List<Person> {
+                    return people.toList()
+                }
+
+                // New method added by the user
+                fun countPeople(): Int = people.size
+            }
+        """.trimIndent()
+        bridge.updateFile(serviceUri, modifiedContent)
+
+        val result = bridge.analyze(serviceUri)
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        val errors = diagnostics.filter {
+            it.asJsonObject.get("severity")?.asString == "ERROR"
+        }
+
+        assertEquals(
+            0, errors.size,
+            "PersonService.kt with edited content should still resolve cross-file imports, got: ${
+                errors.map {
+                    it.asJsonObject.let { o ->
+                        "[${o.get("code")?.asString}] ${o.get("message")?.asString}"
+                    }
+                }
+            }"
+        )
+    }
+
     private fun findJavaOnlyFixtureDir(): String {
         var dir = java.io.File(System.getProperty("user.dir"))
         while (dir.parentFile != null) {
