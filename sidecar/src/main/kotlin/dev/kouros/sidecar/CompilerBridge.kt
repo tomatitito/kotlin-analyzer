@@ -56,6 +56,8 @@ class CompilerBridge {
     private val virtualFilesOnDisk = mutableSetOf<String>()
     // Maps virtual file URI to its path on disk in the temp dir
     private val virtualFileDiskPaths = mutableMapOf<String, String>()
+    // Cache of decompiled library files: virtual file path -> disk path
+    private val decompiledFileCache = mutableMapOf<String, Path>()
     // When true, the session must be rebuilt before next analysis (new virtual files appeared)
     private var sessionDirty = false
     // Stored init params for session rebuilds
@@ -328,6 +330,16 @@ class CompilerBridge {
 
         val result = JsonObject()
         val diagnosticsArray = JsonArray()
+
+        // Skip diagnostics for decompiled library stub files
+        val tempDir = virtualFileTempDir
+        if (tempDir != null) {
+            val filePath = uriToPath(uri)
+            if (filePath.startsWith(tempDir.resolve("decompiled").toString())) {
+                result.add("diagnostics", diagnosticsArray)
+                return result
+            }
+        }
 
         val currentSession = session
         if (currentSession == null) {
@@ -814,24 +826,24 @@ class CompilerBridge {
     /**
      * Builds a definition location from a KaDeclarationSymbol using the Analysis API.
      * Handles both source files and library symbols (inside JARs).
+     * Must be called inside an `analyze` block.
      */
-    private fun buildDefinitionLocation(symbol: KaDeclarationSymbol, fallbackUri: String): JsonObject? {
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.buildDefinitionLocation(symbol: KaDeclarationSymbol, fallbackUri: String): JsonObject? {
         val isLibrary = try {
             symbol.origin.name.contains("LIBRARY", ignoreCase = true)
         } catch (_: Throwable) { false }
 
         // For library symbols, try to build a location from PSI cautiously,
-        // then fall back to a synthetic location
+        // then fall back to rendering the symbol as a stub file
         if (isLibrary) {
-            // Try PSI-based location first (works for decompiled stubs with source)
             val psi = try { symbol.psi } catch (_: Throwable) { null }
             if (psi != null) {
                 try {
                     val file = psi.containingFile
-                    val vf = file?.virtualFile
-                    val vfPath = vf?.path
+                    val vfPath = file?.virtualFile?.path
                     if (file != null && vfPath != null) {
                         val textOffset = try { psi.textOffset } catch (_: Throwable) { 0 }
+                        // file.text is null for compiled .class files in standalone mode
                         val text = try { file.text } catch (_: Throwable) { null }
                         if (text != null && textOffset <= text.length) {
                             val beforeOffset = text.substring(0, textOffset)
@@ -839,19 +851,30 @@ class CompilerBridge {
                             val lastNewline = beforeOffset.lastIndexOf('\n')
                             val column = if (lastNewline >= 0) textOffset - lastNewline - 1 else textOffset
 
+                            val decompiledPath = writeDecompiledFile(vfPath, text)
+                            val uri = if (decompiledPath != null) {
+                                "file://${decompiledPath}"
+                            } else {
+                                buildFileUri(vfPath)
+                            }
+
                             val loc = JsonObject()
-                            loc.addProperty("uri", buildFileUri(vfPath))
+                            loc.addProperty("uri", uri)
                             loc.addProperty("line", lineNumber)
                             loc.addProperty("column", column)
                             return loc
                         }
+
+                        // For compiled classes, render the symbol as a stub file
+                        val rendered = renderLibrarySymbolStub(symbol, vfPath)
+                        if (rendered != null) return rendered
                     }
                 } catch (e: Throwable) {
                     System.err.println("CompilerBridge: buildDefinitionLocation PSI access failed: ${e.javaClass.simpleName}")
                 }
             }
 
-            // Synthetic location using classId
+            // Fallback: render symbol stub using classId for the file path
             try {
                 val classId = when (symbol) {
                     is KaClassLikeSymbol -> symbol.classId
@@ -859,9 +882,14 @@ class CompilerBridge {
                     else -> null
                 }
                 if (classId != null) {
-                    val loc = JsonObject()
                     val pkg = classId.packageFqName.asString().replace('.', '/')
                     val className = classId.shortClassName.asString()
+                    val syntheticPath = "$pkg/$className.class"
+                    val rendered = renderLibrarySymbolStub(symbol, syntheticPath)
+                    if (rendered != null) return rendered
+
+                    // Last resort: return custom-scheme URI
+                    val loc = JsonObject()
                     loc.addProperty("uri", "kotlin-analyzer:///library/$pkg/$className.class")
                     loc.addProperty("line", 1)
                     loc.addProperty("column", 0)
@@ -3030,6 +3058,7 @@ class CompilerBridge {
         virtualFileTempDir = null
         virtualFilesOnDisk.clear()
         virtualFileDiskPaths.clear()
+        decompiledFileCache.clear()
         System.err.println("CompilerBridge: session disposed")
     }
 
@@ -4521,6 +4550,120 @@ class CompilerBridge {
         virtualFileDiskPaths[uri] = targetFile.toString()
 
         System.err.println("CompilerBridge: wrote virtual file to disk: $targetFile")
+    }
+
+    /**
+     * Writes decompiled library source to a temp file so the editor can open it.
+     * Returns the disk path, or null if the temp dir is unavailable.
+     * Results are cached so repeated go-to-definition calls don't re-write.
+     */
+    private fun writeDecompiledFile(vfPath: String, text: String): Path? {
+        val tempDir = virtualFileTempDir ?: return null
+        decompiledFileCache[vfPath]?.let { return it }
+
+        // Extract the path after "!/" (JAR-internal path), or use the full path
+        val internalPath = if (vfPath.contains("!/")) {
+            vfPath.substringAfter("!/")
+        } else {
+            vfPath.substringAfterLast("/")
+        }
+
+        // Convert .class extension to .kt for readability
+        val ktPath = if (internalPath.endsWith(".class")) {
+            internalPath.removeSuffix(".class") + ".kt"
+        } else {
+            internalPath
+        }
+
+        val targetFile = tempDir.resolve("decompiled").resolve(ktPath)
+        try {
+            Files.createDirectories(targetFile.parent)
+            Files.writeString(targetFile, text)
+            decompiledFileCache[vfPath] = targetFile
+            System.err.println("CompilerBridge: wrote decompiled file: $targetFile")
+            return targetFile
+        } catch (e: Exception) {
+            System.err.println("CompilerBridge: failed to write decompiled file: ${e.message}")
+            return null
+        }
+    }
+
+    /**
+     * Renders a library symbol as a Kotlin stub file and writes it to disk.
+     * Returns a definition location pointing to the generated file, or null on failure.
+     * Must be called inside an `analyze` block.
+     */
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.renderLibrarySymbolStub(
+        symbol: KaDeclarationSymbol,
+        vfPath: String,
+    ): JsonObject? {
+        try {
+            val rendered = symbol.render(KaDeclarationRendererForSource.WITH_SHORT_NAMES)
+            if (rendered.isBlank()) return null
+
+            // Shorten fully qualified names (e.g. kotlin.annotation.AnnotationTarget -> AnnotationTarget)
+            // and collect them as imports
+            val fqNamePattern = Regex("""([\w]+(?:\.[\w]+){2,})""")
+            val imports = mutableSetOf<String>()
+            var shortened = rendered
+            for (match in fqNamePattern.findAll(rendered).sortedByDescending { it.range.first }) {
+                val fqName = match.value
+                // Only shorten if the last segment looks like a class/object name (starts uppercase)
+                val segments = fqName.split('.')
+                val shortName = segments.last()
+                // Find the class boundary: last segment starting with uppercase
+                val classIdx = segments.indexOfLast { it.first().isUpperCase() }
+                if (classIdx < 0) continue
+                val importName = segments.subList(0, classIdx + 1).joinToString(".")
+                if (importName.count { it == '.' } < 1) continue // skip if no package
+                imports.add(importName)
+                val replacement = segments.subList(classIdx, segments.size).joinToString(".")
+                shortened = shortened.replaceRange(match.range, replacement)
+            }
+
+            // Build package declaration from classId
+            val packageName = when (symbol) {
+                is KaClassLikeSymbol -> symbol.classId?.packageFqName?.asString()
+                is KaCallableSymbol -> symbol.callableId?.packageName?.asString()
+                else -> null
+            }
+            // Remove self-package imports
+            if (!packageName.isNullOrEmpty()) {
+                imports.removeAll { it.substringBeforeLast('.') == packageName }
+            }
+            // Extract documentation (KDoc or Javadoc) from the symbol's PSI
+            val docText = extractSymbolDocumentation(symbol)
+
+            val stubText = buildString {
+                if (!packageName.isNullOrEmpty()) {
+                    append("package $packageName\n\n")
+                }
+                if (imports.isNotEmpty()) {
+                    imports.sorted().forEach { append("import $it\n") }
+                    append("\n")
+                }
+                if (docText != null) {
+                    append("/**\n")
+                    docText.lines().forEach { line -> append(" * $line\n") }
+                    append(" */\n")
+                }
+                append(shortened)
+                append("\n")
+            }
+
+            // Find the declaration line in the generated stub
+            val declLine = stubText.substring(0, stubText.indexOf(shortened)).count { it == '\n' } + 1
+
+            val decompiledPath = writeDecompiledFile(vfPath, stubText) ?: return null
+            val loc = JsonObject()
+            loc.addProperty("uri", "file://${decompiledPath}")
+            loc.addProperty("line", declLine)
+            loc.addProperty("column", 0)
+            return loc
+        } catch (e: Throwable) {
+            System.err.println("CompilerBridge: renderLibrarySymbolStub failed: ${e.message?.take(100)}")
+            return null
+        }
     }
 
     /**

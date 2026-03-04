@@ -3,6 +3,8 @@ package dev.kouros.sidecar
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
+import java.io.File
+import java.net.URI
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -286,6 +288,17 @@ class SpringWebResolutionTest {
             locations.size() > 0,
             "should find at least one definition location for @RestController"
         )
+
+        val loc = locations[0].asJsonObject
+        val locUri = loc.get("uri").asString
+        assertTrue(locUri.startsWith("file://"), "URI should be a file:// URI, got: $locUri")
+        assertTrue("!/" !in locUri, "URI should not contain JAR separator '!/', got: $locUri")
+
+        val path = File(URI(locUri))
+        assertTrue(path.exists(), "decompiled file should exist on disk: $path")
+
+        val content = path.readText()
+        assertTrue("RestController" in content, "decompiled file should contain 'RestController', got:\n${content.take(200)}")
     }
 
     @Test
@@ -313,6 +326,17 @@ class SpringWebResolutionTest {
             locations.size() > 0,
             "should find at least one definition location for ResponseStatusException"
         )
+
+        val loc = locations[0].asJsonObject
+        val locUri = loc.get("uri").asString
+        assertTrue(locUri.startsWith("file://"), "URI should be a file:// URI, got: $locUri")
+        assertTrue("!/" !in locUri, "URI should not contain JAR separator '!/', got: $locUri")
+
+        val path = File(URI(locUri))
+        assertTrue(path.exists(), "decompiled file should exist on disk: $path")
+
+        val content = path.readText()
+        assertTrue("ResponseStatusException" in content, "decompiled file should contain 'ResponseStatusException', got:\n${content.take(200)}")
     }
 
     // --- Completion parity tests ---
