@@ -1457,6 +1457,12 @@ class CompilerBridge {
 
                     // Convert between expression body and block body for functions
                     addConvertBodyAction(element, document, fileUri, actionsArray)
+
+                    // Structural refactoring actions
+                    addMoveToCompanionAction(element, document, fileUri, actionsArray)
+                    addMoveFromCompanionAction(element, document, fileUri, actionsArray)
+                    addMoveToTopLevelAction(element, document, fileUri, actionsArray, ktFile)
+                    addConvertToExtensionFunctionAction(element, document, fileUri, actionsArray)
                 }
 
                 // 3. Source actions: Organize imports
@@ -1689,6 +1695,504 @@ class CompilerBridge {
 
         action.add("edits", editsArray)
         actionsArray.add(action)
+    }
+
+    /**
+     * Result of analyzing a declaration body for references to members of its containing class.
+     */
+    private data class BodyAnalysis(val referencesThis: Boolean, val accessesPrivateMembers: Boolean)
+
+    /**
+     * Analyzes a declaration body in a single pass for both `this` references and private member access.
+     * Explicit `this`: KtThisExpression nodes.
+     * Implicit `this`: KtSimpleNameExpression that resolves to a member of [containingClass].
+     */
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.analyzeBodyReferences(
+        declaration: KtDeclaration,
+        containingClass: KtClass,
+    ): BodyAnalysis {
+        val body = when (declaration) {
+            is KtNamedFunction -> declaration.bodyExpression
+            is KtProperty -> declaration.initializer
+            else -> return BodyAnalysis(false, false)
+        } ?: return BodyAnalysis(false, false)
+
+        // Explicit this
+        val hasExplicitThis = PsiTreeUtil.findChildrenOfType(body, KtThisExpression::class.java).isNotEmpty()
+
+        var refsThis = hasExplicitThis
+        var accessesPrivate = false
+
+        // Single pass over name expressions for implicit this + private member access
+        try {
+            val classSymbol = containingClass.symbol
+            for (nameExpr in PsiTreeUtil.findChildrenOfType(body, KtSimpleNameExpression::class.java)) {
+                if (nameExpr is KtOperationReferenceExpression) continue
+                try {
+                    for (ref in nameExpr.references.filterIsInstance<KtReference>()) {
+                        for (target in ref.resolveToSymbols()) {
+                            if (target is KaCallableSymbol && target.containingSymbol == classSymbol) {
+                                refsThis = true
+                                if (target.visibility == KaSymbolVisibility.PRIVATE) {
+                                    accessesPrivate = true
+                                }
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Skip unresolvable references
+                }
+                if (refsThis && accessesPrivate) break
+            }
+        } catch (_: Exception) {
+            // Symbol resolution not available — fall back to PSI name matching
+            val memberNames = mutableSetOf<String>()
+            val privateNames = mutableSetOf<String>()
+            containingClass.body?.declarations?.forEach { decl ->
+                if (decl != declaration && decl is KtNamedDeclaration) {
+                    decl.name?.let { memberNames.add(it) }
+                    if (decl.hasModifier(KtTokens.PRIVATE_KEYWORD)) {
+                        decl.name?.let { privateNames.add(it) }
+                    }
+                }
+            }
+            for (nameExpr in PsiTreeUtil.findChildrenOfType(body, KtSimpleNameExpression::class.java)) {
+                if (nameExpr is KtOperationReferenceExpression) continue
+                val name = nameExpr.getReferencedName()
+                if (name in memberNames) refsThis = true
+                if (name in privateNames) accessesPrivate = true
+                if (refsThis && accessesPrivate) break
+            }
+        }
+
+        return BodyAnalysis(refsThis, accessesPrivate)
+    }
+
+    /**
+     * Builds a single edit JSON object.
+     */
+    private fun makeEdit(
+        uri: String,
+        startLine: Int,
+        startCol: Int,
+        endLine: Int,
+        endCol: Int,
+        newText: String,
+    ): JsonObject {
+        val edit = JsonObject()
+        edit.addProperty("uri", uri)
+        val range = JsonObject()
+        range.addProperty("startLine", startLine)
+        range.addProperty("startColumn", startCol)
+        range.addProperty("endLine", endLine)
+        range.addProperty("endColumn", endCol)
+        edit.add("range", range)
+        edit.addProperty("newText", newText)
+        return edit
+    }
+
+    /**
+     * Returns (1-based line, column) for a given offset in the document.
+     */
+    private fun offsetToLineCol(
+        document: com.intellij.openapi.editor.Document,
+        offset: Int,
+    ): Pair<Int, Int> {
+        val lineIndex = document.getLineNumber(offset)
+        val lineStart = document.getLineStartOffset(lineIndex)
+        return Pair(lineIndex + 1, offset - lineStart)
+    }
+
+    /**
+     * Creates an edit that deletes a PSI element, consuming a trailing newline if present.
+     */
+    private fun makeDeleteEdit(
+        document: com.intellij.openapi.editor.Document,
+        fileUri: String,
+        element: PsiElement,
+    ): JsonObject {
+        val (startLine, startCol) = offsetToLineCol(document, element.textOffset)
+        var endOffset = element.textRange.endOffset
+        val docText = document.charsSequence
+        if (endOffset < docText.length && docText[endOffset] == '\n') {
+            endOffset++
+        }
+        val (endLine, endCol) = offsetToLineCol(document, endOffset)
+        return makeEdit(fileUri, startLine, startCol, endLine, endCol, "")
+    }
+
+    /**
+     * Creates an edit that appends text at the end of the file.
+     */
+    private fun makeAppendToFileEdit(
+        document: com.intellij.openapi.editor.Document,
+        fileUri: String,
+        text: String,
+    ): JsonObject {
+        val lastLineEnd = document.getLineEndOffset(document.lineCount - 1)
+        val (endLine, endCol) = offsetToLineCol(document, lastLineEnd)
+        return makeEdit(fileUri, endLine, endCol, endLine, endCol, "\n\n$text")
+    }
+
+    /**
+     * Returns the leading whitespace of the line containing the given offset.
+     */
+    private fun indentAt(document: com.intellij.openapi.editor.Document, offset: Int): String {
+        val lineNum = document.getLineNumber(offset)
+        val lineStart = document.getLineStartOffset(lineNum)
+        val lineEnd = document.getLineEndOffset(lineNum)
+        return document.charsSequence.subSequence(lineStart, lineEnd).toString()
+            .takeWhile { it == ' ' || it == '\t' }
+    }
+
+    /**
+     * Builds a clean modifier string for a function moved to top level,
+     * removing class-level visibility modifiers (private, protected).
+     */
+    private fun cleanModifiersForTopLevel(function: KtNamedFunction): String {
+        val modifierList = function.modifierList ?: return ""
+        val kept = modifierList.node.getChildren(null).filter { child ->
+            val type = child.elementType
+            type != KtTokens.PRIVATE_KEYWORD && type != KtTokens.PROTECTED_KEYWORD &&
+                type != KtTokens.WHITE_SPACE
+        }
+        if (kept.isEmpty()) return ""
+        return kept.joinToString(" ") { it.text } + " "
+    }
+
+    /**
+     * Adds "Move to companion object" code action for class members.
+     * Offers to move a function or property into the companion object of its containing class.
+     * Creates a companion object if none exists. Not offered when the body references `this`.
+     */
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.addMoveToCompanionAction(
+        element: PsiElement,
+        document: com.intellij.openapi.editor.Document,
+        fileUri: String,
+        actionsArray: JsonArray,
+    ) {
+        try {
+            val declaration = PsiTreeUtil.getParentOfType(element, KtNamedFunction::class.java, false)
+                ?: PsiTreeUtil.getParentOfType(element, KtProperty::class.java, false)
+                ?: return
+
+            // Must be a direct member of a class (not in a companion)
+            val parentClassBody = declaration.parent as? KtClassBody ?: return
+            val parentClassOrObject = parentClassBody.parent
+            if (parentClassOrObject is KtObjectDeclaration && parentClassOrObject.isCompanion()) return
+            val containingClass = parentClassOrObject as? KtClass ?: return
+
+            // Don't offer if body references this
+            if (analyzeBodyReferences(declaration, containingClass).referencesThis) return
+
+            val action = JsonObject()
+            action.addProperty("title", "Move to companion object")
+            action.addProperty("kind", "refactor")
+            val actionEdits = JsonArray()
+
+            val memberText = declaration.text
+            val memberIndent = indentAt(document, declaration.textOffset)
+
+            actionEdits.add(makeDeleteEdit(document, fileUri, declaration))
+
+            // Find or create companion object
+            val companion = containingClass.companionObjects.firstOrNull()
+            if (companion != null) {
+                // Insert into existing companion — before the closing brace
+                val companionBody = companion.body
+                if (companionBody != null) {
+                    val closingBrace = companionBody.rBrace
+                    if (closingBrace != null) {
+                        val (insertLine, insertCol) = offsetToLineCol(document, closingBrace.textOffset)
+                        val companionIndent = memberIndent + "    "
+                        val reindentedText = memberText.lines().joinToString("\n") { line ->
+                            if (line.isBlank()) line else "$companionIndent$line".trimEnd()
+                        }
+                        actionEdits.add(makeEdit(fileUri, insertLine, insertCol, insertLine, insertCol,
+                            "$reindentedText\n$memberIndent"))
+                    }
+                }
+            } else {
+                // Create companion object — insert before closing brace of the class
+                val classBody = containingClass.body
+                if (classBody != null) {
+                    val closingBrace = classBody.rBrace
+                    if (closingBrace != null) {
+                        val (insertLine, insertCol) = offsetToLineCol(document, closingBrace.textOffset)
+                        val companionIndent = memberIndent + "    "
+                        val reindentedMember = memberText.lines().joinToString("\n") { line ->
+                            if (line.isBlank()) line else "$companionIndent    $line".trimEnd()
+                        }
+                        val companionText = "${memberIndent}companion object {\n$reindentedMember\n$memberIndent}\n"
+                        actionEdits.add(makeEdit(fileUri, insertLine, insertCol, insertLine, insertCol,
+                            "\n$companionText$memberIndent"))
+                    }
+                }
+            }
+
+            action.add("edits", actionEdits)
+            actionsArray.add(action)
+        } catch (_: Exception) {
+            // Ignore failures
+        }
+    }
+
+    /**
+     * Adds "Move from companion object" code action for companion object members.
+     * Moves a function or property from the companion object to the enclosing class body.
+     * If the companion becomes empty after the move, it is deleted.
+     */
+    private fun addMoveFromCompanionAction(
+        element: PsiElement,
+        document: com.intellij.openapi.editor.Document,
+        fileUri: String,
+        actionsArray: JsonArray,
+    ) {
+        try {
+            val declaration = PsiTreeUtil.getParentOfType(element, KtNamedFunction::class.java, false)
+                ?: PsiTreeUtil.getParentOfType(element, KtProperty::class.java, false)
+                ?: return
+
+            // Must be inside a companion object
+            val companionBody = declaration.parent as? KtClassBody ?: return
+            val companion = companionBody.parent as? KtObjectDeclaration ?: return
+            if (!companion.isCompanion()) return
+
+            // Must have an enclosing class
+            val containingClass = companion.parent?.parent as? KtClass ?: return
+
+            val action = JsonObject()
+            action.addProperty("title", "Move from companion object")
+            action.addProperty("kind", "refactor")
+            val actionEdits = JsonArray()
+
+            val memberText = declaration.text
+
+            // Calculate indent of the containing class members
+            val classBody = containingClass.body ?: return
+            val classIndent = indentAt(document, containingClass.textOffset)
+            val memberIndent = classIndent + "    "
+
+            // Check if companion will be empty after removal
+            val companionDeclarations = companionBody.declarations
+            val willBeEmpty = companionDeclarations.size == 1 && companionDeclarations.first() == declaration
+
+            if (willBeEmpty) {
+                // Delete the entire companion object (including preceding whitespace)
+                val docText = document.charsSequence
+                var companionDeleteStart = companion.textOffset
+                var companionDeleteEnd = companion.textRange.endOffset
+                val companionLine = document.getLineNumber(companionDeleteStart)
+                if (companionLine > 0) {
+                    companionDeleteStart = document.getLineStartOffset(companionLine)
+                }
+                if (companionDeleteEnd < docText.length && docText[companionDeleteEnd] == '\n') {
+                    companionDeleteEnd++
+                }
+                val (compStartLine, compStartCol) = offsetToLineCol(document, companionDeleteStart)
+                val (compEndLine, compEndCol) = offsetToLineCol(document, companionDeleteEnd)
+                actionEdits.add(makeEdit(fileUri, compStartLine, compStartCol, compEndLine, compEndCol, ""))
+            } else {
+                // Just delete the member from the companion
+                actionEdits.add(makeDeleteEdit(document, fileUri, declaration))
+            }
+
+            // Insert the member into the class body — before the companion object
+            val companionOffset = companion.textOffset
+            val companionLine = document.getLineNumber(companionOffset)
+            val insertOffset = document.getLineStartOffset(companionLine)
+            val (insertLine, insertCol) = offsetToLineCol(document, insertOffset)
+
+            val reindentedText = memberText.lines().joinToString("\n") { line ->
+                if (line.isBlank()) line else "$memberIndent${line.trimStart()}".trimEnd()
+            }
+            actionEdits.add(makeEdit(fileUri, insertLine, insertCol, insertLine, insertCol,
+                "$reindentedText\n\n"))
+
+            action.add("edits", actionEdits)
+            actionsArray.add(action)
+        } catch (_: Exception) {
+            // Ignore failures
+        }
+    }
+
+    /**
+     * Adds "Move to top level" code action for class member functions.
+     * If the function body references `this`, a `self: ClassName` parameter is added and
+     * `this` references are rewritten to `self`. Same-file call sites are updated.
+     * Not offered for `override` functions.
+     */
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.addMoveToTopLevelAction(
+        element: PsiElement,
+        document: com.intellij.openapi.editor.Document,
+        fileUri: String,
+        actionsArray: JsonArray,
+        ktFile: KtFile,
+    ) {
+        try {
+            val function = PsiTreeUtil.getParentOfType(element, KtNamedFunction::class.java, false)
+                ?: return
+
+            // Must be a class member
+            val containingClassBody = function.parent as? KtClassBody ?: return
+            val containingClass = containingClassBody.parent as? KtClass ?: return
+
+            // Don't offer for override functions
+            if (function.hasModifier(KtTokens.OVERRIDE_KEYWORD)) return
+
+            val funcName = function.name ?: return
+            val className = containingClass.name ?: return
+
+            // Don't offer if class has type parameters (complex generic propagation)
+            if (containingClass.typeParameters.isNotEmpty()) return
+
+            val action = JsonObject()
+            action.addProperty("title", "Move to top level")
+            action.addProperty("kind", "refactor")
+            val actionEdits = JsonArray()
+
+            val usesThis = analyzeBodyReferences(function, containingClass).referencesThis
+
+            // Build the top-level function signature
+            val cleanModifiers = cleanModifiersForTopLevel(function)
+            val typeParams = function.typeParameterList?.text?.let { "$it " } ?: ""
+            val returnType = function.typeReference?.text?.let { ": $it" } ?: ""
+            val paramList = function.valueParameterList?.text ?: "()"
+            val receiverType = function.receiverTypeReference?.text
+
+            val newParamList = if (usesThis) {
+                val existingParams = paramList.removeSurrounding("(", ")")
+                if (existingParams.isBlank()) "(self: $className)" else "(self: $className, $existingParams)"
+            } else {
+                paramList
+            }
+
+            val bodyExpr = function.bodyExpression ?: return
+            var bodyText = bodyExpr.text
+            if (usesThis) {
+                // Replace KtThisExpression nodes with "self" using PSI offsets
+                val thisExprs = PsiTreeUtil.findChildrenOfType(bodyExpr, KtThisExpression::class.java)
+                    .sortedByDescending { it.textOffset }
+                val bodyStart = bodyExpr.textOffset
+                val sb = StringBuilder(bodyText)
+                for (thisExpr in thisExprs) {
+                    val relStart = thisExpr.textOffset - bodyStart
+                    val relEnd = thisExpr.textRange.endOffset - bodyStart
+                    sb.replace(relStart, relEnd, "self")
+                }
+                bodyText = sb.toString()
+            }
+
+            val receiverPrefix = if (receiverType != null) "$receiverType." else ""
+            val newFuncText = "${cleanModifiers}fun $typeParams$receiverPrefix$funcName$newParamList$returnType $bodyText"
+
+            actionEdits.add(makeDeleteEdit(document, fileUri, function))
+            actionEdits.add(makeAppendToFileEdit(document, fileUri, newFuncText))
+
+            // Update same-file call sites (scoped to containing class body)
+            if (usesThis) {
+                val callSites = mutableListOf<KtCallExpression>()
+                containingClassBody.accept(object : org.jetbrains.kotlin.psi.KtTreeVisitorVoid() {
+                    override fun visitCallExpression(expression: KtCallExpression) {
+                        super.visitCallExpression(expression)
+                        val callee = expression.calleeExpression
+                        if (callee is KtSimpleNameExpression && callee.getReferencedName() == funcName) {
+                            // Don't update the call inside the function itself
+                            if (!PsiTreeUtil.isAncestor(function, expression, true)) {
+                                callSites.add(expression)
+                            }
+                        }
+                    }
+                })
+
+                // Process call sites in reverse order to preserve offsets
+                for (call in callSites.sortedByDescending { it.textOffset }) {
+                    val parent = call.parent
+                    val argList = call.valueArgumentList
+                    val existingArgs = argList?.arguments?.joinToString(", ") { it.text } ?: ""
+
+                    if (parent is KtDotQualifiedExpression) {
+                        // obj.foo(a) → foo(obj, a)
+                        val receiver = parent.receiverExpression.text
+                        val newArgs = if (existingArgs.isBlank()) receiver else "$receiver, $existingArgs"
+                        val newCallText = "$funcName($newArgs)"
+                        val (csStartLine, csStartCol) = offsetToLineCol(document, parent.textOffset)
+                        val (csEndLine, csEndCol) = offsetToLineCol(document, parent.textRange.endOffset)
+                        actionEdits.add(makeEdit(fileUri, csStartLine, csStartCol, csEndLine, csEndCol, newCallText))
+                    } else {
+                        // foo(a) → foo(this, a) (implicit receiver)
+                        val newArgs = if (existingArgs.isBlank()) "this" else "this, $existingArgs"
+                        val newCallText = "$funcName($newArgs)"
+                        val (csStartLine, csStartCol) = offsetToLineCol(document, call.textOffset)
+                        val (csEndLine, csEndCol) = offsetToLineCol(document, call.textRange.endOffset)
+                        actionEdits.add(makeEdit(fileUri, csStartLine, csStartCol, csEndLine, csEndCol, newCallText))
+                    }
+                }
+            }
+
+            action.add("edits", actionEdits)
+            actionsArray.add(action)
+        } catch (_: Exception) {
+            // Ignore failures
+        }
+    }
+
+    /**
+     * Adds "Convert to extension function" code action for class member functions.
+     * Converts `fun foo(x: Int)` in `class Bar` to `fun Bar.foo(x: Int)` at top level.
+     * Not offered when body accesses private members, function is `override`,
+     * or containing class has type parameters.
+     */
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.addConvertToExtensionFunctionAction(
+        element: PsiElement,
+        document: com.intellij.openapi.editor.Document,
+        fileUri: String,
+        actionsArray: JsonArray,
+    ) {
+        try {
+            val function = PsiTreeUtil.getParentOfType(element, KtNamedFunction::class.java, false)
+                ?: return
+
+            // Must be a class member, not in a companion object
+            val containingClassBody = function.parent as? KtClassBody ?: return
+            val parentClassOrObject = containingClassBody.parent
+            if (parentClassOrObject is KtObjectDeclaration && parentClassOrObject.isCompanion()) return
+            val containingClass = parentClassOrObject as? KtClass ?: return
+
+            // Don't offer for override functions
+            if (function.hasModifier(KtTokens.OVERRIDE_KEYWORD)) return
+
+            // Don't offer if class has type parameters
+            if (containingClass.typeParameters.isNotEmpty()) return
+
+            // Don't offer if body accesses private members
+            if (analyzeBodyReferences(function, containingClass).accessesPrivateMembers) return
+
+            val funcName = function.name ?: return
+            val className = containingClass.name ?: return
+
+            val action = JsonObject()
+            action.addProperty("title", "Convert to extension function")
+            action.addProperty("kind", "refactor")
+            val actionEdits = JsonArray()
+
+            // Build extension function signature
+            val cleanModifiers = cleanModifiersForTopLevel(function)
+            val typeParams = function.typeParameterList?.text?.let { "$it " } ?: ""
+            val paramList = function.valueParameterList?.text ?: "()"
+            val returnType = function.typeReference?.text?.let { ": $it" } ?: ""
+            val bodyText = function.bodyExpression?.text ?: return
+
+            val extFuncText = "${cleanModifiers}fun $typeParams$className.$funcName$paramList$returnType $bodyText"
+
+            actionEdits.add(makeDeleteEdit(document, fileUri, function))
+            actionEdits.add(makeAppendToFileEdit(document, fileUri, extFuncText))
+
+            action.add("edits", actionEdits)
+            actionsArray.add(action)
+        } catch (_: Exception) {
+            // Ignore failures
+        }
     }
 
     /**
