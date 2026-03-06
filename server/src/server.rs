@@ -818,7 +818,7 @@ impl LanguageServer for KotlinLanguageServer {
                         }
                     }
 
-                    // --- Project-wide background analysis ---
+                    // --- Project-wide background analysis (streaming) ---
                     let bg_bridge = Arc::clone(&bridge_holder);
                     let bg_documents = Arc::clone(&documents_holder);
                     let bg_client = client.clone();
@@ -858,150 +858,15 @@ impl LanguageServer for KotlinLanguageServer {
                             )
                             .await;
 
-                        // Call analyzeAll with a generous timeout (5 minutes)
                         let bridge_arc = {
                             let guard = bg_bridge.lock().await;
                             guard.as_ref().map(Arc::clone)
                         };
-                        let analyze_result = match bridge_arc {
-                            Some(b) => {
-                                if b.state().await != SidecarState::Ready {
-                                    tracing::warn!(
-                                        "background analysis: sidecar not ready, skipping"
-                                    );
-                                    None
-                                } else {
-                                    Some(
-                                        b.request_with_timeout(
-                                            "analyzeAll",
-                                            None,
-                                            Duration::from_secs(300),
-                                        )
-                                        .await,
-                                    )
-                                }
-                            }
-                            None => None,
-                        };
 
-                        match analyze_result {
-                            Some(Ok(result)) => {
-                                let files = result.get("files").and_then(|f| f.as_array());
-                                let total_files = result
-                                    .get("totalFiles")
-                                    .and_then(|t| t.as_u64())
-                                    .unwrap_or(0);
-                                let total_errors = result
-                                    .get("totalErrors")
-                                    .and_then(|e| e.as_u64())
-                                    .unwrap_or(0);
-                                let total_warnings = result
-                                    .get("totalWarnings")
-                                    .and_then(|w| w.as_u64())
-                                    .unwrap_or(0);
-
-                                if let Some(files) = files {
-                                    let mut processed = 0u64;
-                                    let mut _published = 0u64;
-                                    for file_entry in files {
-                                        processed += 1;
-
-                                        let uri_str =
-                                            match file_entry.get("uri").and_then(|u| u.as_str()) {
-                                                Some(u) => u,
-                                                None => continue,
-                                            };
-
-                                        let uri = match Url::parse(uri_str) {
-                                            Ok(u) => u,
-                                            Err(e) => {
-                                                tracing::warn!("background analysis: invalid URI from sidecar: {:?} ({})", uri_str, e);
-                                                continue;
-                                            }
-                                        };
-
-                                        // Skip files that are currently open — their diagnostics
-                                        // from the replay loop are fresher
-                                        {
-                                            let docs = bg_documents.lock().await;
-                                            if docs.get(&uri).is_some() {
-                                                continue;
-                                            }
-                                        }
-
-                                        let diagnostics = parse_diagnostics_static(file_entry);
-
-                                        // Only publish and cache files with actual diagnostics
-                                        if !diagnostics.is_empty() {
-                                            {
-                                                let mut docs = bg_documents.lock().await;
-                                                docs.set_diagnostics(
-                                                    uri.clone(),
-                                                    diagnostics.clone(),
-                                                );
-                                            }
-                                            bg_client
-                                                .publish_diagnostics(uri, diagnostics, None)
-                                                .await;
-                                            _published += 1;
-                                        }
-
-                                        // Report progress periodically
-                                        if total_files > 0 && processed % 10 == 0 {
-                                            let pct = ((processed as f64 / total_files as f64)
-                                                * 100.0)
-                                                as u32;
-                                            bg_client
-                                                .send_notification::<lsp_types::notification::Progress>(ProgressParams {
-                                                    token: bg_token.clone(),
-                                                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
-                                                        WorkDoneProgressReport {
-                                                            message: Some(format!("Processed {}/{} files", processed, total_files)),
-                                                            percentage: Some(pct),
-                                                            cancellable: Some(false),
-                                                        },
-                                                    )),
-                                                })
-                                                .await;
-                                        }
-                                    }
-
-                                    let summary = format!(
-                                        "Complete — {} error(s), {} warning(s) in {} file(s)",
-                                        total_errors, total_warnings, total_files
-                                    );
-                                    tracing::info!("background analysis: {}", summary);
-
-                                    bg_client
-                                        .send_notification::<lsp_types::notification::Progress>(
-                                            ProgressParams {
-                                                token: bg_token.clone(),
-                                                value: ProgressParamsValue::WorkDone(
-                                                    WorkDoneProgress::End(WorkDoneProgressEnd {
-                                                        message: Some(summary),
-                                                    }),
-                                                ),
-                                            },
-                                        )
-                                        .await;
-                                }
-                            }
-                            Some(Err(e)) => {
-                                tracing::warn!("background analysis failed: {}", e);
-                                bg_client
-                                    .send_notification::<lsp_types::notification::Progress>(
-                                        ProgressParams {
-                                            token: bg_token.clone(),
-                                            value: ProgressParamsValue::WorkDone(
-                                                WorkDoneProgress::End(WorkDoneProgressEnd {
-                                                    message: Some(format!("Failed: {}", e)),
-                                                }),
-                                            ),
-                                        },
-                                    )
-                                    .await;
-                            }
-                            None => {
+                        let bridge = match bridge_arc {
+                            Some(b) if b.state().await == SidecarState::Ready => b,
+                            _ => {
+                                tracing::warn!("background analysis: sidecar not ready, skipping");
                                 bg_client
                                     .send_notification::<lsp_types::notification::Progress>(
                                         ProgressParams {
@@ -1016,8 +881,202 @@ impl LanguageServer for KotlinLanguageServer {
                                         },
                                     )
                                     .await;
+                                return;
+                            }
+                        };
+
+                        // Subscribe to streaming notifications before sending analyzeAll
+                        let mut notification_rx = bridge.subscribe_notifications().await;
+
+                        // Send analyzeAll — sidecar returns an immediate ack and streams
+                        // per-file diagnostics as "diagnostics/progress" notifications
+                        match bridge.request("analyzeAll", None).await {
+                            Ok(_ack) => {
+                                tracing::debug!("background analysis: analyzeAll ack received, consuming streaming notifications");
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "background analysis: analyzeAll request failed: {}",
+                                    e
+                                );
+                                bg_client
+                                    .send_notification::<lsp_types::notification::Progress>(
+                                        ProgressParams {
+                                            token: bg_token.clone(),
+                                            value: ProgressParamsValue::WorkDone(
+                                                WorkDoneProgress::End(WorkDoneProgressEnd {
+                                                    message: Some(format!("Failed: {}", e)),
+                                                }),
+                                            ),
+                                        },
+                                    )
+                                    .await;
+                                return;
                             }
                         }
+
+                        // Consume streaming diagnostics/progress notifications
+                        let mut total_errors = 0u64;
+                        let mut total_warnings = 0u64;
+                        let mut processed = 0u64;
+                        let mut total_files = 0u64;
+
+                        // Use a 5-minute overall timeout for the streaming phase
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+
+                        loop {
+                            match tokio::time::timeout_at(deadline, notification_rx.recv()).await {
+                                Ok(Some(notification))
+                                    if notification.method == "diagnostics/progress" =>
+                                {
+                                    let params = match notification.params {
+                                        Some(p) => p,
+                                        None => continue,
+                                    };
+
+                                    // Extract progress info
+                                    if let Some(progress) = params.get("progress") {
+                                        total_files = progress
+                                            .get("total")
+                                            .and_then(|t| t.as_u64())
+                                            .unwrap_or(total_files);
+                                    }
+                                    processed += 1;
+
+                                    let uri_str = match params.get("uri").and_then(|u| u.as_str()) {
+                                        Some(u) => u,
+                                        None => continue,
+                                    };
+
+                                    let uri = match Url::parse(uri_str) {
+                                        Ok(u) => u,
+                                        Err(e) => {
+                                            tracing::warn!("background analysis: invalid URI from sidecar: {:?} ({})", uri_str, e);
+                                            continue;
+                                        }
+                                    };
+
+                                    // Skip files that are currently open
+                                    {
+                                        let docs = bg_documents.lock().await;
+                                        if docs.get(&uri).is_some() {
+                                            // Check if we're done
+                                            if let Some(progress) = params.get("progress") {
+                                                let current = progress
+                                                    .get("current")
+                                                    .and_then(|c| c.as_u64())
+                                                    .unwrap_or(0);
+                                                let total = progress
+                                                    .get("total")
+                                                    .and_then(|t| t.as_u64())
+                                                    .unwrap_or(0);
+                                                if total > 0 && current >= total {
+                                                    break;
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                    }
+
+                                    let diagnostics = parse_diagnostics_static(&params);
+
+                                    // Count errors and warnings
+                                    for d in &diagnostics {
+                                        match d.severity {
+                                            Some(lsp_types::DiagnosticSeverity::ERROR) => {
+                                                total_errors += 1
+                                            }
+                                            Some(lsp_types::DiagnosticSeverity::WARNING) => {
+                                                total_warnings += 1
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+
+                                    // Only publish files with actual diagnostics
+                                    if !diagnostics.is_empty() {
+                                        {
+                                            let mut docs = bg_documents.lock().await;
+                                            docs.set_diagnostics(uri.clone(), diagnostics.clone());
+                                        }
+                                        bg_client.publish_diagnostics(uri, diagnostics, None).await;
+                                    }
+
+                                    // Report progress periodically
+                                    if total_files > 0 && processed % 10 == 0 {
+                                        let pct = ((processed as f64 / total_files as f64) * 100.0)
+                                            .min(100.0)
+                                            as u32;
+                                        bg_client
+                                            .send_notification::<lsp_types::notification::Progress>(
+                                                ProgressParams {
+                                                    token: bg_token.clone(),
+                                                    value: ProgressParamsValue::WorkDone(
+                                                        WorkDoneProgress::Report(
+                                                            WorkDoneProgressReport {
+                                                                message: Some(format!(
+                                                                    "Processed {}/{} files",
+                                                                    processed, total_files
+                                                                )),
+                                                                percentage: Some(pct),
+                                                                cancellable: Some(false),
+                                                            },
+                                                        ),
+                                                    ),
+                                                },
+                                            )
+                                            .await;
+                                    }
+
+                                    // Check if this was the last file
+                                    if let Some(progress) = params.get("progress") {
+                                        let current = progress
+                                            .get("current")
+                                            .and_then(|c| c.as_u64())
+                                            .unwrap_or(0);
+                                        let total = progress
+                                            .get("total")
+                                            .and_then(|t| t.as_u64())
+                                            .unwrap_or(0);
+                                        if total > 0 && current >= total {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Ok(Some(_other)) => {
+                                    // Ignore non-diagnostics notifications
+                                }
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        "background analysis: notification channel closed"
+                                    );
+                                    break;
+                                }
+                                Err(_) => {
+                                    tracing::warn!("background analysis: timed out waiting for streaming results");
+                                    break;
+                                }
+                            }
+                        }
+
+                        let summary = format!(
+                            "Complete — {} error(s), {} warning(s) in {} file(s)",
+                            total_errors, total_warnings, processed
+                        );
+                        tracing::info!("background analysis: {}", summary);
+
+                        bg_client
+                            .send_notification::<lsp_types::notification::Progress>(
+                                ProgressParams {
+                                    token: bg_token.clone(),
+                                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                        WorkDoneProgressEnd {
+                                            message: Some(summary),
+                                        },
+                                    )),
+                                },
+                            )
+                            .await;
                     });
                 }
                 Err(e) => {

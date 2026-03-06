@@ -106,6 +106,27 @@ class JsonRpcTransport(
         )
     }
 
+    /**
+     * Sends a JSON-RPC notification (no id, no response expected).
+     * Used for streaming results like per-file diagnostics during analyzeAll.
+     */
+    fun sendNotification(method: String, params: JsonObject) {
+        val obj = JsonObject()
+        obj.addProperty("jsonrpc", "2.0")
+        obj.addProperty("method", method)
+        obj.add("params", params)
+
+        val json = gson.toJson(obj)
+        val bytes = json.toByteArray(Charsets.UTF_8)
+
+        synchronized(writer) {
+            writer.write("Content-Length: ${bytes.size}\r\n")
+            writer.write("\r\n")
+            writer.write(json)
+            writer.flush()
+        }
+    }
+
     private fun readContentLength(): Int? {
         var contentLength: Int? = null
 

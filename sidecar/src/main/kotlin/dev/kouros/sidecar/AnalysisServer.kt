@@ -150,8 +150,23 @@ class AnalysisServer(
     }
 
     private fun handleAnalyzeAll(request: JsonRpcRequest) {
-        val result = bridge.analyzeAll()
-        transport.sendResult(request.id, result)
+        // Send immediate ack so the Rust LSP knows analysis has started
+        val ack = JsonObject()
+        ack.addProperty("started", true)
+        transport.sendResult(request.id, ack)
+
+        // Run analysis on a background thread, streaming per-file diagnostics
+        // as JSON-RPC notifications to avoid blocking the event loop
+        Thread({
+            try {
+                bridge.analyzeAllStreaming { notification ->
+                    transport.sendNotification("diagnostics/progress", notification)
+                }
+            } catch (e: Throwable) {
+                System.err.println("AnalysisServer: background analyzeAll failed: ${e.javaClass.name}: ${e.message}")
+                e.printStackTrace(System.err)
+            }
+        }, "analyzeAll-background").start()
     }
 
     private fun handleHover(request: JsonRpcRequest) {

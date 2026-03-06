@@ -630,6 +630,113 @@ class CompilerBridge {
     }
 
     /**
+     * Analyzes all source files and streams per-file diagnostics via a callback.
+     * Each callback invocation receives a JsonObject with uri, diagnostics, and progress.
+     * Runs on the calling thread — the caller is responsible for running this on a
+     * background thread to avoid blocking the event loop.
+     */
+    fun analyzeAllStreaming(onFileAnalyzed: (JsonObject) -> Unit) {
+        val currentSession = session
+        if (currentSession == null) {
+            System.err.println("CompilerBridge: analyzeAllStreaming() — session is NULL, nothing to stream")
+            return
+        }
+
+        val allKtFiles = currentSession.modulesWithFiles.entries
+            .flatMap { (_, files) -> files }
+            .filterIsInstance<KtFile>()
+
+        // Filter out build scripts and build directories
+        val filesToAnalyze = allKtFiles.filter { ktFile ->
+            val filePath = ktFile.virtualFile.path
+            !filePath.endsWith(".gradle.kts") &&
+                !(filePath.endsWith(".kts") && ("/buildSrc/" in filePath || "/gradle/" in filePath)) &&
+                "/build/" !in filePath &&
+                "/.gradle/" !in filePath
+        }
+
+        val totalFiles = filesToAnalyze.size
+        System.err.println("CompilerBridge: analyzeAllStreaming() — $totalFiles file(s) to analyze")
+
+        var current = 0
+
+        for (ktFile in filesToAnalyze) {
+            current++
+            val filePath = ktFile.virtualFile.path
+            val fileUri = "file://$filePath"
+
+            // Use virtual content if the file is open in the editor
+            val effectiveKtFile = if (virtualFiles.containsKey(fileUri)) {
+                findKtFile(currentSession, fileUri) ?: ktFile
+            } else {
+                ktFile
+            }
+
+            val notification = JsonObject()
+            notification.addProperty("uri", fileUri)
+            val diagnosticsArray = JsonArray()
+
+            try {
+                analyze(effectiveKtFile) {
+                    val diagnostics = effectiveKtFile.collectDiagnostics(
+                        KaDiagnosticCheckerFilter.EXTENDED_AND_COMMON_CHECKERS
+                    )
+
+                    for (diagnostic in diagnostics) {
+                        val diagObj = JsonObject()
+                        diagObj.addProperty("severity", diagnostic.severity.name)
+                        diagObj.addProperty("message", diagnostic.defaultMessage)
+                        diagObj.addProperty("code", diagnostic.factoryName)
+
+                        val textRange = diagnostic.textRanges.firstOrNull()
+                        if (textRange != null) {
+                            try {
+                                val document = effectiveKtFile.viewProvider.document
+                                if (document != null) {
+                                    val startLine = document.getLineNumber(textRange.startOffset) + 1
+                                    val startLineOffset = document.getLineStartOffset(
+                                        document.getLineNumber(textRange.startOffset)
+                                    )
+                                    val startCol = textRange.startOffset - startLineOffset
+
+                                    val endLine = document.getLineNumber(textRange.endOffset) + 1
+                                    val endLineOffset = document.getLineStartOffset(
+                                        document.getLineNumber(textRange.endOffset)
+                                    )
+                                    val endCol = textRange.endOffset - endLineOffset
+
+                                    diagObj.addProperty("line", startLine)
+                                    diagObj.addProperty("column", startCol)
+                                    diagObj.addProperty("endLine", endLine)
+                                    diagObj.addProperty("endColumn", endCol)
+                                }
+                            } catch (_: Exception) {
+                                // Position extraction failed, skip position info
+                            }
+                        }
+
+                        diagnosticsArray.add(diagObj)
+                    }
+                }
+            } catch (e: Throwable) {
+                System.err.println("CompilerBridge: analyzeAllStreaming() — error analyzing $filePath: ${e.javaClass.name}: ${e.message}")
+            }
+
+            notification.add("diagnostics", diagnosticsArray)
+
+            // Add progress info
+            val progress = JsonObject()
+            progress.addProperty("current", current)
+            progress.addProperty("total", totalFiles)
+            notification.add("progress", progress)
+
+            onFileAnalyzed(notification)
+        }
+
+        System.err.println("CompilerBridge: analyzeAllStreaming() — completed $current/$totalFiles files")
+    }
+
+    /**
      * Provides hover information at the given position.
      * Returns type/signature information with KDoc documentation when available.
      */
