@@ -1180,6 +1180,9 @@ impl LanguageServer for KotlinLanguageServer {
             .await
         {
             Ok(result) => {
+                if let Some(reason) = result.get("reason").and_then(|r| r.as_str()) {
+                    tracing::debug!("completion: sidecar reported: {}", reason);
+                }
                 let items = self.parse_completion_items(&result);
                 Ok(Some(CompletionResponse::Array(items)))
             }
@@ -1225,6 +1228,9 @@ impl LanguageServer for KotlinLanguageServer {
         {
             Ok(result) => {
                 tracing::debug!("hover: sidecar returned: {}", result);
+                if let Some(reason) = result.get("reason").and_then(|r| r.as_str()) {
+                    tracing::debug!("hover: sidecar reported: {}", reason);
+                }
                 if let Some(contents) = result.get("contents").and_then(|c| c.as_str()) {
                     Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
@@ -1269,6 +1275,9 @@ impl LanguageServer for KotlinLanguageServer {
             .await
         {
             Ok(result) => {
+                if let Some(reason) = result.get("reason").and_then(|r| r.as_str()) {
+                    tracing::debug!("goto_definition: sidecar reported: {}", reason);
+                }
                 let locations = self.parse_locations(&result);
                 if locations.is_empty() {
                     Ok(None)
@@ -1309,6 +1318,9 @@ impl LanguageServer for KotlinLanguageServer {
             .await
         {
             Ok(result) => {
+                if let Some(reason) = result.get("reason").and_then(|r| r.as_str()) {
+                    tracing::debug!("references: sidecar reported: {}", reason);
+                }
                 let locations = self.parse_locations(&result);
                 if locations.is_empty() {
                     Ok(None)
@@ -1599,6 +1611,9 @@ impl LanguageServer for KotlinLanguageServer {
         {
             Ok(result) => {
                 tracing::debug!("code_action: raw sidecar response for {}: {}", uri, result);
+                if let Some(reason) = result.get("reason").and_then(|r| r.as_str()) {
+                    tracing::debug!("code_action: sidecar reported: {}", reason);
+                }
                 let actions = self.parse_code_actions(&result);
                 tracing::debug!(
                     "code_action: parsed {} action(s) for {} at L{}:{}",
