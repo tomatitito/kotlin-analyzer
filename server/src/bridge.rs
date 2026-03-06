@@ -63,7 +63,11 @@ pub struct Bridge {
 impl Bridge {
     /// Creates a new bridge but does not start the sidecar yet.
     pub fn new(sidecar_jar: PathBuf, java_path: PathBuf, config: Config) -> Self {
-        tracing::debug!("Bridge::new called with sidecar_jar: {:?}, java_path: {:?}", sidecar_jar, java_path);
+        tracing::debug!(
+            "Bridge::new called with sidecar_jar: {:?}, java_path: {:?}",
+            sidecar_jar,
+            java_path
+        );
         let (request_tx, _request_rx) = mpsc::channel(32);
         let (state_watch_tx, state_watch_rx) = watch::channel(SidecarState::Stopped);
 
@@ -91,7 +95,11 @@ impl Bridge {
     }
 
     /// Updates the state and notifies all watchers (request buffering).
-    async fn set_state(state: &Mutex<SidecarState>, watch_tx: &watch::Sender<SidecarState>, new_state: SidecarState) {
+    async fn set_state(
+        state: &Mutex<SidecarState>,
+        watch_tx: &watch::Sender<SidecarState>,
+        new_state: SidecarState,
+    ) {
         let mut s = state.lock().await;
         *s = new_state;
         let _ = watch_tx.send(new_state);
@@ -204,9 +212,9 @@ impl Bridge {
             tracing::warn!("cancelling {} pending request(s): {}", count, reason);
         }
         for req in reqs.drain(..) {
-            let _ = req.response_tx.send(Err(
-                Error::Bridge(BridgeError::Crashed(reason.to_string()))
-            ));
+            let _ = req
+                .response_tx
+                .send(Err(Error::Bridge(BridgeError::Crashed(reason.to_string()))));
         }
     }
 
@@ -265,9 +273,7 @@ impl Bridge {
             .stdout
             .take()
             .ok_or_else(|| BridgeError::SpawnFailed("failed to capture stdout".into()))?;
-        let stderr = child
-            .stderr
-            .take();
+        let stderr = child.stderr.take();
 
         // Store the child process handle to prevent kill_on_drop from firing
         {
@@ -394,11 +400,7 @@ impl Bridge {
                 tracing::info!("sidecar ready");
 
                 // Start health check heartbeat
-                Self::start_health_check(
-                    Arc::clone(self),
-                    tx.clone(),
-                    &self.request_id,
-                );
+                Self::start_health_check(Arc::clone(self), tx.clone(), &self.request_id);
 
                 // Reset restart counter on successful start
                 let mut restart_count = self.restart_count.lock().await;
@@ -441,7 +443,10 @@ impl Bridge {
                 // Starting: sidecar is booting up, wait for Ready.
                 // Degraded: a restart may be in progress — wait to see if
                 // the state transitions to Starting/Ready before giving up.
-                tracing::debug!("waiting for sidecar to become Ready (current: {:?})", current);
+                tracing::debug!(
+                    "waiting for sidecar to become Ready (current: {:?})",
+                    current
+                );
             }
         }
 
@@ -455,9 +460,11 @@ impl Bridge {
                 match state {
                     SidecarState::Ready => return Ok(()),
                     SidecarState::Stopped => {
-                        return Err(BridgeError::NotReady(
-                            format!("sidecar transitioned to {:?} while waiting", state),
-                        ).into());
+                        return Err(BridgeError::NotReady(format!(
+                            "sidecar transitioned to {:?} while waiting",
+                            state
+                        ))
+                        .into());
                     }
                     SidecarState::Starting | SidecarState::Degraded => {
                         // Keep waiting — restart may be in progress
@@ -480,15 +487,25 @@ impl Bridge {
     /// If the sidecar is still starting, waits up to 30 seconds for it to
     /// become Ready before sending the request.
     pub async fn request(&self, method: &str, params: Option<Value>) -> Result<Value, Error> {
-        self.request_with_timeout(method, params, Duration::from_secs(60)).await
+        self.request_with_timeout(method, params, Duration::from_secs(60))
+            .await
     }
 
     /// Sends a JSON-RPC request with a custom response timeout.
     /// Used for long-running operations like project-wide analysis.
-    pub async fn request_with_timeout(&self, method: &str, params: Option<Value>, timeout: Duration) -> Result<Value, Error> {
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, Error> {
         self.wait_for_ready(Duration::from_secs(30)).await?;
 
-        tracing::debug!("Sending request '{}' to sidecar (timeout: {:?})", method, timeout);
+        tracing::debug!(
+            "Sending request '{}' to sidecar (timeout: {:?})",
+            method,
+            timeout
+        );
 
         let id = self.next_id();
         let request = Request::new(id, method, params);
@@ -532,16 +549,20 @@ impl Bridge {
     /// Attempts to restart the sidecar after it enters the Degraded state.
     /// Uses exponential backoff (2s, 4s, 8s, 16s, 32s) up to MAX_RESTART_ATTEMPTS.
     /// Called from the health check loop and reader EOF handler.
-    fn try_restart(bridge: Arc<Self>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    fn try_restart(
+        bridge: Arc<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         Box::pin(async move {
             let attempt = {
                 let mut count = bridge.restart_count.lock().await;
                 if *count >= MAX_RESTART_ATTEMPTS {
                     tracing::error!(
                         "sidecar restart limit reached ({}/{}), giving up",
-                        *count, MAX_RESTART_ATTEMPTS,
+                        *count,
+                        MAX_RESTART_ATTEMPTS,
                     );
-                    Self::set_state(&bridge.state, &bridge.state_watch_tx, SidecarState::Stopped).await;
+                    Self::set_state(&bridge.state, &bridge.state_watch_tx, SidecarState::Stopped)
+                        .await;
                     return;
                 }
                 *count += 1;
@@ -552,7 +573,9 @@ impl Bridge {
             let delay = Duration::from_secs(1 << attempt);
             tracing::warn!(
                 "sidecar restart attempt {}/{} in {:?}",
-                attempt, MAX_RESTART_ATTEMPTS, delay,
+                attempt,
+                MAX_RESTART_ATTEMPTS,
+                delay,
             );
             time::sleep(delay).await;
 
@@ -589,7 +612,12 @@ impl Bridge {
                 }
                 Err(e) => {
                     tracing::error!("sidecar restart failed (attempt {}): {}", attempt, e);
-                    Self::set_state(&bridge.state, &bridge.state_watch_tx, SidecarState::Degraded).await;
+                    Self::set_state(
+                        &bridge.state,
+                        &bridge.state_watch_tx,
+                        SidecarState::Degraded,
+                    )
+                    .await;
                     // Schedule another attempt
                     tokio::spawn(Self::try_restart(bridge));
                 }
@@ -645,7 +673,11 @@ impl Bridge {
         };
 
         let mut pending = pending.lock().await;
-        tracing::debug!("Looking for pending request with id {}, have {} pending requests", id, pending.len());
+        tracing::debug!(
+            "Looking for pending request with id {}, have {} pending requests",
+            id,
+            pending.len()
+        );
         if let Some(pos) = pending.iter().position(|p| p.id == id) {
             let req = pending.remove(pos);
             let result = if let Some(error) = response.error {
@@ -776,7 +808,12 @@ mod tests {
             Config::default(),
         );
         // Set state to Starting
-        Bridge::set_state(&bridge.state, &bridge.state_watch_tx, SidecarState::Starting).await;
+        Bridge::set_state(
+            &bridge.state,
+            &bridge.state_watch_tx,
+            SidecarState::Starting,
+        )
+        .await;
 
         let state_ref = Arc::clone(&bridge.state);
         let watch_tx = Arc::clone(&bridge.state_watch_tx);
@@ -798,7 +835,12 @@ mod tests {
             PathBuf::from("/usr/bin/java"),
             Config::default(),
         );
-        Bridge::set_state(&bridge.state, &bridge.state_watch_tx, SidecarState::Degraded).await;
+        Bridge::set_state(
+            &bridge.state,
+            &bridge.state_watch_tx,
+            SidecarState::Degraded,
+        )
+        .await;
 
         // Degraded now waits (restart may be in progress) then times out
         let result = bridge.wait_for_ready(Duration::from_millis(100)).await;
@@ -817,7 +859,10 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         {
             let mut p = pending.lock().await;
-            p.push(PendingRequest { id: 1, response_tx: tx });
+            p.push(PendingRequest {
+                id: 1,
+                response_tx: tx,
+            });
         }
 
         Bridge::cancel_all_pending(&pending, "test crash").await;

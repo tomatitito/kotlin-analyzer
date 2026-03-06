@@ -21,8 +21,7 @@ pub struct Document {
 
 impl DocumentStore {
     pub fn open(&mut self, uri: Url, text: String, version: i32) {
-        self.documents
-            .insert(uri, Document { text, version });
+        self.documents.insert(uri, Document { text, version });
     }
 
     pub fn change(&mut self, uri: &Url, text: String, version: i32) -> bool {

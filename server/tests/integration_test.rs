@@ -124,13 +124,17 @@ impl LspTestClient {
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Err(format!("Timeout waiting for response to {} (id={})", method, id).into());
+                return Err(
+                    format!("Timeout waiting for response to {} (id={})", method, id).into(),
+                );
             }
 
             let msg = match self.rx.recv_timeout(remaining) {
                 Ok(msg) => msg,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(format!("Timeout waiting for response to {} (id={})", method, id).into());
+                    return Err(
+                        format!("Timeout waiting for response to {} (id={})", method, id).into(),
+                    );
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err("Server stdout closed".into());
@@ -200,11 +204,7 @@ impl LspTestClient {
 
     /// Drain messages for the given duration, collecting notifications with the specified method.
     /// Server-initiated requests are answered with empty results.
-    fn collect_notifications(
-        &mut self,
-        method: &str,
-        timeout: Duration,
-    ) -> Vec<Value> {
+    fn collect_notifications(&mut self, method: &str, timeout: Duration) -> Vec<Value> {
         let mut notifications = Vec::new();
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -481,9 +481,10 @@ fun main() {
         .expect("Completion request failed");
 
     // Check we got completions — response may be an array or {items: [...]}
-    let items = response
-        .get("result")
-        .and_then(|r| r.as_array().or_else(|| r.get("items").and_then(|i| i.as_array())));
+    let items = response.get("result").and_then(|r| {
+        r.as_array()
+            .or_else(|| r.get("items").and_then(|i| i.as_array()))
+    });
 
     assert!(
         items.is_some() && !items.unwrap().is_empty(),
@@ -527,8 +528,7 @@ fn test_code_actions_returned_for_expression_body() {
     let result = response.get("result");
 
     // Result should be a non-null, non-empty array of code actions
-    let actions = result
-        .and_then(|r| if r.is_null() { None } else { r.as_array() });
+    let actions = result.and_then(|r| if r.is_null() { None } else { r.as_array() });
 
     assert!(
         actions.is_some() && !actions.unwrap().is_empty(),
@@ -589,17 +589,12 @@ fn test_diagnostics_persist_after_did_close() {
         .expect("Failed to send didOpen");
 
     // Collect publishDiagnostics — should eventually include errors for our file
-    let diags_after_open = client.collect_notifications(
-        "textDocument/publishDiagnostics",
-        Duration::from_secs(10),
-    );
+    let diags_after_open =
+        client.collect_notifications("textDocument/publishDiagnostics", Duration::from_secs(10));
 
     let has_errors = diags_after_open.iter().any(|n| {
         if let Some(params) = n.get("params") {
-            let diag_uri = params
-                .get("uri")
-                .and_then(|u| u.as_str())
-                .unwrap_or("");
+            let diag_uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
             if let Some(diagnostics) = params.get("diagnostics").and_then(|d| d.as_array()) {
                 return diag_uri.contains("test-diag-persist") && !diagnostics.is_empty();
             }
@@ -626,18 +621,13 @@ fn test_diagnostics_persist_after_did_close() {
         .expect("Failed to send didClose");
 
     // Collect any publishDiagnostics emitted after didClose
-    let diags_after_close = client.collect_notifications(
-        "textDocument/publishDiagnostics",
-        Duration::from_secs(3),
-    );
+    let diags_after_close =
+        client.collect_notifications("textDocument/publishDiagnostics", Duration::from_secs(3));
 
     // The server should NOT clear diagnostics on didClose
     let cleared = diags_after_close.iter().any(|n| {
         if let Some(params) = n.get("params") {
-            let diag_uri = params
-                .get("uri")
-                .and_then(|u| u.as_str())
-                .unwrap_or("");
+            let diag_uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
             if let Some(diagnostics) = params.get("diagnostics").and_then(|d| d.as_array()) {
                 return diag_uri.contains("test-diag-persist") && diagnostics.is_empty();
             }

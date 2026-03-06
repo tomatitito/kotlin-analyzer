@@ -58,7 +58,10 @@ async fn main() -> anyhow::Result<()> {
 
     Server::new(stdin, stdout, socket).serve(service).await;
 
-    tracing::info!("kotlin-analyzer: server loop exited (pid={})", std::process::id());
+    tracing::info!(
+        "kotlin-analyzer: server loop exited (pid={})",
+        std::process::id()
+    );
 
     Ok(())
 }

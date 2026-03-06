@@ -302,7 +302,11 @@ allprojects {
 "#;
 
 /// Extracts project model from a Gradle project using the init script approach.
-fn resolve_gradle_project(root: &Path, config: &Config, offline: bool) -> Result<ProjectModel, Error> {
+fn resolve_gradle_project(
+    root: &Path,
+    config: &Config,
+    offline: bool,
+) -> Result<ProjectModel, Error> {
     let gradlew = find_gradle_wrapper(root);
 
     let init_script_path = root.join(".kotlin-analyzer-init.gradle");
@@ -415,10 +419,15 @@ fn parse_gradle_output(output: &str, root: &Path, config: &Config) -> Result<Pro
             parts.get(1).and_then(|s| s.parse::<u32>().ok()),
         ) {
             // Multi-dollar interpolation: experimental in 2.1, stable in 2.2+
-            if major >= 2 && minor >= 1
-                && !model.compiler_flags.contains(&"-Xmulti-dollar-interpolation".to_string())
+            if major >= 2
+                && minor >= 1
+                && !model
+                    .compiler_flags
+                    .contains(&"-Xmulti-dollar-interpolation".to_string())
             {
-                model.compiler_flags.push("-Xmulti-dollar-interpolation".to_string());
+                model
+                    .compiler_flags
+                    .push("-Xmulti-dollar-interpolation".to_string());
             }
         }
     }
@@ -426,7 +435,11 @@ fn parse_gradle_output(output: &str, root: &Path, config: &Config) -> Result<Pro
     Ok(model)
 }
 
-fn resolve_maven_project(root: &Path, config: &Config, offline: bool) -> Result<ProjectModel, Error> {
+fn resolve_maven_project(
+    root: &Path,
+    config: &Config,
+    offline: bool,
+) -> Result<ProjectModel, Error> {
     let mvn = if root.join("mvnw").exists() {
         root.join("mvnw")
     } else {
@@ -506,8 +519,9 @@ fn resolve_manual_config(
     lsp_config: &Config,
 ) -> Result<ProjectModel, Error> {
     let content = std::fs::read_to_string(config_path).map_err(Error::Io)?;
-    let manual: ManualProjectConfig = serde_json::from_str(&content)
-        .map_err(|e| ProjectError::ClasspathExtraction(format!("invalid .kotlin-analyzer.json: {e}")))?;
+    let manual: ManualProjectConfig = serde_json::from_str(&content).map_err(|e| {
+        ProjectError::ClasspathExtraction(format!("invalid .kotlin-analyzer.json: {e}"))
+    })?;
 
     let source_roots: Vec<PathBuf> = manual
         .source_roots
@@ -651,7 +665,9 @@ fn execute_with_timeout(
     // Wait for either completion or timeout
     match rx.recv_timeout(timeout) {
         Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(ProjectError::GradleFailed(format!("process execution failed: {e}")).into()),
+        Ok(Err(e)) => {
+            Err(ProjectError::GradleFailed(format!("process execution failed: {e}")).into())
+        }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             // Note: The child process may continue running after timeout.
             // This is a known limitation of the thread-based approach without keeping
@@ -663,9 +679,10 @@ fn execute_with_timeout(
             ))
             .into())
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err(ProjectError::GradleFailed("process thread disconnected unexpectedly".into()).into())
-        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProjectError::GradleFailed(
+            "process thread disconnected unexpectedly".into(),
+        )
+        .into()),
     }
 }
 
@@ -717,7 +734,10 @@ KOTLIN_VERSION=2.1.20
         let model = parse_gradle_output(output, Path::new("/project"), &config).unwrap();
         assert_eq!(model.source_roots.len(), 1);
         assert_eq!(model.classpath.len(), 2);
-        assert_eq!(model.compiler_flags, vec!["-Xcontext-parameters", "-Xmulti-dollar-interpolation"]);
+        assert_eq!(
+            model.compiler_flags,
+            vec!["-Xcontext-parameters", "-Xmulti-dollar-interpolation"]
+        );
         assert_eq!(model.kotlin_version, Some("2.1.20".into()));
     }
 
@@ -818,7 +838,10 @@ KOTLIN_VERSION=2.1.20
         let model = parse_gradle_output(output, Path::new("/project"), &config).unwrap();
         assert_eq!(model.source_roots.len(), 2);
         assert_eq!(model.classpath.len(), 2);
-        assert_eq!(model.compiler_flags, vec!["-Xcontext-parameters", "-Xmulti-dollar-interpolation"]);
+        assert_eq!(
+            model.compiler_flags,
+            vec!["-Xcontext-parameters", "-Xmulti-dollar-interpolation"]
+        );
         assert_eq!(model.kotlin_version, Some("2.1.20".into()));
     }
 
@@ -862,11 +885,11 @@ GENERATED_SOURCE_ROOT=/project/lib/build/generated/ksp/main/kotlin
     #[test]
     #[cfg(feature = "integration")]
     fn init_script_kotlin_project() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/gradle-kotlin-simple");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/gradle-kotlin-simple");
         let config = Config::default();
-        let model =
-            resolve_gradle_project(&fixture, &config, false).expect("gradle resolution should succeed");
+        let model = resolve_gradle_project(&fixture, &config, false)
+            .expect("gradle resolution should succeed");
 
         assert!(!model.source_roots.is_empty(), "should find source roots");
         assert!(!model.classpath.is_empty(), "should find classpath entries");
@@ -879,8 +902,8 @@ GENERATED_SOURCE_ROOT=/project/lib/build/generated/ksp/main/kotlin
     #[test]
     #[cfg(feature = "integration")]
     fn init_script_java_only_project() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/gradle-java-only");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/gradle-java-only");
         let config = Config::default();
         let model = resolve_gradle_project(&fixture, &config, false)
             .expect("gradle resolution should not crash on java-only project");
@@ -898,8 +921,8 @@ GENERATED_SOURCE_ROOT=/project/lib/build/generated/ksp/main/kotlin
     #[test]
     #[cfg(feature = "integration")]
     fn init_script_output_format() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/gradle-kotlin-simple");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/gradle-kotlin-simple");
 
         // Write init script to a temp dir to avoid racing with other tests
         // that also write to the fixture directory.

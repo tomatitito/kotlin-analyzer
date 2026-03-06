@@ -73,7 +73,9 @@ impl KotlinLanguageServer {
         let bridge = match self.get_bridge().await {
             Some(b) => b,
             None => {
-                tracing::debug!("analyze_document: bridge is None (sidecar still starting), skipping");
+                tracing::debug!(
+                    "analyze_document: bridge is None (sidecar still starting), skipping"
+                );
                 return;
             }
         };
@@ -115,11 +117,25 @@ impl KotlinLanguageServer {
             .await
         {
             Ok(result) => {
-                tracing::debug!("analyze_document: raw sidecar response for {}: {}", uri, result);
+                tracing::debug!(
+                    "analyze_document: raw sidecar response for {}: {}",
+                    uri,
+                    result
+                );
                 let diagnostics = self.parse_diagnostics(&result);
-                tracing::debug!("analyze_document: {} returned {} diagnostics", uri, diagnostics.len());
+                tracing::debug!(
+                    "analyze_document: {} returned {} diagnostics",
+                    uri,
+                    diagnostics.len()
+                );
                 for d in &diagnostics {
-                    tracing::debug!("  diagnostic: {:?} at L{}:{} - {}", d.severity, d.range.start.line, d.range.start.character, d.message);
+                    tracing::debug!(
+                        "  diagnostic: {:?} at L{}:{} - {}",
+                        d.severity,
+                        d.range.start.line,
+                        d.range.start.character,
+                        d.message
+                    );
                 }
                 // Cache diagnostics so they survive didClose/didOpen tab switches
                 {
@@ -403,14 +419,16 @@ impl LanguageServer for KotlinLanguageServer {
                 references_provider: Some(OneOf::Left(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Left(true)),
-                code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
-                    code_action_kinds: Some(vec![
-                        CodeActionKind::QUICKFIX,
-                        CodeActionKind::REFACTOR,
-                        CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
-                    ]),
-                    ..Default::default()
-                })),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![
+                            CodeActionKind::QUICKFIX,
+                            CodeActionKind::REFACTOR,
+                            CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                        ]),
+                        ..Default::default()
+                    },
+                )),
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(false),
                 }),
@@ -527,7 +545,9 @@ impl LanguageServer for KotlinLanguageServer {
             .await
             {
                 Ok(Err(e)) => tracing::warn!("failed to create progress token: {:?}", e),
-                Err(_) => tracing::warn!("progress token creation timed out, client may not support workDoneProgress"),
+                Err(_) => tracing::warn!(
+                    "progress token creation timed out, client may not support workDoneProgress"
+                ),
                 Ok(Ok(())) => {}
             }
 
@@ -664,11 +684,15 @@ impl LanguageServer for KotlinLanguageServer {
 
             let (classpath, compiler_flags, source_roots) = match &project_model {
                 Some(model) => {
-                    let cp: Vec<String> = model.classpath.iter()
+                    let cp: Vec<String> = model
+                        .classpath
+                        .iter()
                         .map(|p| p.to_string_lossy().to_string())
                         .collect();
                     let cf: Vec<String> = model.compiler_flags.clone();
-                    let sr: Vec<String> = model.source_roots.iter()
+                    let sr: Vec<String> = model
+                        .source_roots
+                        .iter()
                         .chain(model.generated_source_roots.iter())
                         .map(|p| p.to_string_lossy().to_string())
                         .collect();
@@ -687,19 +711,23 @@ impl LanguageServer for KotlinLanguageServer {
 
             tracing::debug!(
                 "starting sidecar with project_root={}, classpath={} entries, source_roots={:?}",
-                project_root_str, classpath.len(), source_roots
+                project_root_str,
+                classpath.len(),
+                source_roots
             );
 
             // Re-acquire lock briefly to call start() on the bridge
             let start_result = {
                 let b = bridge_holder.lock().await;
                 let bridge = b.as_ref().unwrap();
-                bridge.start(
-                    Some(project_root_str.as_str()),
-                    &classpath,
-                    &compiler_flags,
-                    &source_roots,
-                ).await
+                bridge
+                    .start(
+                        Some(project_root_str.as_str()),
+                        &classpath,
+                        &compiler_flags,
+                        &source_roots,
+                    )
+                    .await
             };
 
             match start_result {
@@ -726,7 +754,10 @@ impl LanguageServer for KotlinLanguageServer {
                     };
 
                     if !open_docs.is_empty() {
-                        tracing::info!("replaying {} open document(s) after sidecar startup", open_docs.len());
+                        tracing::info!(
+                            "replaying {} open document(s) after sidecar startup",
+                            open_docs.len()
+                        );
                     }
 
                     // Clone the Arc<Bridge> out of the mutex so the lock is released
@@ -739,33 +770,46 @@ impl LanguageServer for KotlinLanguageServer {
                     if let Some(bridge) = bridge_arc {
                         for (uri, text, version) in &open_docs {
                             tracing::debug!("replay: sending didOpen for {}", uri);
-                            let _ = bridge.notify(
-                                "textDocument/didOpen",
-                                Some(serde_json::json!({
-                                    "uri": uri.as_str(),
-                                    "version": version,
-                                    "text": text,
-                                })),
-                            ).await;
+                            let _ = bridge
+                                .notify(
+                                    "textDocument/didOpen",
+                                    Some(serde_json::json!({
+                                        "uri": uri.as_str(),
+                                        "version": version,
+                                        "text": text,
+                                    })),
+                                )
+                                .await;
 
                             // Send didChange + analyze
-                            let _ = bridge.notify(
-                                "textDocument/didChange",
-                                Some(serde_json::json!({
-                                    "uri": uri.as_str(),
-                                    "version": version,
-                                    "text": text,
-                                })),
-                            ).await;
+                            let _ = bridge
+                                .notify(
+                                    "textDocument/didChange",
+                                    Some(serde_json::json!({
+                                        "uri": uri.as_str(),
+                                        "version": version,
+                                        "text": text,
+                                    })),
+                                )
+                                .await;
 
-                            match bridge.request(
-                                "analyze",
-                                Some(serde_json::json!({ "uri": uri.as_str() })),
-                            ).await {
+                            match bridge
+                                .request(
+                                    "analyze",
+                                    Some(serde_json::json!({ "uri": uri.as_str() })),
+                                )
+                                .await
+                            {
                                 Ok(result) => {
                                     let diagnostics = parse_diagnostics_static(&result);
-                                    tracing::info!("replay: {} returned {} diagnostics", uri, diagnostics.len());
-                                    client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+                                    tracing::info!(
+                                        "replay: {} returned {} diagnostics",
+                                        uri,
+                                        diagnostics.len()
+                                    );
+                                    client
+                                        .publish_diagnostics(uri.clone(), diagnostics, None)
+                                        .await;
                                 }
                                 Err(e) => {
                                     tracing::warn!("replay: analysis failed for {}: {}", uri, e);
@@ -783,7 +827,8 @@ impl LanguageServer for KotlinLanguageServer {
                         tokio::time::sleep(Duration::from_secs(2)).await;
 
                         // Create progress token for background analysis
-                        let bg_token = NumberOrString::String("kotlin-analyzer-background".to_string());
+                        let bg_token =
+                            NumberOrString::String("kotlin-analyzer-background".to_string());
                         let _ = tokio::time::timeout(
                             Duration::from_secs(5),
                             bg_client.send_request::<lsp_types::request::WorkDoneProgressCreate>(
@@ -791,20 +836,26 @@ impl LanguageServer for KotlinLanguageServer {
                                     token: bg_token.clone(),
                                 },
                             ),
-                        ).await;
+                        )
+                        .await;
 
                         bg_client
-                            .send_notification::<lsp_types::notification::Progress>(ProgressParams {
-                                token: bg_token.clone(),
-                                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
-                                    WorkDoneProgressBegin {
-                                        title: "Analyzing project".to_string(),
-                                        message: Some("Running diagnostics on all source files...".to_string()),
-                                        percentage: Some(0),
-                                        cancellable: Some(false),
-                                    },
-                                )),
-                            })
+                            .send_notification::<lsp_types::notification::Progress>(
+                                ProgressParams {
+                                    token: bg_token.clone(),
+                                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                                        WorkDoneProgressBegin {
+                                            title: "Analyzing project".to_string(),
+                                            message: Some(
+                                                "Running diagnostics on all source files..."
+                                                    .to_string(),
+                                            ),
+                                            percentage: Some(0),
+                                            cancellable: Some(false),
+                                        },
+                                    )),
+                                },
+                            )
                             .await;
 
                         // Call analyzeAll with a generous timeout (5 minutes)
@@ -815,14 +866,19 @@ impl LanguageServer for KotlinLanguageServer {
                         let analyze_result = match bridge_arc {
                             Some(b) => {
                                 if b.state().await != SidecarState::Ready {
-                                    tracing::warn!("background analysis: sidecar not ready, skipping");
+                                    tracing::warn!(
+                                        "background analysis: sidecar not ready, skipping"
+                                    );
                                     None
                                 } else {
-                                    Some(b.request_with_timeout(
-                                        "analyzeAll",
-                                        None,
-                                        Duration::from_secs(300),
-                                    ).await)
+                                    Some(
+                                        b.request_with_timeout(
+                                            "analyzeAll",
+                                            None,
+                                            Duration::from_secs(300),
+                                        )
+                                        .await,
+                                    )
                                 }
                             }
                             None => None,
@@ -831,9 +887,18 @@ impl LanguageServer for KotlinLanguageServer {
                         match analyze_result {
                             Some(Ok(result)) => {
                                 let files = result.get("files").and_then(|f| f.as_array());
-                                let total_files = result.get("totalFiles").and_then(|t| t.as_u64()).unwrap_or(0);
-                                let total_errors = result.get("totalErrors").and_then(|e| e.as_u64()).unwrap_or(0);
-                                let total_warnings = result.get("totalWarnings").and_then(|w| w.as_u64()).unwrap_or(0);
+                                let total_files = result
+                                    .get("totalFiles")
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                let total_errors = result
+                                    .get("totalErrors")
+                                    .and_then(|e| e.as_u64())
+                                    .unwrap_or(0);
+                                let total_warnings = result
+                                    .get("totalWarnings")
+                                    .and_then(|w| w.as_u64())
+                                    .unwrap_or(0);
 
                                 if let Some(files) = files {
                                     let mut processed = 0u64;
@@ -841,10 +906,11 @@ impl LanguageServer for KotlinLanguageServer {
                                     for file_entry in files {
                                         processed += 1;
 
-                                        let uri_str = match file_entry.get("uri").and_then(|u| u.as_str()) {
-                                            Some(u) => u,
-                                            None => continue,
-                                        };
+                                        let uri_str =
+                                            match file_entry.get("uri").and_then(|u| u.as_str()) {
+                                                Some(u) => u,
+                                                None => continue,
+                                            };
 
                                         let uri = match Url::parse(uri_str) {
                                             Ok(u) => u,
@@ -869,15 +935,22 @@ impl LanguageServer for KotlinLanguageServer {
                                         if !diagnostics.is_empty() {
                                             {
                                                 let mut docs = bg_documents.lock().await;
-                                                docs.set_diagnostics(uri.clone(), diagnostics.clone());
+                                                docs.set_diagnostics(
+                                                    uri.clone(),
+                                                    diagnostics.clone(),
+                                                );
                                             }
-                                            bg_client.publish_diagnostics(uri, diagnostics, None).await;
+                                            bg_client
+                                                .publish_diagnostics(uri, diagnostics, None)
+                                                .await;
                                             _published += 1;
                                         }
 
                                         // Report progress periodically
                                         if total_files > 0 && processed % 10 == 0 {
-                                            let pct = ((processed as f64 / total_files as f64) * 100.0) as u32;
+                                            let pct = ((processed as f64 / total_files as f64)
+                                                * 100.0)
+                                                as u32;
                                             bg_client
                                                 .send_notification::<lsp_types::notification::Progress>(ProgressParams {
                                                     token: bg_token.clone(),
@@ -900,40 +973,48 @@ impl LanguageServer for KotlinLanguageServer {
                                     tracing::info!("background analysis: {}", summary);
 
                                     bg_client
-                                        .send_notification::<lsp_types::notification::Progress>(ProgressParams {
-                                            token: bg_token.clone(),
-                                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
-                                                WorkDoneProgressEnd {
-                                                    message: Some(summary),
-                                                },
-                                            )),
-                                        })
+                                        .send_notification::<lsp_types::notification::Progress>(
+                                            ProgressParams {
+                                                token: bg_token.clone(),
+                                                value: ProgressParamsValue::WorkDone(
+                                                    WorkDoneProgress::End(WorkDoneProgressEnd {
+                                                        message: Some(summary),
+                                                    }),
+                                                ),
+                                            },
+                                        )
                                         .await;
                                 }
                             }
                             Some(Err(e)) => {
                                 tracing::warn!("background analysis failed: {}", e);
                                 bg_client
-                                    .send_notification::<lsp_types::notification::Progress>(ProgressParams {
-                                        token: bg_token.clone(),
-                                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
-                                            WorkDoneProgressEnd {
-                                                message: Some(format!("Failed: {}", e)),
-                                            },
-                                        )),
-                                    })
+                                    .send_notification::<lsp_types::notification::Progress>(
+                                        ProgressParams {
+                                            token: bg_token.clone(),
+                                            value: ProgressParamsValue::WorkDone(
+                                                WorkDoneProgress::End(WorkDoneProgressEnd {
+                                                    message: Some(format!("Failed: {}", e)),
+                                                }),
+                                            ),
+                                        },
+                                    )
                                     .await;
                             }
                             None => {
                                 bg_client
-                                    .send_notification::<lsp_types::notification::Progress>(ProgressParams {
-                                        token: bg_token.clone(),
-                                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
-                                            WorkDoneProgressEnd {
-                                                message: Some("Skipped — sidecar not ready".to_string()),
-                                            },
-                                        )),
-                                    })
+                                    .send_notification::<lsp_types::notification::Progress>(
+                                        ProgressParams {
+                                            token: bg_token.clone(),
+                                            value: ProgressParamsValue::WorkDone(
+                                                WorkDoneProgress::End(WorkDoneProgressEnd {
+                                                    message: Some(
+                                                        "Skipped — sidecar not ready".to_string(),
+                                                    ),
+                                                }),
+                                            ),
+                                        },
+                                    )
                                     .await;
                             }
                         }
@@ -984,14 +1065,23 @@ impl LanguageServer for KotlinLanguageServer {
         let text = params.text_document.text.clone();
         let version = params.text_document.version;
 
-        tracing::debug!("did_open: {} (version {}, {} bytes)", uri, version, text.len());
+        tracing::debug!(
+            "did_open: {} (version {}, {} bytes)",
+            uri,
+            version,
+            text.len()
+        );
 
         // Re-publish cached diagnostics immediately so they appear instantly on tab switch
         {
             let mut documents = self.documents.lock().await;
             if let Some(cached) = documents.get_diagnostics(&uri).cloned() {
                 if !cached.is_empty() {
-                    tracing::debug!("did_open: re-publishing {} cached diagnostics for {}", cached.len(), uri);
+                    tracing::debug!(
+                        "did_open: re-publishing {} cached diagnostics for {}",
+                        cached.len(),
+                        uri
+                    );
                     self.client
                         .publish_diagnostics(uri.clone(), cached, None)
                         .await;
@@ -1104,7 +1194,12 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        tracing::debug!("hover request: {}:{}:{}", uri, position.line, position.character);
+        tracing::debug!(
+            "hover request: {}:{}:{}",
+            uri,
+            position.line,
+            position.character
+        );
 
         let bridge = match self.get_bridge().await {
             Some(b) => b,
@@ -1253,8 +1348,13 @@ impl LanguageServer for KotlinLanguageServer {
         match config.formatting_tool {
             FormattingTool::None => return Ok(None),
             FormattingTool::Ktfmt => {
-                let binary = config.formatting_path.unwrap_or_else(|| "ktfmt".to_string());
-                match self.format_with_ktfmt(&binary, &original_text, &config.formatting_style).await {
+                let binary = config
+                    .formatting_path
+                    .unwrap_or_else(|| "ktfmt".to_string());
+                match self
+                    .format_with_ktfmt(&binary, &original_text, &config.formatting_style)
+                    .await
+                {
                     Ok(Some(formatted)) => {
                         if formatted == original_text {
                             return Ok(None);
@@ -1276,7 +1376,9 @@ impl LanguageServer for KotlinLanguageServer {
                 }
             }
             FormattingTool::Ktlint => {
-                let binary = config.formatting_path.unwrap_or_else(|| "ktlint".to_string());
+                let binary = config
+                    .formatting_path
+                    .unwrap_or_else(|| "ktlint".to_string());
                 match self.format_with_ktlint(&binary, &original_text).await {
                     Ok(Some(formatted)) => {
                         if formatted == original_text {
@@ -1379,7 +1481,10 @@ impl LanguageServer for KotlinLanguageServer {
                 || path_str.ends_with("gradle.properties"))
                 && !path_str.ends_with(".kotlin-analyzer-init.gradle");
             if is_build_file {
-                tracing::debug!("build file changed: {}, triggering project re-resolution", path_str);
+                tracing::debug!(
+                    "build file changed: {}, triggering project re-resolution",
+                    path_str
+                );
 
                 let project_root = self.project_root.lock().await.clone();
                 if let Some(root) = project_root {
@@ -1396,7 +1501,10 @@ impl LanguageServer for KotlinLanguageServer {
                                 let _ = client
                                     .show_message(
                                         MessageType::WARNING,
-                                        format!("kotlin-analyzer: project re-resolution failed: {}", e),
+                                        format!(
+                                            "kotlin-analyzer: project re-resolution failed: {}",
+                                            e
+                                        ),
                                     )
                                     .await;
                             }
@@ -1492,7 +1600,13 @@ impl LanguageServer for KotlinLanguageServer {
             Ok(result) => {
                 tracing::debug!("code_action: raw sidecar response for {}: {}", uri, result);
                 let actions = self.parse_code_actions(&result);
-                tracing::debug!("code_action: parsed {} action(s) for {} at L{}:{}", actions.len(), uri, range.start.line, range.start.character);
+                tracing::debug!(
+                    "code_action: parsed {} action(s) for {} at L{}:{}",
+                    actions.len(),
+                    uri,
+                    range.start.line,
+                    range.start.character
+                );
                 if actions.is_empty() {
                     Ok(None)
                 } else {
@@ -1506,7 +1620,10 @@ impl LanguageServer for KotlinLanguageServer {
         }
     }
 
-    async fn symbol(&self, params: WorkspaceSymbolParams) -> LspResult<Option<Vec<SymbolInformation>>> {
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> LspResult<Option<Vec<SymbolInformation>>> {
         let query = params.query;
 
         let bridge = match self.get_bridge().await {
@@ -2051,10 +2168,7 @@ impl KotlinLanguageServer {
                 .and_then(|l| l.as_u64())
                 .map(|l| l.saturating_sub(1) as u32)
                 .unwrap_or(start_line);
-            let end_col = range
-                .get("endColumn")
-                .and_then(|c| c.as_u64())
-                .unwrap_or(0) as u32;
+            let end_col = range.get("endColumn").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
 
             let new_text = match edit.get("newText").and_then(|t| t.as_str()) {
                 Some(t) => t.to_string(),
@@ -2150,7 +2264,10 @@ impl KotlinLanguageServer {
                             end: Position::new(line, column),
                         },
                     },
-                    container_name: sym.get("containerName").and_then(|c| c.as_str()).map(String::from),
+                    container_name: sym
+                        .get("containerName")
+                        .and_then(|c| c.as_str())
+                        .map(String::from),
                 })
             })
             .collect()
@@ -2169,11 +2286,14 @@ impl KotlinLanguageServer {
                 let character = hint.get("character")?.as_u64()? as u32;
                 let label_str = hint.get("label")?.as_str()?.to_string();
 
-                let kind = hint.get("kind").and_then(|k| k.as_str()).and_then(|k| match k {
-                    "type" => Some(InlayHintKind::TYPE),
-                    "parameter" => Some(InlayHintKind::PARAMETER),
-                    _ => None,
-                });
+                let kind = hint
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .and_then(|k| match k {
+                        "type" => Some(InlayHintKind::TYPE),
+                        "parameter" => Some(InlayHintKind::PARAMETER),
+                        _ => None,
+                    });
 
                 let padding_left = hint.get("paddingLeft").and_then(|p| p.as_bool());
                 let padding_right = hint.get("paddingRight").and_then(|p| p.as_bool());
@@ -2269,7 +2389,9 @@ impl KotlinLanguageServer {
 
             // Map sidecar token type to local legend index
             let mapped_token_type = if let Some(legend) = legend_types {
-                if let Some(type_name) = legend.get(token_type_idx as usize).and_then(|t| t.as_str()) {
+                if let Some(type_name) =
+                    legend.get(token_type_idx as usize).and_then(|t| t.as_str())
+                {
                     // Find in local legend
                     local_legend
                         .iter()
@@ -2358,7 +2480,8 @@ impl KotlinLanguageServer {
                         ranges
                             .iter()
                             .filter_map(|r| {
-                                let start_line = r.get("startLine")?.as_u64()?.saturating_sub(1) as u32;
+                                let start_line =
+                                    r.get("startLine")?.as_u64()?.saturating_sub(1) as u32;
                                 let start_column = r.get("startColumn")?.as_u64()? as u32;
                                 let end_line = r.get("endLine")?.as_u64()?.saturating_sub(1) as u32;
                                 let end_column = r.get("endColumn")?.as_u64()? as u32;

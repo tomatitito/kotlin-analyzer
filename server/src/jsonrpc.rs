@@ -94,8 +94,7 @@ pub async fn read_message(
         Err(e) => return Err(crate::error::Error::Io(e)),
     }
 
-    let response: Response =
-        serde_json::from_slice(&body).map_err(ProtocolError::JsonParse)?;
+    let response: Response = serde_json::from_slice(&body).map_err(ProtocolError::JsonParse)?;
 
     Ok(Some(response))
 }
