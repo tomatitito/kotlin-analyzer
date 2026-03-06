@@ -64,6 +64,8 @@ class CompilerBridge {
     private val dirtyOnDiskFiles = mutableSetOf<String>()
     // Maps shadow source tree paths back to original paths for findKtFile matching
     private val shadowPathMapping = mutableMapOf<String, String>()
+    // Cache of diagnostics per file URI, populated by analyze()/analyzeAll()
+    private val diagnosticsCache = mutableMapOf<String, List<JsonObject>>()
     // Stored init params for session rebuilds
     private var initProjectRoot = ""
     private var initClasspath = emptyList<String>()
@@ -376,6 +378,7 @@ class CompilerBridge {
     private fun ensureSessionCurrent() {
         if (!sessionDirty || session == null) return
         System.err.println("CompilerBridge: session dirty, rebuilding to pick up virtual file changes")
+        diagnosticsCache.clear()
         initialize(initProjectRoot, initClasspath, initCompilerFlags, initJdkHome, initSourceRoots)
     }
 
@@ -503,6 +506,9 @@ class CompilerBridge {
             e.printStackTrace(System.err)
         }
 
+
+        // Cache diagnostics for code actions to avoid re-running collectDiagnostics
+        diagnosticsCache[uri] = (0 until diagnosticsArray.size()).map { diagnosticsArray[it].asJsonObject }
         result.add("diagnostics", diagnosticsArray)
         return result
     }
@@ -615,6 +621,8 @@ class CompilerBridge {
                 System.err.println("CompilerBridge: analyzeAll() — error analyzing $filePath: ${e.javaClass.name}: ${e.message}")
             }
 
+            // Cache diagnostics for code actions
+            diagnosticsCache[fileUri] = (0 until diagnosticsArray.size()).map { diagnosticsArray[it].asJsonObject }
             fileObj.add("diagnostics", diagnosticsArray)
             filesArray.add(fileObj)
             analyzedCount++
@@ -638,19 +646,27 @@ class CompilerBridge {
         val result = JsonObject()
         val perfStart = System.currentTimeMillis()
 
-        val currentSession = session ?: return result
-        val ktFile = findKtFile(currentSession, uri) ?: return result
+        val currentSession = session ?: run {
+            result.addProperty("reason", "session not initialized")
+            return result
+        }
+        val ktFile = findKtFile(currentSession, uri) ?: run {
+            result.addProperty("reason", "file not found: $uri")
+            return result
+        }
 
         try {
             analyze(ktFile) {
                 val offset = lineColToOffset(ktFile, line, character)
                 if (offset == null) {
                     System.err.println("CompilerBridge: hover — lineColToOffset=null (line=$line, char=$character, fileLines=${ktFile.text.lines().size})")
+                    result.addProperty("reason", "invalid offset at position $line:$character")
                     return@analyze
                 }
                 val element = ktFile.findElementAt(offset)
                 if (element == null) {
                     System.err.println("CompilerBridge: hover — findElementAt=null (offset=$offset, textLen=${ktFile.text.length})")
+                    result.addProperty("reason", "no element found at position $line:$character")
                     return@analyze
                 }
 
@@ -712,6 +728,7 @@ class CompilerBridge {
             }
         } catch (e: Throwable) {
             System.err.println("CompilerBridge: hover failed: ${e.javaClass.name}: ${e.message}")
+            result.addProperty("reason", "analysis failed: ${e.message}")
         }
 
         System.err.println("[PERF] method=hover uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
@@ -730,10 +747,12 @@ class CompilerBridge {
 
         val currentSession = session ?: run {
             result.add("items", itemsArray)
+            result.addProperty("reason", "session not initialized")
             return result
         }
         val ktFile = findKtFile(currentSession, uri) ?: run {
             result.add("items", itemsArray)
+            result.addProperty("reason", "file not found: $uri")
             return result
         }
 
@@ -741,6 +760,7 @@ class CompilerBridge {
             analyze(ktFile) {
                 val offset = lineColToOffset(ktFile, line, character) ?: run {
                     result.add("items", itemsArray)
+                    result.addProperty("reason", "invalid offset at position $line:$character")
                     return@analyze
                 }
 
@@ -749,6 +769,7 @@ class CompilerBridge {
 
                 if (element == null) {
                     result.add("items", itemsArray)
+                    result.addProperty("reason", "no element found at position $line:$character")
                     return@analyze
                 }
 
@@ -769,6 +790,7 @@ class CompilerBridge {
             }
         } catch (e: Throwable) {
             System.err.println("CompilerBridge: completion failed: ${e.javaClass.name}: ${e.message}")
+            result.addProperty("reason", "analysis failed: ${e.message}")
         }
 
         System.err.println("[PERF] method=completion uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
@@ -787,10 +809,12 @@ class CompilerBridge {
 
         val currentSession = session ?: run {
             result.add("locations", locationsArray)
+            result.addProperty("reason", "session not initialized")
             return result
         }
         val ktFile = findKtFile(currentSession, uri) ?: run {
             result.add("locations", locationsArray)
+            result.addProperty("reason", "file not found: $uri")
             return result
         }
 
@@ -798,6 +822,7 @@ class CompilerBridge {
             analyze(ktFile) {
                 val offset = lineColToOffset(ktFile, line, character) ?: run {
                     result.add("locations", locationsArray)
+                    result.addProperty("reason", "invalid offset at position $line:$character")
                     return@analyze
                 }
 
@@ -876,6 +901,7 @@ class CompilerBridge {
             }
         } catch (e: Throwable) {
             System.err.println("CompilerBridge: definition failed: ${e.javaClass.name}: ${e.message}")
+            result.addProperty("reason", "analysis failed: ${e.message}")
         }
 
         System.err.println("[PERF] method=definition uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
@@ -1038,10 +1064,12 @@ class CompilerBridge {
 
         val currentSession = session ?: run {
             result.add("locations", locationsArray)
+            result.addProperty("reason", "session not initialized")
             return result
         }
         val ktFile = findKtFile(currentSession, uri) ?: run {
             result.add("locations", locationsArray)
+            result.addProperty("reason", "file not found: $uri")
             return result
         }
 
@@ -1136,6 +1164,7 @@ class CompilerBridge {
             }
         } catch (e: Throwable) {
             System.err.println("CompilerBridge: references failed: ${e.javaClass.name}: ${e.message}")
+            result.addProperty("reason", "analysis failed: ${e.message}")
         }
 
         System.err.println("[PERF] method=references uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
@@ -1400,11 +1429,13 @@ class CompilerBridge {
         val currentSession = session ?: run {
             System.err.println("CompilerBridge: codeActions — session is NULL")
             result.add("actions", actionsArray)
+            result.addProperty("reason", "session not initialized")
             return result
         }
         val ktFile = findKtFile(currentSession, uri) ?: run {
             System.err.println("CompilerBridge: codeActions — file not found")
             result.add("actions", actionsArray)
+            result.addProperty("reason", "file not found: $uri")
             return result
         }
 
@@ -1423,24 +1454,52 @@ class CompilerBridge {
 
                 val fileUri = uri
 
-                // 1. Diagnostic-based code actions
+                // 1. Diagnostic-based code actions (use cache from analyze/analyzeAll)
                 try {
-                    val diagnostics = ktFile.collectDiagnostics(
-                        KaDiagnosticCheckerFilter.EXTENDED_AND_COMMON_CHECKERS
-                    )
+                    val cachedDiags = diagnosticsCache[uri]
+                    val diagList = if (cachedDiags != null) {
+                        System.err.println("CompilerBridge: codeActions — using ${cachedDiags.size} cached diagnostic(s)")
+                        cachedDiags
+                    } else {
+                        // Cache miss: fall back to collecting diagnostics directly
+                        System.err.println("CompilerBridge: codeActions — cache miss, collecting diagnostics")
+                        try {
+                            val rawDiags = ktFile.collectDiagnostics(
+                                KaDiagnosticCheckerFilter.EXTENDED_AND_COMMON_CHECKERS
+                            )
+                            rawDiags.mapNotNull { diagnostic ->
+                                val textRange = diagnostic.textRanges.firstOrNull() ?: return@mapNotNull null
+                                val diagObj = JsonObject()
+                                diagObj.addProperty("severity", diagnostic.severity.name)
+                                diagObj.addProperty("message", diagnostic.defaultMessage)
+                                diagObj.addProperty("code", diagnostic.factoryName)
+                                try {
+                                    val doc = ktFile.viewProvider.document ?: return@mapNotNull null
+                                    diagObj.addProperty("line", doc.getLineNumber(textRange.startOffset) + 1)
+                                    diagObj.addProperty("column", textRange.startOffset - doc.getLineStartOffset(doc.getLineNumber(textRange.startOffset)))
+                                    diagObj.addProperty("endLine", doc.getLineNumber(textRange.endOffset) + 1)
+                                    diagObj.addProperty("endColumn", textRange.endOffset - doc.getLineStartOffset(doc.getLineNumber(textRange.endOffset)))
+                                } catch (_: Exception) {
+                                    return@mapNotNull null
+                                }
+                                diagObj
+                            }.also { diagnosticsCache[uri] = it }
+                        } catch (e: Exception) {
+                            System.err.println("CompilerBridge: codeActions — collectDiagnostics failed: ${e.message}")
+                            emptyList()
+                        }
+                    }
 
-                    for (diagnostic in diagnostics) {
-                        val textRange = diagnostic.textRanges.firstOrNull() ?: continue
+                    for (diag in diagList) {
+                        val diagStartLine = diag.get("line")?.asInt ?: continue
+                        val diagEndLine = diag.get("endLine")?.asInt ?: continue
+                        val diagStartCol = diag.get("column")?.asInt ?: 0
+                        val diagEndCol = diag.get("endColumn")?.asInt ?: 0
+                        val factoryName = diag.get("code")?.asString ?: continue
+                        val severityName = diag.get("severity")?.asString ?: continue
 
-                        // Use line-level matching: check if the cursor line overlaps the diagnostic
-                        val diagStartLine = document.getLineNumber(textRange.startOffset)
-                        val diagEndLine = document.getLineNumber(textRange.endOffset)
-                        val cursorLine = line - 1 // Convert to 0-based
-
-                        if (cursorLine < diagStartLine || cursorLine > diagEndLine) continue
-
-                        val factoryName = diagnostic.factoryName ?: continue
-                        val severityName = diagnostic.severity.name
+                        // line is 1-based from cache, cursor line is also 1-based
+                        if (line < diagStartLine || line > diagEndLine) continue
 
                         // Suppress warning action for warnings
                         if (severityName == "WARNING") {
@@ -1450,7 +1509,9 @@ class CompilerBridge {
 
                             val actionEdits = JsonArray()
 
-                            val element = ktFile.findElementAt(textRange.startOffset)
+                            // Convert cached line/col back to offset to find PSI element
+                            val diagOffset = document.getLineStartOffset(diagStartLine - 1) + diagStartCol
+                            val element = ktFile.findElementAt(diagOffset)
                             val enclosingDeclaration = findEnclosingDeclaration(element)
 
                             if (enclosingDeclaration != null) {
@@ -1481,9 +1542,11 @@ class CompilerBridge {
 
                         // Add import action for unresolved references
                         if (factoryName == "UNRESOLVED_REFERENCE") {
+                            val startOffset = document.getLineStartOffset(diagStartLine - 1) + diagStartCol
+                            val endOffset = document.getLineStartOffset(diagEndLine - 1) + diagEndCol
                             val unresolvedText = ktFile.text.substring(
-                                textRange.startOffset,
-                                minOf(textRange.endOffset, ktFile.text.length)
+                                startOffset,
+                                minOf(endOffset, ktFile.text.length)
                             )
 
                             val importCandidates = findImportCandidates(unresolvedText)
@@ -1511,7 +1574,6 @@ class CompilerBridge {
                                     actionsArray.add(action)
                                 }
                             } else {
-                                // Fallback: offer the short name import
                                 val action = JsonObject()
                                 action.addProperty("title", "Add import for '$unresolvedText'")
                                 action.addProperty("kind", "quickfix")
@@ -1559,6 +1621,7 @@ class CompilerBridge {
         } catch (e: Throwable) {
             System.err.println("CompilerBridge: codeActions failed: ${e.javaClass.name}: ${e.message}")
             e.printStackTrace(System.err)
+            result.addProperty("reason", "analysis failed: ${e.message}")
         }
 
         System.err.println("CompilerBridge: codeActions($uri) — returning ${actionsArray.size()} action(s)")
