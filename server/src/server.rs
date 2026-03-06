@@ -17,6 +17,14 @@ use crate::config::{Config, FormattingTool};
 use crate::project;
 use crate::state::DocumentStore;
 
+/// Request for a debounced code action lookup.
+struct CodeActionRequest {
+    uri: Url,
+    range: Range,
+    diagnostics: Vec<Diagnostic>,
+    response_tx: tokio::sync::oneshot::Sender<Option<CodeActionResponse>>,
+}
+
 /// The main language server implementation.
 pub struct KotlinLanguageServer {
     client: Client,
@@ -25,6 +33,8 @@ pub struct KotlinLanguageServer {
     config: Arc<Mutex<Config>>,
     project_root: Arc<Mutex<Option<PathBuf>>>,
     debounce_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Url>>>>,
+    code_action_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<CodeActionRequest>>>>,
+    code_action_cache: Arc<Mutex<HashMap<Url, CodeActionResponse>>>,
 }
 
 impl KotlinLanguageServer {
@@ -36,6 +46,8 @@ impl KotlinLanguageServer {
             config: Arc::new(Mutex::new(Config::default())),
             project_root: Arc::new(Mutex::new(None)),
             debounce_tx: Arc::new(Mutex::new(None)),
+            code_action_tx: Arc::new(Mutex::new(None)),
+            code_action_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -269,6 +281,91 @@ impl KotlinLanguageServer {
 
         tx
     }
+
+    /// Starts the debounce loop for code action requests.
+    fn start_code_action_debounce_loop(&self) -> tokio::sync::mpsc::Sender<CodeActionRequest> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CodeActionRequest>(64);
+
+        let bridge = Arc::clone(&self.bridge);
+        let cache = Arc::clone(&self.code_action_cache);
+
+        tokio::spawn(async move {
+            let mut pending: Option<CodeActionRequest> = None;
+            let debounce_duration = Duration::from_millis(200);
+
+            loop {
+                tokio::select! {
+                    request = rx.recv() => {
+                        match request {
+                            Some(req) => {
+                                pending = Some(req);
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = tokio::time::sleep(debounce_duration), if pending.is_some() => {
+                        if let Some(req) = pending.take() {
+                            let bridge_arc = {
+                                let guard = bridge.lock().await;
+                                guard.as_ref().map(Arc::clone)
+                            };
+
+                            if let Some(bridge) = bridge_arc {
+                                if bridge.state().await == SidecarState::Ready {
+                                    match bridge
+                                        .request(
+                                            "codeActions",
+                                            Some(serde_json::json!({
+                                                "uri": req.uri.as_str(),
+                                                "line": req.range.start.line + 1,
+                                                "character": req.range.start.character,
+                                                "diagnostics": req.diagnostics.iter().map(|d| {
+                                                    serde_json::json!({
+                                                        "severity": d.severity,
+                                                        "message": d.message,
+                                                        "code": d.code,
+                                                    })
+                                                }).collect::<Vec<_>>(),
+                                            })),
+                                        )
+                                        .await
+                                    {
+                                        Ok(result) => {
+                                            tracing::debug!("code_action debounce: raw sidecar response for {}: {}", req.uri, result);
+                                            let actions = parse_code_actions_static(&result);
+                                            tracing::debug!("code_action debounce: parsed {} action(s) for {} at L{}:{}",
+                                                actions.len(), req.uri, req.range.start.line, req.range.start.character);
+
+                                            // Update cache
+                                            if !actions.is_empty() {
+                                                let mut cache_guard = cache.lock().await;
+                                                cache_guard.insert(req.uri.clone(), actions.clone());
+                                            }
+
+                                            let response = if actions.is_empty() { None } else { Some(actions) };
+                                            let _ = req.response_tx.send(response);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("code_action debounce failed for {}: {}", req.uri, e);
+                                            let _ = req.response_tx.send(None);
+                                        }
+                                    }
+                                } else {
+                                    tracing::debug!("code_action debounce: sidecar not ready, returning None");
+                                    let _ = req.response_tx.send(None);
+                                }
+                            } else {
+                                tracing::debug!("code_action debounce: no bridge available, returning None");
+                                let _ = req.response_tx.send(None);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        tx
+    }
 }
 
 /// Returns true if the URI points to a Gradle build script (.gradle.kts in any
@@ -333,6 +430,97 @@ fn parse_diagnostics_static(result: &Value) -> Vec<Diagnostic> {
         .collect()
 }
 
+fn parse_workspace_edits_static(result: &Value) -> HashMap<Url, Vec<TextEdit>> {
+    let edits_array = match result.get("edits").and_then(|e| e.as_array()) {
+        Some(arr) => arr,
+        None => return HashMap::new(),
+    };
+
+    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+    for edit in edits_array {
+        let uri_str = match edit.get("uri").and_then(|u| u.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let uri = match Url::parse(uri_str) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+
+        let range = match edit.get("range") {
+            Some(r) => r,
+            None => continue,
+        };
+
+        let start_line = range
+            .get("startLine")
+            .and_then(|l| l.as_u64())
+            .map(|l| l.saturating_sub(1) as u32)
+            .unwrap_or(0);
+        let start_col = range
+            .get("startColumn")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0) as u32;
+        let end_line = range
+            .get("endLine")
+            .and_then(|l| l.as_u64())
+            .map(|l| l.saturating_sub(1) as u32)
+            .unwrap_or(start_line);
+        let end_col = range.get("endColumn").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
+
+        let new_text = match edit.get("newText").and_then(|t| t.as_str()) {
+            Some(t) => t.to_string(),
+            None => continue,
+        };
+
+        changes.entry(uri).or_default().push(TextEdit {
+            range: Range {
+                start: Position::new(start_line, start_col),
+                end: Position::new(end_line, end_col),
+            },
+            new_text,
+        });
+    }
+
+    changes
+}
+
+fn parse_code_actions_static(result: &Value) -> CodeActionResponse {
+    let actions_array = match result.get("actions").and_then(|a| a.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    actions_array
+        .iter()
+        .filter_map(|action| {
+            let title = action.get("title")?.as_str()?.to_string();
+            let kind = action
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .map(|k| CodeActionKind::from(k.to_string()));
+
+            let edits = parse_workspace_edits_static(action);
+
+            Some(CodeActionOrCommand::CodeAction(CodeAction {
+                title,
+                kind,
+                diagnostics: None,
+                edit: Some(WorkspaceEdit {
+                    changes: Some(edits),
+                    document_changes: None,
+                    change_annotations: None,
+                }),
+                command: None,
+                is_preferred: None,
+                disabled: None,
+                data: None,
+            }))
+        })
+        .collect()
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for KotlinLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
@@ -371,6 +559,12 @@ impl LanguageServer for KotlinLanguageServer {
         {
             let mut debounce = self.debounce_tx.lock().await;
             *debounce = Some(tx);
+        }
+
+        let code_action_tx = self.start_code_action_debounce_loop();
+        {
+            let mut ca_tx = self.code_action_tx.lock().await;
+            *ca_tx = Some(code_action_tx);
         }
 
         // File watchers for build files and .editorconfig
@@ -1180,6 +1374,9 @@ impl LanguageServer for KotlinLanguageServer {
             .await
         {
             Ok(result) => {
+                if let Some(reason) = result.get("reason").and_then(|r| r.as_str()) {
+                    tracing::debug!("completion: sidecar reported: {}", reason);
+                }
                 let items = self.parse_completion_items(&result);
                 Ok(Some(CompletionResponse::Array(items)))
             }
@@ -1225,6 +1422,9 @@ impl LanguageServer for KotlinLanguageServer {
         {
             Ok(result) => {
                 tracing::debug!("hover: sidecar returned: {}", result);
+                if let Some(reason) = result.get("reason").and_then(|r| r.as_str()) {
+                    tracing::debug!("hover: sidecar reported: {}", reason);
+                }
                 if let Some(contents) = result.get("contents").and_then(|c| c.as_str()) {
                     Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
@@ -1269,6 +1469,9 @@ impl LanguageServer for KotlinLanguageServer {
             .await
         {
             Ok(result) => {
+                if let Some(reason) = result.get("reason").and_then(|r| r.as_str()) {
+                    tracing::debug!("goto_definition: sidecar reported: {}", reason);
+                }
                 let locations = self.parse_locations(&result);
                 if locations.is_empty() {
                     Ok(None)
@@ -1309,6 +1512,9 @@ impl LanguageServer for KotlinLanguageServer {
             .await
         {
             Ok(result) => {
+                if let Some(reason) = result.get("reason").and_then(|r| r.as_str()) {
+                    tracing::debug!("references: sidecar reported: {}", reason);
+                }
                 let locations = self.parse_locations(&result);
                 if locations.is_empty() {
                     Ok(None)
@@ -1574,49 +1780,61 @@ impl LanguageServer for KotlinLanguageServer {
         let range = params.range;
         let diagnostics = params.context.diagnostics;
 
-        let bridge = match self.get_bridge().await {
-            Some(b) => b,
-            None => return Self::server_not_initialized_error(),
+        // Get cached response to return immediately
+        let cached = {
+            let cache = self.code_action_cache.lock().await;
+            cache.get(&uri).cloned()
         };
 
-        match bridge
-            .request(
-                "codeActions",
-                Some(serde_json::json!({
-                    "uri": uri.as_str(),
-                    "line": range.start.line + 1,
-                    "character": range.start.character,
-                    "diagnostics": diagnostics.iter().map(|d| {
-                        serde_json::json!({
-                            "severity": d.severity,
-                            "message": d.message,
-                            "code": d.code,
-                        })
-                    }).collect::<Vec<_>>(),
-                })),
-            )
-            .await
-        {
-            Ok(result) => {
-                tracing::debug!("code_action: raw sidecar response for {}: {}", uri, result);
-                let actions = self.parse_code_actions(&result);
-                tracing::debug!(
-                    "code_action: parsed {} action(s) for {} at L{}:{}",
-                    actions.len(),
-                    uri,
-                    range.start.line,
-                    range.start.character
-                );
-                if actions.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(actions))
+        // Send request to debounce channel
+        let tx = {
+            let guard = self.code_action_tx.lock().await;
+            guard.clone()
+        };
+
+        if let Some(tx) = tx {
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            let request = CodeActionRequest {
+                uri: uri.clone(),
+                range,
+                diagnostics,
+                response_tx,
+            };
+
+            if tx.send(request).await.is_ok() {
+                // If we have cached data, return it immediately
+                // The debounced request will update the cache in the background
+                if let Some(actions) = cached {
+                    tracing::debug!(
+                        "code_action: returning {} cached action(s) for {}",
+                        actions.len(),
+                        uri
+                    );
+                    return Ok(Some(actions));
+                }
+
+                // No cache, wait for debounced response
+                match tokio::time::timeout(Duration::from_secs(5), response_rx).await {
+                    Ok(Ok(response)) => {
+                        tracing::debug!("code_action: received debounced response for {}", uri);
+                        return Ok(response);
+                    }
+                    Ok(Err(_)) => {
+                        tracing::warn!("code_action: response channel closed for {}", uri);
+                    }
+                    Err(_) => {
+                        tracing::warn!("code_action: timeout waiting for response for {}", uri);
+                    }
                 }
             }
-            Err(e) => {
-                tracing::warn!("code_action failed for {}: {}", uri, e);
-                Ok(None)
-            }
+        }
+
+        // Fallback: no debounce channel or send failed, return cached or None
+        if let Some(actions) = cached {
+            tracing::debug!("code_action: fallback to cached response for {}", uri);
+            Ok(Some(actions))
+        } else {
+            Ok(None)
         }
     }
 
