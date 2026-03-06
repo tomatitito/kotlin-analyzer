@@ -28,6 +28,17 @@ struct PendingRequest {
     response_tx: oneshot::Sender<Result<Value, Error>>,
 }
 
+/// Stored initialization parameters for restart.
+#[derive(Clone, Default)]
+struct InitParams {
+    project_root: String,
+    classpath: Vec<String>,
+    compiler_flags: Vec<String>,
+    source_roots: Vec<String>,
+}
+
+const MAX_RESTART_ATTEMPTS: u32 = 5;
+
 /// Manages the JVM sidecar process lifecycle and JSON-RPC communication.
 pub struct Bridge {
     state: Arc<Mutex<SidecarState>>,
@@ -45,6 +56,8 @@ pub struct Bridge {
     health_check_shutdown: Arc<Notify>,
     /// Holds the sidecar child process to prevent kill_on_drop from firing.
     child: Mutex<Option<tokio::process::Child>>,
+    /// Stored init params for automatic restart.
+    init_params: Mutex<InitParams>,
 }
 
 impl Bridge {
@@ -68,6 +81,7 @@ impl Bridge {
             restart_count: Arc::new(Mutex::new(0)),
             health_check_shutdown: Arc::new(Notify::new()),
             child: Mutex::new(None),
+            init_params: Mutex::new(InitParams::default()),
         }
     }
 
@@ -85,14 +99,15 @@ impl Bridge {
 
     /// Starts the health check heartbeat for the sidecar.
     fn start_health_check(
-        state: Arc<Mutex<SidecarState>>,
-        state_watch_tx: Arc<watch::Sender<SidecarState>>,
+        bridge: Arc<Bridge>,
         request_tx: mpsc::Sender<Request>,
         request_id: &AtomicU64,
-        pending: Arc<Mutex<Vec<PendingRequest>>>,
-        shutdown: Arc<Notify>,
-        health_shutdown: Arc<Notify>,
     ) {
+        let state = Arc::clone(&bridge.state);
+        let state_watch_tx = Arc::clone(&bridge.state_watch_tx);
+        let pending = Arc::clone(&bridge.pending);
+        let shutdown = Arc::clone(&bridge.shutdown_notify);
+        let health_shutdown = Arc::clone(&bridge.health_check_shutdown);
         let request_id_val = request_id.load(Ordering::Relaxed);
         let request_id_counter = Arc::new(AtomicU64::new(request_id_val));
 
@@ -107,6 +122,7 @@ impl Bridge {
 
             let mut consecutive_failures: u32 = 0;
             const MAX_FAILURES: u32 = 3;
+            let mut should_restart = false;
 
             loop {
                 tokio::select! {
@@ -128,6 +144,7 @@ impl Bridge {
                         if request_tx.send(request).await.is_err() {
                             tracing::warn!("health check: request channel closed");
                             Self::set_state(&state, &state_watch_tx, SidecarState::Degraded).await;
+                            should_restart = true;
                             break;
                         }
 
@@ -142,12 +159,14 @@ impl Bridge {
                                 tracing::warn!("health check: ping failed ({}/{}): {}", consecutive_failures, MAX_FAILURES, e);
                                 if consecutive_failures >= MAX_FAILURES {
                                     Self::set_state(&state, &state_watch_tx, SidecarState::Degraded).await;
+                                    should_restart = true;
                                     break;
                                 }
                             }
                             Ok(Err(_)) => {
                                 tracing::warn!("health check: response channel dropped");
                                 Self::set_state(&state, &state_watch_tx, SidecarState::Degraded).await;
+                                should_restart = true;
                                 break;
                             }
                             Err(_) => {
@@ -155,6 +174,7 @@ impl Bridge {
                                 tracing::warn!("health check: ping timeout ({}/{})", consecutive_failures, MAX_FAILURES);
                                 if consecutive_failures >= MAX_FAILURES {
                                     Self::set_state(&state, &state_watch_tx, SidecarState::Degraded).await;
+                                    should_restart = true;
                                     break;
                                 }
                             }
@@ -167,6 +187,11 @@ impl Bridge {
                         break;
                     }
                 }
+            }
+
+            // Trigger automatic restart if degraded
+            if should_restart {
+                Self::try_restart(bridge).await;
             }
         });
     }
@@ -190,12 +215,23 @@ impl Bridge {
     /// to the sidecar's `initialize` request so the Analysis API session
     /// is configured with actual project data.
     pub async fn start(
-        &self,
+        self: &Arc<Self>,
         project_root: Option<&str>,
         classpath: &[String],
         compiler_flags: &[String],
         source_roots: &[String],
     ) -> Result<(), Error> {
+        // Store init params for potential restart
+        {
+            let mut params = self.init_params.lock().await;
+            *params = InitParams {
+                project_root: project_root.unwrap_or("").to_string(),
+                classpath: classpath.to_vec(),
+                compiler_flags: compiler_flags.to_vec(),
+                source_roots: source_roots.to_vec(),
+            };
+        }
+
         {
             Self::set_state(&self.state, &self.state_watch_tx, SidecarState::Starting).await;
             tracing::debug!("sidecar state changed to Starting");
@@ -256,10 +292,12 @@ impl Bridge {
         let state = Arc::clone(&self.state);
         let state_watch_tx = Arc::clone(&self.state_watch_tx);
         let shutdown = Arc::clone(&self.shutdown_notify);
+        let reader_bridge = Arc::clone(self);
 
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             tracing::debug!("sidecar reader task started");
+            let mut should_restart = false;
             loop {
                 tokio::select! {
                     result = jsonrpc::read_message(&mut reader) => {
@@ -275,12 +313,15 @@ impl Bridge {
                                 let current = *state.lock().await;
                                 if current != SidecarState::Stopped {
                                     Self::set_state(&state, &state_watch_tx, SidecarState::Degraded).await;
+                                    should_restart = true;
                                 }
                                 break;
                             }
                             Err(e) => {
                                 tracing::error!("error reading sidecar response: {}", e);
                                 Self::cancel_all_pending(&pending, &format!("read error: {}", e)).await;
+                                Self::set_state(&state, &state_watch_tx, SidecarState::Degraded).await;
+                                should_restart = true;
                                 break;
                             }
                         }
@@ -290,6 +331,11 @@ impl Bridge {
                         break;
                     }
                 }
+            }
+
+            // Trigger automatic restart on unexpected exit
+            if should_restart {
+                Self::try_restart(reader_bridge).await;
             }
         });
 
@@ -349,13 +395,9 @@ impl Bridge {
 
                 // Start health check heartbeat
                 Self::start_health_check(
-                    Arc::clone(&self.state),
-                    Arc::clone(&self.state_watch_tx),
+                    Arc::clone(self),
                     tx.clone(),
                     &self.request_id,
-                    Arc::clone(&self.pending),
-                    Arc::clone(&self.shutdown_notify),
-                    Arc::clone(&self.health_check_shutdown),
                 );
 
                 // Reset restart counter on successful start
@@ -395,10 +437,10 @@ impl Bridge {
             SidecarState::Stopped => {
                 return Err(BridgeError::NotReady("sidecar is Stopped".into()).into());
             }
-            SidecarState::Degraded => {
-                return Err(BridgeError::NotReady("sidecar is Degraded".into()).into());
-            }
-            SidecarState::Starting => {
+            SidecarState::Starting | SidecarState::Degraded => {
+                // Starting: sidecar is booting up, wait for Ready.
+                // Degraded: a restart may be in progress — wait to see if
+                // the state transitions to Starting/Ready before giving up.
                 tracing::debug!("waiting for sidecar to become Ready (current: {:?})", current);
             }
         }
@@ -412,13 +454,13 @@ impl Bridge {
                 let state = *rx.borrow();
                 match state {
                     SidecarState::Ready => return Ok(()),
-                    SidecarState::Stopped | SidecarState::Degraded => {
+                    SidecarState::Stopped => {
                         return Err(BridgeError::NotReady(
                             format!("sidecar transitioned to {:?} while waiting", state),
                         ).into());
                     }
-                    SidecarState::Starting => {
-                        // Keep waiting
+                    SidecarState::Starting | SidecarState::Degraded => {
+                        // Keep waiting — restart may be in progress
                         continue;
                     }
                 }
@@ -485,6 +527,74 @@ impl Bridge {
             .await
             .map_err(|_| BridgeError::Crashed("request channel closed".into()))?;
         Ok(())
+    }
+
+    /// Attempts to restart the sidecar after it enters the Degraded state.
+    /// Uses exponential backoff (2s, 4s, 8s, 16s, 32s) up to MAX_RESTART_ATTEMPTS.
+    /// Called from the health check loop and reader EOF handler.
+    fn try_restart(bridge: Arc<Self>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            let attempt = {
+                let mut count = bridge.restart_count.lock().await;
+                if *count >= MAX_RESTART_ATTEMPTS {
+                    tracing::error!(
+                        "sidecar restart limit reached ({}/{}), giving up",
+                        *count, MAX_RESTART_ATTEMPTS,
+                    );
+                    Self::set_state(&bridge.state, &bridge.state_watch_tx, SidecarState::Stopped).await;
+                    return;
+                }
+                *count += 1;
+                *count
+            };
+
+            // Exponential backoff: 2^attempt seconds (2, 4, 8, 16, 32)
+            let delay = Duration::from_secs(1 << attempt);
+            tracing::warn!(
+                "sidecar restart attempt {}/{} in {:?}",
+                attempt, MAX_RESTART_ATTEMPTS, delay,
+            );
+            time::sleep(delay).await;
+
+            // Kill old process if still running
+            {
+                let mut child = bridge.child.lock().await;
+                if let Some(mut proc) = child.take() {
+                    let _ = proc.kill().await;
+                }
+            }
+
+            // Cancel any lingering pending requests
+            Self::cancel_all_pending(&bridge.pending, "sidecar restarting").await;
+
+            // Stop old health check
+            bridge.health_check_shutdown.notify_waiters();
+
+            // Retrieve stored init params
+            let params = bridge.init_params.lock().await.clone();
+
+            // Attempt restart
+            let result = bridge
+                .start(
+                    Some(&params.project_root),
+                    &params.classpath,
+                    &params.compiler_flags,
+                    &params.source_roots,
+                )
+                .await;
+
+            match result {
+                Ok(()) => {
+                    tracing::info!("sidecar restarted successfully (attempt {})", attempt);
+                }
+                Err(e) => {
+                    tracing::error!("sidecar restart failed (attempt {}): {}", attempt, e);
+                    Self::set_state(&bridge.state, &bridge.state_watch_tx, SidecarState::Degraded).await;
+                    // Schedule another attempt
+                    tokio::spawn(Self::try_restart(bridge));
+                }
+            }
+        })
     }
 
     /// Shuts down the sidecar gracefully.
@@ -682,7 +792,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_ready_returns_error_on_degraded() {
+    async fn wait_for_ready_waits_then_times_out_on_degraded() {
         let bridge = Bridge::new(
             PathBuf::from("sidecar.jar"),
             PathBuf::from("/usr/bin/java"),
@@ -690,8 +800,15 @@ mod tests {
         );
         Bridge::set_state(&bridge.state, &bridge.state_watch_tx, SidecarState::Degraded).await;
 
-        let result = bridge.wait_for_ready(Duration::from_secs(1)).await;
+        // Degraded now waits (restart may be in progress) then times out
+        let result = bridge.wait_for_ready(Duration::from_millis(100)).await;
         assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, Error::Bridge(BridgeError::Timeout(_))),
+            "expected Timeout, got: {:?}",
+            err
+        );
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
-use tower_lsp::jsonrpc::Result as LspResult;
+use tower_lsp::jsonrpc::{Error as JsonRpcError, ErrorCode, Result as LspResult};
 use tower_lsp::lsp_types;
 use tower_lsp::{Client, LanguageServer};
 
@@ -21,7 +21,7 @@ use crate::state::DocumentStore;
 pub struct KotlinLanguageServer {
     client: Client,
     documents: Arc<Mutex<DocumentStore>>,
-    bridge: Arc<Mutex<Option<Bridge>>>,
+    bridge: Arc<Mutex<Option<Arc<Bridge>>>>,
     config: Arc<Mutex<Config>>,
     project_root: Arc<Mutex<Option<PathBuf>>>,
     debounce_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Url>>>>,
@@ -39,6 +39,26 @@ impl KotlinLanguageServer {
         }
     }
 
+    /// Creates a "server not initialized" error for when the sidecar bridge is unavailable.
+    ///
+    /// Returns LSP error code -32002, signaling to clients that the server is still starting up
+    /// and they should retry the request later.
+    fn server_not_initialized_error<T>() -> LspResult<T> {
+        Err(JsonRpcError {
+            code: ErrorCode::ServerError(-32002),
+            message: "Server not initialized (sidecar still starting)".into(),
+            data: None,
+        })
+    }
+
+    /// Returns a cloned Arc to the bridge, releasing the mutex immediately.
+    /// This prevents holding the bridge mutex during long-running sidecar requests,
+    /// which would block all other LSP handlers.
+    async fn get_bridge(&self) -> Option<Arc<Bridge>> {
+        let guard = self.bridge.lock().await;
+        guard.as_ref().map(Arc::clone)
+    }
+
     /// Publishes diagnostics for a document by requesting analysis from the sidecar.
     async fn analyze_document(&self, uri: &Url) {
         tracing::debug!("analyze_document: {}", uri);
@@ -50,8 +70,7 @@ impl KotlinLanguageServer {
             return;
         }
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
             None => {
                 tracing::debug!("analyze_document: bridge is None (sidecar still starting), skipping");
@@ -194,8 +213,11 @@ impl KotlinLanguageServer {
                             if is_gradle_script(&uri) {
                                 continue;
                             }
-                            let bridge = bridge.lock().await;
-                            if let Some(bridge) = bridge.as_ref() {
+                            let bridge_arc = {
+                                let guard = bridge.lock().await;
+                                guard.as_ref().map(Arc::clone)
+                            };
+                            if let Some(bridge) = bridge_arc {
                                 if bridge.state().await == SidecarState::Ready {
                                     let documents = documents.lock().await;
                                     if let Some(doc) = documents.get(&uri) {
@@ -621,7 +643,7 @@ impl LanguageServer for KotlinLanguageServer {
 
             tracing::debug!("sidecar JAR found at {:?}", sidecar_jar);
             tracing::debug!("creating Bridge with sidecar JAR and java path");
-            let bridge = Bridge::new(sidecar_jar, java_path, config);
+            let bridge = Arc::new(Bridge::new(sidecar_jar, java_path, config));
 
             // Store the bridge BEFORE starting so LSP requests that arrive
             // during sidecar startup can reach it and wait for Ready state
@@ -707,8 +729,14 @@ impl LanguageServer for KotlinLanguageServer {
                         tracing::info!("replaying {} open document(s) after sidecar startup", open_docs.len());
                     }
 
-                    let bridge_ref = bridge_holder.lock().await;
-                    if let Some(bridge) = bridge_ref.as_ref() {
+                    // Clone the Arc<Bridge> out of the mutex so the lock is released
+                    // before the replay loop. This prevents blocking hover/completion
+                    // handlers during the potentially long replay.
+                    let bridge_arc = {
+                        let guard = bridge_holder.lock().await;
+                        guard.as_ref().map(Arc::clone)
+                    };
+                    if let Some(bridge) = bridge_arc {
                         for (uri, text, version) in &open_docs {
                             tracing::debug!("replay: sending didOpen for {}", uri);
                             let _ = bridge.notify(
@@ -745,7 +773,6 @@ impl LanguageServer for KotlinLanguageServer {
                             }
                         }
                     }
-                    drop(bridge_ref);
 
                     // --- Project-wide background analysis ---
                     let bg_bridge = Arc::clone(&bridge_holder);
@@ -781,23 +808,24 @@ impl LanguageServer for KotlinLanguageServer {
                             .await;
 
                         // Call analyzeAll with a generous timeout (5 minutes)
-                        let analyze_result = {
-                            let bridge = bg_bridge.lock().await;
-                            match bridge.as_ref() {
-                                Some(b) => {
-                                    if b.state().await != SidecarState::Ready {
-                                        tracing::warn!("background analysis: sidecar not ready, skipping");
-                                        None
-                                    } else {
-                                        Some(b.request_with_timeout(
-                                            "analyzeAll",
-                                            None,
-                                            Duration::from_secs(300),
-                                        ).await)
-                                    }
+                        let bridge_arc = {
+                            let guard = bg_bridge.lock().await;
+                            guard.as_ref().map(Arc::clone)
+                        };
+                        let analyze_result = match bridge_arc {
+                            Some(b) => {
+                                if b.state().await != SidecarState::Ready {
+                                    tracing::warn!("background analysis: sidecar not ready, skipping");
+                                    None
+                                } else {
+                                    Some(b.request_with_timeout(
+                                        "analyzeAll",
+                                        None,
+                                        Duration::from_secs(300),
+                                    ).await)
                                 }
-                                None => None,
                             }
+                            None => None,
                         };
 
                         match analyze_result {
@@ -942,8 +970,7 @@ impl LanguageServer for KotlinLanguageServer {
     async fn shutdown(&self) -> LspResult<()> {
         tracing::info!("kotlin-analyzer: shutting down");
 
-        let bridge = self.bridge.lock().await;
-        if let Some(bridge) = bridge.as_ref() {
+        if let Some(bridge) = self.get_bridge().await {
             if let Err(e) = bridge.shutdown().await {
                 tracing::error!("error shutting down sidecar: {}", e);
             }
@@ -974,8 +1001,7 @@ impl LanguageServer for KotlinLanguageServer {
         }
 
         // Notify sidecar
-        let bridge = self.bridge.lock().await;
-        if let Some(bridge) = bridge.as_ref() {
+        if let Some(bridge) = self.get_bridge().await {
             let _ = bridge
                 .notify(
                     "textDocument/didOpen",
@@ -987,7 +1013,6 @@ impl LanguageServer for KotlinLanguageServer {
                 )
                 .await;
         }
-        drop(bridge);
 
         // Trigger fresh analysis (will update the cache when complete)
         self.analyze_document(&uri).await;
@@ -1019,18 +1044,15 @@ impl LanguageServer for KotlinLanguageServer {
         }
 
         // Notify sidecar
-        {
-            let bridge = self.bridge.lock().await;
-            if let Some(bridge) = bridge.as_ref() {
-                let _ = bridge
-                    .notify(
-                        "textDocument/didClose",
-                        Some(serde_json::json!({
-                            "uri": uri.as_str(),
-                        })),
-                    )
-                    .await;
-            }
+        if let Some(bridge) = self.get_bridge().await {
+            let _ = bridge
+                .notify(
+                    "textDocument/didClose",
+                    Some(serde_json::json!({
+                        "uri": uri.as_str(),
+                    })),
+                )
+                .await;
         }
 
         // Do NOT clear diagnostics on didClose — Zed sends didClose when switching
@@ -1051,10 +1073,9 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1085,12 +1106,11 @@ impl LanguageServer for KotlinLanguageServer {
 
         tracing::debug!("hover request: {}:{}:{}", uri, position.line, position.character);
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
             None => {
-                tracing::warn!("hover: bridge is None, returning null");
-                return Ok(None);
+                tracing::warn!("hover: bridge is None, returning ServerNotInitialized error");
+                return Self::server_not_initialized_error();
             }
         };
 
@@ -1137,10 +1157,9 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1177,10 +1196,9 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1290,10 +1308,9 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1341,8 +1358,7 @@ impl LanguageServer for KotlinLanguageServer {
             let mut c = self.config.lock().await;
             *c = config.clone();
 
-            let bridge = self.bridge.lock().await;
-            if let Some(bridge) = bridge.as_ref() {
+            if let Some(bridge) = self.get_bridge().await {
                 bridge.update_config(config).await;
             }
         }
@@ -1409,10 +1425,9 @@ impl LanguageServer for KotlinLanguageServer {
         let position = params.text_document_position.position;
         let new_name = params.new_name;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1451,10 +1466,9 @@ impl LanguageServer for KotlinLanguageServer {
         let range = params.range;
         let diagnostics = params.context.diagnostics;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1495,10 +1509,9 @@ impl LanguageServer for KotlinLanguageServer {
     async fn symbol(&self, params: WorkspaceSymbolParams) -> LspResult<Option<Vec<SymbolInformation>>> {
         let query = params.query;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1529,10 +1542,9 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = params.text_document.uri;
         let range = params.range;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1564,10 +1576,9 @@ impl LanguageServer for KotlinLanguageServer {
     async fn code_lens(&self, params: CodeLensParams) -> LspResult<Option<Vec<CodeLens>>> {
         let uri = params.text_document.uri;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1600,10 +1611,9 @@ impl LanguageServer for KotlinLanguageServer {
     ) -> LspResult<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1636,10 +1646,9 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1676,10 +1685,9 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = &item.uri;
         let position = item.selection_range.start;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1716,10 +1724,9 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge
@@ -1756,10 +1763,9 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = &item.uri;
         let position = item.selection_range.start;
 
-        let bridge = self.bridge.lock().await;
-        let bridge = match bridge.as_ref() {
+        let bridge = match self.get_bridge().await {
             Some(b) => b,
-            None => return Ok(None),
+            None => return Self::server_not_initialized_error(),
         };
 
         match bridge

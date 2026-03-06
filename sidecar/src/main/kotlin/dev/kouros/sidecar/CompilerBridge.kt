@@ -60,6 +60,10 @@ class CompilerBridge {
     private val decompiledFileCache = mutableMapOf<String, Path>()
     // When true, the session must be rebuilt before next analysis (new virtual files appeared)
     private var sessionDirty = false
+    // URIs of on-disk files whose content has been overridden via updateFile()
+    private val dirtyOnDiskFiles = mutableSetOf<String>()
+    // Maps shadow source tree paths back to original paths for findKtFile matching
+    private val shadowPathMapping = mutableMapOf<String, String>()
     // Stored init params for session rebuilds
     private var initProjectRoot = ""
     private var initClasspath = emptyList<String>()
@@ -97,7 +101,6 @@ class CompilerBridge {
         for ((uri, text) in virtualFiles) {
             writeVirtualFileToDisk(uri, text)
         }
-        sessionDirty = false
 
         // Clear cached LightVirtualFiles from previous session
         lightFileCache.clear()
@@ -132,8 +135,18 @@ class CompilerBridge {
             emptyList()
         }
 
-        // Include the virtual file temp dir as a source root so FIR can discover virtual files
-        val effectiveSourceRoots = if (virtualFileTempDir != null && virtualFilesOnDisk.isNotEmpty()) {
+        // When on-disk files have virtual overrides, build a shadow source tree so the
+        // session discovers the virtual content instead of stale on-disk content.
+        // Without this, FIR sees both the session file (old content) and a LightVirtualFile
+        // (new content) simultaneously, causing REDECLARATION and phantom resolution.
+        val effectiveSourceRoots = if (dirtyOnDiskFiles.isNotEmpty() && virtualFileTempDir != null) {
+            val shadowRoots = buildShadowSourceRoots(baseSourceRoots)
+            if (virtualFilesOnDisk.isNotEmpty()) {
+                shadowRoots + listOf(virtualFileTempDir!!)
+            } else {
+                shadowRoots
+            }
+        } else if (virtualFileTempDir != null && virtualFilesOnDisk.isNotEmpty()) {
             baseSourceRoots + listOf(virtualFileTempDir!!)
         } else {
             baseSourceRoots
@@ -160,82 +173,94 @@ class CompilerBridge {
         System.err.println("CompilerBridge: stdlibJars=${stdlibJars.size} jars")
         System.err.println("CompilerBridge: jdkHome=$jdkHome")
 
-        session = buildStandaloneAnalysisAPISession(disposable) {
-            buildKtModuleProvider {
-                platform = JvmPlatforms.defaultJvmPlatform
+        try {
+            session = buildStandaloneAnalysisAPISession(disposable) {
+                buildKtModuleProvider {
+                    platform = JvmPlatforms.defaultJvmPlatform
 
-                // JDK module
-                val jdkModule = if (jdkHome.isNotEmpty()) {
-                    buildKtSdkModule {
-                        addBinaryRootsFromJdkHome(Paths.get(jdkHome), isJre = false)
-                        libraryName = "JDK"
-                        platform = JvmPlatforms.defaultJvmPlatform
-                    }
-                } else {
-                    // Try to use the current JDK
-                    val currentJdkHome = System.getProperty("java.home")
-                    if (currentJdkHome != null) {
-                        System.err.println("CompilerBridge: using current JDK at $currentJdkHome")
+                    // JDK module
+                    val jdkModule = if (jdkHome.isNotEmpty()) {
                         buildKtSdkModule {
-                            addBinaryRootsFromJdkHome(Paths.get(currentJdkHome), isJre = false)
+                            addBinaryRootsFromJdkHome(Paths.get(jdkHome), isJre = false)
                             libraryName = "JDK"
                             platform = JvmPlatforms.defaultJvmPlatform
                         }
+                    } else {
+                        // Try to use the current JDK
+                        val currentJdkHome = System.getProperty("java.home")
+                        if (currentJdkHome != null) {
+                            System.err.println("CompilerBridge: using current JDK at $currentJdkHome")
+                            buildKtSdkModule {
+                                addBinaryRootsFromJdkHome(Paths.get(currentJdkHome), isJre = false)
+                                libraryName = "JDK"
+                                platform = JvmPlatforms.defaultJvmPlatform
+                            }
+                        } else null
+                    }
+
+                    // Kotlin stdlib module
+                    val stdlibModule = if (stdlibJars.isNotEmpty()) {
+                        buildKtLibraryModule {
+                            libraryName = "kotlin-stdlib"
+                            for (jar in stdlibJars) {
+                                addBinaryRoot(jar)
+                            }
+                            platform = JvmPlatforms.defaultJvmPlatform
+                        }
                     } else null
-                }
 
-                // Kotlin stdlib module
-                val stdlibModule = if (stdlibJars.isNotEmpty()) {
-                    buildKtLibraryModule {
-                        libraryName = "kotlin-stdlib"
-                        for (jar in stdlibJars) {
-                            addBinaryRoot(jar)
+                    // Project classpath as a single flat library module
+                    // Using one module with all JARs mirrors flat-classpath semantics
+                    // and avoids JPMS module-info boundary issues (e.g. JUnit 6)
+                    val classpathRoots = classpath
+                        .map { Paths.get(it) }
+                        .filter { it.toFile().exists() }
+                    val classpathModule = if (classpathRoots.isNotEmpty()) {
+                        buildKtLibraryModule {
+                            libraryName = "project-dependencies"
+                            for (jar in classpathRoots) {
+                                addBinaryRoot(jar)
+                            }
+                            platform = JvmPlatforms.defaultJvmPlatform
                         }
-                        platform = JvmPlatforms.defaultJvmPlatform
-                    }
-                } else null
+                    } else null
 
-                // Project classpath as a single flat library module
-                // Using one module with all JARs mirrors flat-classpath semantics
-                // and avoids JPMS module-info boundary issues (e.g. JUnit 6)
-                val classpathRoots = classpath
-                    .map { Paths.get(it) }
-                    .filter { it.toFile().exists() }
-                val classpathModule = if (classpathRoots.isNotEmpty()) {
-                    buildKtLibraryModule {
-                        libraryName = "project-dependencies"
-                        for (jar in classpathRoots) {
-                            addBinaryRoot(jar)
+                    // Source module
+                    val mainModule = buildKtSourceModule {
+                        moduleName = "main"
+                        platform = JvmPlatforms.defaultJvmPlatform
+
+                        for (root in effectiveSourceRoots) {
+                            addSourceRoot(root)
                         }
-                        platform = JvmPlatforms.defaultJvmPlatform
+
+                        if (languageFeatures.isNotEmpty()) {
+                            languageVersionSettings = LanguageVersionSettingsImpl(
+                                languageVersion = LanguageVersion.KOTLIN_2_1,
+                                apiVersion = ApiVersion.KOTLIN_2_1,
+                                specificFeatures = languageFeatures,
+                            )
+                        }
+
+                        if (jdkModule != null) addRegularDependency(jdkModule)
+                        if (stdlibModule != null) addRegularDependency(stdlibModule)
+                        if (classpathModule != null) addRegularDependency(classpathModule)
                     }
-                } else null
-
-                // Source module
-                val mainModule = buildKtSourceModule {
-                    moduleName = "main"
-                    platform = JvmPlatforms.defaultJvmPlatform
-
-                    for (root in effectiveSourceRoots) {
-                        addSourceRoot(root)
-                    }
-
-                    if (languageFeatures.isNotEmpty()) {
-                        languageVersionSettings = LanguageVersionSettingsImpl(
-                            languageVersion = LanguageVersion.KOTLIN_2_1,
-                            apiVersion = ApiVersion.KOTLIN_2_1,
-                            specificFeatures = languageFeatures,
-                        )
-                    }
-
-                    if (jdkModule != null) addRegularDependency(jdkModule)
-                    if (stdlibModule != null) addRegularDependency(stdlibModule)
-                    if (classpathModule != null) addRegularDependency(classpathModule)
+                    sourceModule = mainModule
+                    addModule(mainModule)
                 }
-                sourceModule = mainModule
-                addModule(mainModule)
             }
+        } catch (e: Exception) {
+            // Session build failed — leave sessionDirty = true so the next
+            // ensureSessionCurrent() call retries the build instead of using
+            // a stale/null session forever.
+            sessionDirty = true
+            System.err.println("CompilerBridge: session build failed, will retry on next request: ${e.message}")
+            throw e
         }
+
+        // Session built successfully — clear the dirty flag
+        sessionDirty = false
 
         // Register a custom module provider that maps KtPsiFactory files (LightVirtualFile)
         // to the source module. Without this, KtPsiFactory files fall into the default
@@ -270,6 +295,34 @@ class CompilerBridge {
     fun updateFile(uri: String, text: String) {
         virtualFiles[uri] = text
         updateFileInSession(uri, text)
+
+        // Detect on-disk file edits: the session's FIR caches are baked in at creation
+        // time, so when an on-disk file's content changes, the session must be rebuilt
+        // with a shadow source tree that reflects the virtual content.
+        // Only mark dirty if the content actually differs from on-disk to avoid
+        // unnecessary rebuilds (e.g., textDocument/didOpen sends original content).
+        val filePath = uriToPath(uri)
+        val onDiskFile = File(filePath)
+        if (onDiskFile.exists()) {
+            if (uri in dirtyOnDiskFiles) {
+                // Already dirty — just need rebuild for new content
+                sessionDirty = true
+            } else {
+                // First edit: compare with on-disk content
+                try {
+                    val onDiskContent = onDiskFile.readText()
+                    if (text != onDiskContent) {
+                        dirtyOnDiskFiles.add(uri)
+                        sessionDirty = true
+                        System.err.println("CompilerBridge: updateFile($uri) — on-disk file content changed, session marked dirty")
+                    }
+                } catch (e: Exception) {
+                    // Can't read the file — mark dirty to be safe
+                    dirtyOnDiskFiles.add(uri)
+                    sessionDirty = true
+                }
+            }
+        }
 
         // Write virtual file to temp dir so FIR can discover it for cross-package resolution.
         // Only needed for files that don't exist on disk in the session's source roots.
@@ -306,6 +359,10 @@ class CompilerBridge {
     fun removeFile(uri: String) {
         virtualFiles.remove(uri)
         symbolIndex.removeFile(uri)
+        if (uri in dirtyOnDiskFiles) {
+            dirtyOnDiskFiles.remove(uri)
+            sessionDirty = true
+        }
         if (uri in virtualFilesOnDisk) {
             virtualFilesOnDisk.remove(uri)
             sessionDirty = true
@@ -577,6 +634,7 @@ class CompilerBridge {
      * Returns type/signature information with KDoc documentation when available.
      */
     fun hover(uri: String, line: Int, character: Int): JsonObject {
+        ensureSessionCurrent()
         val result = JsonObject()
         val perfStart = System.currentTimeMillis()
 
@@ -665,6 +723,7 @@ class CompilerBridge {
      * Supports both scope-based completions and dot-member completions.
      */
     fun completion(uri: String, line: Int, character: Int): JsonObject {
+        ensureSessionCurrent()
         val result = JsonObject()
         val itemsArray = JsonArray()
         val perfStart = System.currentTimeMillis()
@@ -721,6 +780,7 @@ class CompilerBridge {
      * Provides go-to-definition locations.
      */
     fun definition(uri: String, line: Int, character: Int): JsonObject {
+        ensureSessionCurrent()
         val result = JsonObject()
         val locationsArray = JsonArray()
         val perfStart = System.currentTimeMillis()
@@ -1241,7 +1301,7 @@ class CompilerBridge {
                     return@analyze
                 }
 
-                val fileUri = ktFile.virtualFile?.path?.let { "file://$it" } ?: uri
+                val fileUri = uri
 
                 // Collect all locations that need renaming (references + declaration)
                 val renameOffsets = mutableSetOf<Int>()
@@ -1361,7 +1421,7 @@ class CompilerBridge {
                     return@analyze
                 }
 
-                val fileUri = ktFile.virtualFile?.path?.let { "file://$it" } ?: uri
+                val fileUri = uri
 
                 // 1. Diagnostic-based code actions
                 try {
@@ -2454,7 +2514,7 @@ class CompilerBridge {
                     return@analyze
                 }
 
-                val fileUri = ktFile.virtualFile?.path?.let { "file://$it" } ?: uri
+                val fileUri = uri
 
                 // Collect classes, interfaces, and objects for "N references" lenses
                 val classOrObjects = PsiTreeUtil.collectElementsOfType(
@@ -4504,7 +4564,10 @@ class CompilerBridge {
         return session.modulesWithFiles.entries
             .flatMap { (_, files) -> files }
             .filterIsInstance<KtFile>()
-            .find { it.virtualFile.path == filePath || it.name == filePath }
+            .find {
+                val path = it.virtualFile.path
+                path == filePath || it.name == filePath || shadowPathMapping[path] == filePath
+            }
     }
 
     /**
@@ -4514,6 +4577,59 @@ class CompilerBridge {
      */
     private fun updateFileInSession(uri: String, text: String) {
         System.err.println("CompilerBridge: updateFile($uri) — stored in virtualFiles (${text.length} chars)")
+    }
+
+    /**
+     * Builds a shadow source tree in the temp directory with virtual content applied.
+     *
+     * When on-disk files have been edited via updateFile(), the session must be rebuilt
+     * with the virtual content. This method copies all source files from the original
+     * source roots into a shadow directory, replacing modified files with their virtual
+     * content. The shadow directories are used as source roots instead of the originals,
+     * ensuring FIR only sees one version of each file.
+     */
+    private fun buildShadowSourceRoots(baseSourceRoots: List<Path>): List<Path> {
+        val tempDir = virtualFileTempDir ?: return baseSourceRoots
+        val shadowRoot = tempDir.resolve("shadow")
+
+        // Clean previous shadow tree
+        if (shadowRoot.toFile().exists()) {
+            shadowRoot.toFile().deleteRecursively()
+        }
+        shadowPathMapping.clear()
+
+        val shadowRoots = mutableListOf<Path>()
+        for ((index, root) in baseSourceRoots.withIndex()) {
+            val rootFile = root.toFile()
+            if (!rootFile.exists()) continue
+
+            val shadowDir = shadowRoot.resolve("root$index")
+            Files.createDirectories(shadowDir)
+
+            rootFile.walk()
+                .filter { it.isFile && it.extension == "kt" }
+                .forEach { file ->
+                    val relativePath = file.relativeTo(rootFile).path
+                    val uri = "file://${file.absolutePath}"
+                    val hasVirtualOverride = virtualFiles.containsKey(uri)
+                    val content = virtualFiles[uri] ?: file.readText()
+                    val target = shadowDir.resolve(relativePath)
+                    target.parent.toFile().mkdirs()
+                    Files.writeString(target, content)
+
+                    if (hasVirtualOverride) {
+                        System.err.println("CompilerBridge: shadow tree — $relativePath using VIRTUAL content (${content.length} chars): ${content.take(80)}")
+                    }
+
+                    // Map shadow path back to original for findKtFile matching
+                    shadowPathMapping[target.toString()] = file.absolutePath
+                }
+
+            shadowRoots.add(shadowDir)
+        }
+
+        System.err.println("CompilerBridge: built shadow source tree with ${shadowPathMapping.size} files across ${shadowRoots.size} root(s)")
+        return shadowRoots
     }
 
     /**
@@ -4684,20 +4800,26 @@ class CompilerBridge {
 
         val virtualContent = virtualFiles[uri]
 
+        // Helper: match a session file to the requested path (including shadow tree paths)
+        fun matchesPath(ktFile: KtFile): Boolean {
+            val path = ktFile.virtualFile.path
+            return path == filePath || ktFile.name == filePath ||
+                shadowPathMapping[path] == filePath
+        }
+
         // If no virtual content, use the session file (on-disk content)
         if (virtualContent == null) {
-            val sessionFile = allSessionFiles
-                .find { it.virtualFile.path == filePath || it.name == filePath }
+            val sessionFile = allSessionFiles.find { matchesPath(it) }
             if (sessionFile != null) {
                 System.err.println("CompilerBridge: findKtFile($uri) — FOUND in session: ${sessionFile.virtualFile.path}")
                 return sessionFile
             }
         } else {
-            // Check if session file has matching content — by original path or temp dir path
+            // Check if session file has matching content — by original path, temp dir path, or shadow path
             val tempDiskPath = virtualFileDiskPaths[uri]
             val sessionFile = allSessionFiles
                 .find {
-                    it.virtualFile.path == filePath || it.name == filePath ||
+                    matchesPath(it) ||
                     (tempDiskPath != null && it.virtualFile.path == tempDiskPath)
                 }
             if (sessionFile != null && sessionFile.text == virtualContent) {
@@ -4705,7 +4827,7 @@ class CompilerBridge {
                 return sessionFile
             }
 
-            // Content differs or file not in session — create a LightVirtualFile-backed
+            // File not in session or in-place update failed — create a LightVirtualFile-backed
             // KtFile through PsiManager. This gives a proper VFS-backed file that the
             // custom KotlinProjectStructureProvider maps to the source module, enabling
             // full FIR resolution including class-body members.
