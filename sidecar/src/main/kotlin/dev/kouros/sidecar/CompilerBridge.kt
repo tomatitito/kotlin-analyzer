@@ -60,6 +60,10 @@ class CompilerBridge {
     private val decompiledFileCache = mutableMapOf<String, Path>()
     // When true, the session must be rebuilt before next analysis (new virtual files appeared)
     private var sessionDirty = false
+    // Timestamp of the last edit that marked the session dirty (for debounce)
+    private var lastDirtyTimestamp: Long = 0L
+    // When true, new files appeared/disappeared and rebuild cannot be debounced
+    private var newFilesPending = false
     // URIs of on-disk files whose content has been overridden via updateFile()
     private val dirtyOnDiskFiles = mutableSetOf<String>()
     // Maps shadow source tree paths back to original paths for findKtFile matching
@@ -307,6 +311,7 @@ class CompilerBridge {
             if (uri in dirtyOnDiskFiles) {
                 // Already dirty — just need rebuild for new content
                 sessionDirty = true
+                lastDirtyTimestamp = System.currentTimeMillis()
             } else {
                 // First edit: compare with on-disk content
                 try {
@@ -314,12 +319,14 @@ class CompilerBridge {
                     if (text != onDiskContent) {
                         dirtyOnDiskFiles.add(uri)
                         sessionDirty = true
+                        lastDirtyTimestamp = System.currentTimeMillis()
                         System.err.println("CompilerBridge: updateFile($uri) — on-disk file content changed, session marked dirty")
                     }
                 } catch (e: Exception) {
                     // Can't read the file — mark dirty to be safe
                     dirtyOnDiskFiles.add(uri)
                     sessionDirty = true
+                    lastDirtyTimestamp = System.currentTimeMillis()
                 }
             }
         }
@@ -332,10 +339,13 @@ class CompilerBridge {
         if (nowOnDisk && !wasOnDisk) {
             // New file appeared in temp dir — session must be rebuilt so FIR discovers it
             sessionDirty = true
+            lastDirtyTimestamp = System.currentTimeMillis()
+            newFilesPending = true
             System.err.println("CompilerBridge: updateFile($uri) — new virtual file in temp dir, session marked dirty")
         } else if (nowOnDisk && wasOnDisk) {
             // Content changed for existing temp dir file — need rebuild since session caches file content
             sessionDirty = true
+            lastDirtyTimestamp = System.currentTimeMillis()
         }
 
         // Re-index the file with updated content
@@ -362,10 +372,13 @@ class CompilerBridge {
         if (uri in dirtyOnDiskFiles) {
             dirtyOnDiskFiles.remove(uri)
             sessionDirty = true
+            lastDirtyTimestamp = System.currentTimeMillis()
         }
         if (uri in virtualFilesOnDisk) {
             virtualFilesOnDisk.remove(uri)
             sessionDirty = true
+            lastDirtyTimestamp = System.currentTimeMillis()
+            newFilesPending = true
         }
     }
 
@@ -375,6 +388,14 @@ class CompilerBridge {
      */
     private fun ensureSessionCurrent() {
         if (!sessionDirty || session == null) return
+        if (!newFilesPending) {
+            val elapsed = System.currentTimeMillis() - lastDirtyTimestamp
+            if (elapsed < 500) {
+                // Not enough time since last edit — skip rebuild, use existing session with LightVirtualFile overlay
+                return
+            }
+        }
+        newFilesPending = false
         System.err.println("CompilerBridge: session dirty, rebuilding to pick up virtual file changes")
         initialize(initProjectRoot, initClasspath, initCompilerFlags, initJdkHome, initSourceRoots)
     }
