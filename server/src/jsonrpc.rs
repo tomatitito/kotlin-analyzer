@@ -36,6 +36,20 @@ pub struct ResponseError {
     pub data: Option<serde_json::Value>,
 }
 
+/// JSON-RPC 2.0 notification from the sidecar (no id, has method).
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub method: String,
+    pub params: Option<serde_json::Value>,
+}
+
+/// A message from the sidecar: either a response to a request or an unsolicited notification.
+#[derive(Debug)]
+pub enum Message {
+    Response(Response),
+    Notification(Notification),
+}
+
 impl Request {
     pub fn new(id: u64, method: &str, params: Option<serde_json::Value>) -> Self {
         Self {
@@ -79,9 +93,10 @@ pub async fn write_message(
 
 /// Reads a JSON-RPC message with Content-Length framing from an async reader.
 /// Returns `None` on EOF (sidecar exited).
+/// Distinguishes between responses (have `id`) and notifications (have `method`, no `id`).
 pub async fn read_message(
     reader: &mut BufReader<ChildStdout>,
-) -> Result<Option<Response>, crate::error::Error> {
+) -> Result<Option<Message>, crate::error::Error> {
     let content_length = match read_content_length(reader).await? {
         Some(len) => len,
         None => return Ok(None), // EOF
@@ -94,9 +109,18 @@ pub async fn read_message(
         Err(e) => return Err(crate::error::Error::Io(e)),
     }
 
-    let response: Response = serde_json::from_slice(&body).map_err(ProtocolError::JsonParse)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(ProtocolError::JsonParse)?;
 
-    Ok(Some(response))
+    // Notifications have a "method" field but no "id" field
+    if value.get("method").is_some() && value.get("id").is_none() {
+        let method = value["method"].as_str().unwrap_or("").to_string();
+        let params = value.get("params").cloned();
+        Ok(Some(Message::Notification(Notification { method, params })))
+    } else {
+        let response: Response = serde_json::from_value(value).map_err(ProtocolError::JsonParse)?;
+        Ok(Some(Message::Response(response)))
+    }
 }
 
 /// Reads headers until the empty line separator, extracts Content-Length.

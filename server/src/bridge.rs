@@ -11,7 +11,7 @@ use tokio::time;
 
 use crate::config::Config;
 use crate::error::{BridgeError, Error};
-use crate::jsonrpc::{self, Request, Response};
+use crate::jsonrpc::{self, Message, Notification, Request, Response};
 
 /// Sidecar lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,6 +58,8 @@ pub struct Bridge {
     child: Mutex<Option<tokio::process::Child>>,
     /// Stored init params for automatic restart.
     init_params: Mutex<InitParams>,
+    /// Channel sender for forwarding sidecar notifications to subscribers.
+    notification_tx: Arc<Mutex<Option<mpsc::Sender<Notification>>>>,
 }
 
 impl Bridge {
@@ -86,6 +88,7 @@ impl Bridge {
             health_check_shutdown: Arc::new(Notify::new()),
             child: Mutex::new(None),
             init_params: Mutex::new(InitParams::default()),
+            notification_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -293,12 +296,13 @@ impl Bridge {
             });
         }
 
-        // Spawn the reader task to process incoming responses
+        // Spawn the reader task to process incoming responses and notifications
         let pending = Arc::clone(&self.pending);
         let state = Arc::clone(&self.state);
         let state_watch_tx = Arc::clone(&self.state_watch_tx);
         let shutdown = Arc::clone(&self.shutdown_notify);
         let reader_bridge = Arc::clone(self);
+        let notification_tx = Arc::clone(&self.notification_tx);
 
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
@@ -308,9 +312,16 @@ impl Bridge {
                 tokio::select! {
                     result = jsonrpc::read_message(&mut reader) => {
                         match result {
-                            Ok(Some(response)) => {
-                                tracing::debug!("Read message from sidecar");
+                            Ok(Some(Message::Response(response))) => {
+                                tracing::debug!("Read response from sidecar");
                                 Self::dispatch_response(&pending, response).await;
+                            }
+                            Ok(Some(Message::Notification(notification))) => {
+                                tracing::debug!("Read notification from sidecar: {}", notification.method);
+                                let tx = notification_tx.lock().await;
+                                if let Some(ref sender) = *tx {
+                                    let _ = sender.send(notification).await;
+                                }
                             }
                             Ok(None) => {
                                 // EOF - sidecar exited. Cancel all pending requests immediately.
@@ -623,6 +634,15 @@ impl Bridge {
                 }
             }
         })
+    }
+
+    /// Subscribes to sidecar notifications (JSON-RPC messages with method but no id).
+    /// Returns a receiver that yields notifications as they arrive from the sidecar.
+    pub async fn subscribe_notifications(&self) -> mpsc::Receiver<Notification> {
+        let (tx, rx) = mpsc::channel(64);
+        let mut slot = self.notification_tx.lock().await;
+        *slot = Some(tx);
+        rx
     }
 
     /// Shuts down the sidecar gracefully.
