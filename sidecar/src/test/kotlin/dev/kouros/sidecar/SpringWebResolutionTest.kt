@@ -4,6 +4,7 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
 import java.io.File
+import java.nio.file.Paths
 import java.net.URI
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -60,8 +61,12 @@ class SpringWebResolutionTest {
         data class ProjectConfig(val classpath: List<String>, val compilerFlags: List<String>)
 
         private fun resolveGradleProjectConfig(fixtureDir: String): ProjectConfig {
-            val process = ProcessBuilder("gradle", "printProjectConfig", "--quiet")
+            val process = ProcessBuilder(resolveGradleCommand(fixtureDir))
                 .directory(java.io.File(fixtureDir))
+                .apply {
+                    val gradleHome = Paths.get(System.getProperty("java.io.tmpdir"), "kotlin-analyzer-gradle").toString()
+                    environment()["GRADLE_USER_HOME"] = gradleHome
+                }
                 .redirectErrorStream(true)
                 .start()
 
@@ -84,6 +89,30 @@ class SpringWebResolutionTest {
                 classpath = extractBlock("---CLASSPATH-START---", "---CLASSPATH-END---"),
                 compilerFlags = extractBlock("---FLAGS-START---", "---FLAGS-END---"),
             )
+        }
+
+        private fun resolveGradleCommand(fixtureDir: String): List<String> {
+            var dir = java.io.File(fixtureDir).absoluteFile
+            while (dir.parentFile != null) {
+                val wrapper = File(dir, "gradlew")
+                if (wrapper.exists()) {
+                    return listOf(wrapper.absolutePath, "-p", fixtureDir, "printProjectConfig", "--quiet")
+                }
+                val wrapperBat = File(dir, "gradlew.bat")
+                if (wrapperBat.exists()) {
+                    return listOf(wrapperBat.absolutePath, "-p", fixtureDir, "printProjectConfig", "--quiet")
+                }
+                val sidecarWrapper = File(dir, "sidecar/gradlew")
+                if (sidecarWrapper.exists()) {
+                    return listOf(sidecarWrapper.absolutePath, "-p", fixtureDir, "printProjectConfig", "--quiet")
+                }
+                val sidecarWrapperBat = File(dir, "sidecar/gradlew.bat")
+                if (sidecarWrapperBat.exists()) {
+                    return listOf(sidecarWrapperBat.absolutePath, "-p", fixtureDir, "printProjectConfig", "--quiet")
+                }
+                dir = dir.parentFile
+            }
+            return listOf("gradle", "-p", fixtureDir, "printProjectConfig", "--quiet")
         }
     }
 

@@ -1,9 +1,13 @@
 package dev.kouros.sidecar
 
+import com.google.gson.JsonArray
+import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import java.io.File
+import java.nio.file.Paths
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -16,8 +20,8 @@ import kotlin.test.assertTrue
  * providing real classpath entries for Spring Web, Arrow, etc. This lets us verify that
  * annotations like @RestController resolve without warnings or errors.
  *
- * Prerequisite: run `./gradlew printProjectConfig` in tests/fixtures/gradle-spring-web/
- * at least once so that Gradle downloads dependencies and project-model.json is populated.
+ * If project-model.json is missing, this test can generate it from the fixture's
+ * `printProjectConfig` task through the repo `gradlew` wrapper before parsing.
  */
 class SpringFixtureIntegrationTest {
 
@@ -186,14 +190,14 @@ class SpringFixtureIntegrationTest {
 
     private fun loadProjectModel(fixtureRoot: String): ProjectModel {
         val modelFile = java.io.File(fixtureRoot, ".kotlin-analyzer/project-model.json")
-        require(modelFile.exists()) {
-            "project-model.json not found at ${modelFile.absolutePath}. " +
-                "Run the Rust LSP server against the fixture once, or run " +
-                "'./gradlew printProjectConfig' in $fixtureRoot to generate it."
+        val json = if (modelFile.exists()) {
+            JsonParser.parseString(modelFile.readText()).asJsonObject
+        } else {
+            val generated = generateProjectModel(fixtureRoot)
+            modelFile.parentFile?.mkdirs()
+            modelFile.writeText(generated.toString())
+            generated
         }
-
-        val json = JsonParser.parseString(modelFile.readText()).asJsonObject
-
         val sourceRoots = json.getAsJsonArray("source_roots")
             .map { it.asString }
             .filter { java.io.File(it).exists() }
@@ -212,6 +216,95 @@ class SpringFixtureIntegrationTest {
         }
 
         return ProjectModel(sourceRoots, classpath, compilerFlags, jdkHome)
+    }
+
+    private fun generateProjectModel(fixtureRoot: String): JsonObject {
+        val config = resolveGradleProjectConfig(fixtureRoot)
+        val sourceRoots = listOf(
+            "$fixtureRoot/src/main/kotlin",
+            "$fixtureRoot/src/main/java",
+            "$fixtureRoot/src",
+        )
+            .filter { java.io.File(it).exists() }
+        require(sourceRoots.isNotEmpty()) {
+            "Could not infer source roots for spring fixture at $fixtureRoot"
+        }
+
+        val json = JsonObject().apply {
+            addProperty("project_root", fixtureRoot)
+            addProperty("build_system", "Gradle")
+            add("source_roots", JsonArray().also { src ->
+                sourceRoots.forEach { src.add(it) }
+            })
+            add("classpath", JsonArray().also { path ->
+                config.classpath.forEach { path.add(it) }
+            })
+            add("compiler_flags", JsonArray().also { flags ->
+                config.compilerFlags.forEach { flags.add(it) }
+            })
+            addProperty("jdk_home", System.getProperty("java.home"))
+            addProperty("kotlin_version", null as String?)
+            addProperty("has_compose", false)
+            add("generated_source_roots", JsonArray())
+        }
+        return json
+    }
+
+    private data class GradleProjectConfig(val classpath: List<String>, val compilerFlags: List<String>)
+
+    private fun resolveGradleProjectConfig(fixtureRoot: String): GradleProjectConfig {
+        val process = ProcessBuilder(resolveGradleCommand(fixtureRoot))
+            .directory(java.io.File(fixtureRoot))
+            .apply {
+                val gradleHome = Paths.get(System.getProperty("java.io.tmpdir"), "kotlin-analyzer-gradle").toString()
+                environment()["GRADLE_USER_HOME"] = gradleHome
+            }
+            .redirectErrorStream(true)
+            .start()
+
+        val output = process.inputStream.bufferedReader().readText()
+        val exitCode = process.waitFor()
+        check(exitCode == 0) { "Gradle config resolution failed (exit $exitCode): $output" }
+
+        val lines = output.lines()
+        fun extractBlock(startMarker: String, endMarker: String): List<String> {
+            val startIdx = lines.indexOf(startMarker)
+            val endIdx = lines.indexOf(endMarker)
+            check(startIdx >= 0 && endIdx > startIdx) {
+                "Could not find $startMarker/$endMarker in Gradle output: $output"
+            }
+            return lines.subList(startIdx + 1, endIdx).filter { it.isNotBlank() }
+        }
+
+        return GradleProjectConfig(
+            classpath = extractBlock("---CLASSPATH-START---", "---CLASSPATH-END---"),
+            compilerFlags = extractBlock("---FLAGS-START---", "---FLAGS-END---"),
+        )
+    }
+
+    private fun resolveGradleCommand(fixtureRoot: String): List<String> {
+        val fixtureDir = File(fixtureRoot).absoluteFile
+        var dir = fixtureDir
+        while (dir.parentFile != null) {
+            val wrapper = File(dir, "gradlew")
+            if (wrapper.exists()) {
+                return listOf(wrapper.absolutePath, "-p", fixtureRoot, "printProjectConfig", "--quiet")
+            }
+            val wrapperBat = File(dir, "gradlew.bat")
+            if (wrapperBat.exists()) {
+                return listOf(wrapperBat.absolutePath, "-p", fixtureRoot, "printProjectConfig", "--quiet")
+            }
+            val sidecarWrapper = File(dir, "sidecar/gradlew")
+            if (sidecarWrapper.exists()) {
+                return listOf(sidecarWrapper.absolutePath, "-p", fixtureRoot, "printProjectConfig", "--quiet")
+            }
+            val sidecarWrapperBat = File(dir, "sidecar/gradlew.bat")
+            if (sidecarWrapperBat.exists()) {
+                return listOf(sidecarWrapperBat.absolutePath, "-p", fixtureRoot, "printProjectConfig", "--quiet")
+            }
+            dir = dir.parentFile
+        }
+        return listOf("gradle", "-p", fixtureRoot, "printProjectConfig", "--quiet")
     }
 
     private fun findFixtureRoot(): String {
