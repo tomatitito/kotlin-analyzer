@@ -118,13 +118,16 @@ model and human-readable wire format for debugging.
 | `textDocument/didClose` | Rust -> JVM | `{ uri }` | -- (notification) |
 | `analyze` | Rust -> JVM | `{ uri, version }` | `{ diagnostics[] }` |
 | `completion` | Rust -> JVM | `{ uri, line, character }` | `{ items[] }` |
-| `hover` | Rust -> JVM | `{ uri, line, character }` | `{ contents }` |
+| `hover` | Rust -> JVM | `{ uri, line, character }` | `{ contents, reason? }` |
 | `definition` | Rust -> JVM | `{ uri, line, character }` | `{ locations[] }` |
 | `references` | Rust -> JVM | `{ uri, line, character, includeDeclaration }` | `{ locations[] }` |
 | `formatting` | Rust -> JVM | `{ uri, options }` | `{ edits[] }` |
 | `shutdown` | Rust -> JVM | -- | `{ success }` |
 | `ping` | Rust -> JVM | -- | `{ pong }` |
 | `$/cancelRequest` | Rust -> JVM | `{ id }` | -- (notification) |
+
+`reason` is returned for semantic empty responses (currently `hover`) to help classify why no
+user-facing payload was available without changing success/error status.
 
 ### 3.2 Message Framing
 

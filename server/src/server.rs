@@ -1225,6 +1225,11 @@ impl LanguageServer for KotlinLanguageServer {
         {
             Ok(result) => {
                 tracing::debug!("hover: sidecar returned: {}", result);
+                let failure_reason = result
+                    .get("reason")
+                    .and_then(|reason| reason.as_str())
+                    .unwrap_or("no explicit reason");
+
                 if let Some(contents) = result.get("contents").and_then(|c| c.as_str()) {
                     Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
@@ -1234,7 +1239,10 @@ impl LanguageServer for KotlinLanguageServer {
                         range: None,
                     }))
                 } else {
-                    tracing::warn!("hover: sidecar result has no 'contents' string field");
+                    tracing::warn!(
+                        "hover: sidecar result has no 'contents' string field (reason={})",
+                        failure_reason
+                    );
                     Ok(None)
                 }
             }

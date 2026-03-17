@@ -637,31 +637,55 @@ class CompilerBridge {
         ensureSessionCurrent()
         val result = JsonObject()
         val perfStart = System.currentTimeMillis()
+        var resolvedOffset: Int? = null
+        val setFailureReason = { reason: String ->
+            if (!result.has("reason")) {
+                result.addProperty("reason", reason)
+            }
+        }
 
-        val currentSession = session ?: return result
-        val ktFile = findKtFile(currentSession, uri) ?: return result
+        val currentSession = session ?: run {
+            setFailureReason("no-active-session")
+            return result
+        }
+        val ktFile = findKtFile(currentSession, uri) ?: run {
+            setFailureReason("file-not-found")
+            return result
+        }
 
         try {
             analyze(ktFile) {
                 val offset = lineColToOffset(ktFile, line, character)
                 if (offset == null) {
-                    System.err.println("CompilerBridge: hover — lineColToOffset=null (line=$line, char=$character, fileLines=${ktFile.text.lines().size})")
+                    val reason = "line-col-offset-null (line=$line, char=$character, fileLines=${ktFile.text.lines().size})"
+                    setFailureReason(reason)
+                    System.err.println("CompilerBridge: hover — $reason")
                     return@analyze
                 }
-                val element = findHoverElement(ktFile, line, offset)
+                resolvedOffset = offset
+
+                val element = ktFile.findElementAt(offset) ?: ktFile.findElementAt(maxOf(0, offset - 1))
                 if (element == null) {
-                    System.err.println("CompilerBridge: hover — no hover element found (offset=$offset, textLen=${ktFile.text.length})")
+                    val reason = "findElementAt=null (offset=$offset, textLen=${ktFile.text.length})"
+                    setFailureReason(reason)
+                    System.err.println("CompilerBridge: hover — $reason")
                     return@analyze
                 }
 
                 // Walk up to find the nearest meaningful element
                 var current: PsiElement? = element
                 while (current != null) {
+                    if (current is PsiWhiteSpace || current is PsiComment) {
+                        current = current.parent
+                        continue
+                    }
+
                     // Handle annotation entries specially — show the annotation CLASS info
                     if (current is org.jetbrains.kotlin.psi.KtAnnotationEntry) {
                         val hoverText = buildAnnotationEntryHover(current)
                         if (hoverText != null) {
                             result.addProperty("contents", hoverText)
+                            result.remove("reason")
                             return@analyze
                         }
                     }
@@ -670,6 +694,7 @@ class CompilerBridge {
                         val hoverText = buildDeclarationHover(current)
                         if (hoverText != null) {
                             result.addProperty("contents", hoverText)
+                            result.remove("reason")
                             return@analyze
                         }
                     }
@@ -682,6 +707,7 @@ class CompilerBridge {
                             val hoverText = buildReferenceHover(current)
                             if (hoverText != null) {
                                 result.addProperty("contents", hoverText)
+                                result.remove("reason")
                                 return@analyze
                             }
                         }
@@ -699,6 +725,7 @@ class CompilerBridge {
                                         Variance.INVARIANT
                                     )
                                     result.addProperty("contents", "```kotlin\n$rendered\n```")
+                                    result.remove("reason")
                                     return@analyze
                                 }
                             } catch (_: Exception) {
@@ -709,9 +736,15 @@ class CompilerBridge {
 
                     current = current.parent
                 }
+
+                if (!result.has("reason")) {
+                    setFailureReason("no-hoverable-element (line=$line, char=$character, offset=${resolvedOffset ?: -1})")
+                }
             }
         } catch (e: Throwable) {
-            System.err.println("CompilerBridge: hover failed: ${e.javaClass.name}: ${e.message}")
+            val reason = "hover failed: ${e.javaClass.name}: ${e.message}"
+            setFailureReason(reason)
+            System.err.println("CompilerBridge: $reason")
         }
 
         System.err.println("[PERF] method=hover uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
@@ -4935,6 +4968,7 @@ class CompilerBridge {
                 return null
             }
             val lineStartOffset = document.getLineStartOffset(line - 1)
+<<<<<<< HEAD
             val lineEndOffset = document.getLineEndOffset(line - 1)
             if (character < 0) {
                 System.err.println("CompilerBridge: lineColToOffset — character $character is negative, clamping to 0")
@@ -4946,11 +4980,24 @@ class CompilerBridge {
             if (safeCharacter != character) {
                 System.err.println("CompilerBridge: lineColToOffset — character $character clamped to line length $lineLength (line=$line)")
             }
+=======
+            val lineEndOffset = if (line - 1 < document.lineCount) {
+                document.getLineEndOffset(line - 1)
+            } else {
+                document.textLength
+            }
+            val lineLength = (lineEndOffset - lineStartOffset).coerceAtLeast(0)
+            val safeCharacter = character.coerceIn(0, lineLength)
+>>>>>>> f411481 (feat(hover): add explicit no-result reason for hover)
             return lineStartOffset + safeCharacter
         }
         // Fallback for LightVirtualFile-backed files where document may be null:
         // compute offset from raw text
         val text = ktFile.text
+        if (line < 1) {
+            System.err.println("CompilerBridge: lineColToOffset — line $line out of range (1..?) for LightVirtualFile fallback")
+            return null
+        }
         var currentLine = 1
         var offset = 0
         while (offset < text.length && currentLine < line) {
@@ -4961,11 +5008,15 @@ class CompilerBridge {
             System.err.println("CompilerBridge: lineColToOffset — fallback: line $line not found (reached line $currentLine at offset $offset, textLen=${text.length})")
             return null
         }
+<<<<<<< HEAD
 
+=======
+>>>>>>> f411481 (feat(hover): add explicit no-result reason for hover)
         var lineEndOffset = offset
         while (lineEndOffset < text.length && text[lineEndOffset] != '\n') {
             lineEndOffset++
         }
+<<<<<<< HEAD
         if (character < 0) {
             return offset
         }
@@ -4999,6 +5050,11 @@ class CompilerBridge {
             probe--
         }
         return null
+=======
+        val lineLength = (lineEndOffset - offset).coerceAtLeast(0)
+        val safeCharacter = character.coerceIn(0, lineLength)
+        return offset + safeCharacter
+>>>>>>> f411481 (feat(hover): add explicit no-result reason for hover)
     }
 
     private fun findKotlinStdlibJars(): List<Path> {

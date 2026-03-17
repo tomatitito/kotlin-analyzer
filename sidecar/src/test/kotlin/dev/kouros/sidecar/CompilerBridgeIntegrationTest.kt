@@ -157,6 +157,32 @@ class CompilerBridgeIntegrationTest {
         )
     }
 
+    @Test
+    fun `hover - accepts end-of-line character by falling back to previous token`() {
+        // Clean.kt line 1: "class Greeter("
+        //                                ^end-of-line fallback to "r" in Greeter
+        val uri = "file://$testSourceDir/Clean.kt"
+        val result = bridge.hover(uri, line = 1, character = 14)
+
+        val contents = result.get("contents")?.asString
+        assertNotNull(contents, "hover should return contents for end-of-line position")
+        assertTrue(
+            contents.contains("Greeter"),
+            "hover should still resolve constructor context, got: $contents"
+        )
+    }
+
+    @Test
+    fun `hover - reports explicit reason when unresolved`() {
+        val uri = "file://$testSourceDir/Clean.kt"
+        val result = bridge.hover(uri, line = 20, character = 0)
+
+        assertTrue(
+            result.get("reason") != null,
+            "hover should include a reason when no hover target is found"
+        )
+    }
+
     // --- Definition ---
 
     @Test

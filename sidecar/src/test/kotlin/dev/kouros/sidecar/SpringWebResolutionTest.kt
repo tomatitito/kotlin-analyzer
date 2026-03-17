@@ -1,11 +1,13 @@
 package dev.kouros.sidecar
 
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
 import java.io.File
-import java.nio.file.Paths
 import java.net.URI
+import java.nio.file.Paths
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -30,7 +32,7 @@ class SpringWebResolutionTest {
         @BeforeAll
         fun resolveProjectConfig() {
             val fixtureDir = findFixtureDir()
-            val config = resolveGradleProjectConfig(fixtureDir)
+            val config = loadSpringProjectConfig(fixtureDir)
             projectClasspath = config.classpath
             projectCompilerFlags = config.compilerFlags
 
@@ -59,6 +61,36 @@ class SpringWebResolutionTest {
         }
 
         data class ProjectConfig(val classpath: List<String>, val compilerFlags: List<String>)
+
+        private fun loadSpringProjectConfig(fixtureDir: String): ProjectConfig {
+            val modelFile = File(fixtureDir, ".kotlin-analyzer/project-model.json")
+            val modelJson = if (modelFile.exists()) {
+                JsonParser.parseString(modelFile.readText()).asJsonObject
+            } else {
+                val generated = resolveGradleProjectConfig(fixtureDir)
+                val json = JsonObject().apply {
+                    addProperty("jdk_home", System.getProperty("java.home"))
+                    add("classpath", com.google.gson.JsonArray().also { classpath ->
+                        generated.classpath.forEach { classpath.add(it) }
+                    })
+                    add("compiler_flags", com.google.gson.JsonArray().also { flags ->
+                        generated.compilerFlags.forEach { flags.add(it) }
+                    })
+                }
+                modelFile.parentFile?.mkdirs()
+                modelFile.writeText(json.toString())
+                json
+            }
+
+            val classpath = modelJson.getAsJsonArray("classpath")
+                .map { it.asString }
+                .filter { File(it).exists() }
+            val compilerFlags = modelJson.getAsJsonArray("compiler_flags")
+                .map { it.asString }
+                .filter { it.isNotBlank() }
+
+            return ProjectConfig(classpath, compilerFlags)
+        }
 
         private fun resolveGradleProjectConfig(fixtureDir: String): ProjectConfig {
             val process = ProcessBuilder(resolveGradleCommand(fixtureDir))
