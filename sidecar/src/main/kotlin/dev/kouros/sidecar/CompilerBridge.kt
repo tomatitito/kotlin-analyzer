@@ -648,9 +648,9 @@ class CompilerBridge {
                     System.err.println("CompilerBridge: hover — lineColToOffset=null (line=$line, char=$character, fileLines=${ktFile.text.lines().size})")
                     return@analyze
                 }
-                val element = ktFile.findElementAt(offset)
+                val element = findHoverElement(ktFile, line, offset)
                 if (element == null) {
-                    System.err.println("CompilerBridge: hover — findElementAt=null (offset=$offset, textLen=${ktFile.text.length})")
+                    System.err.println("CompilerBridge: hover — no hover element found (offset=$offset, textLen=${ktFile.text.length})")
                     return@analyze
                 }
 
@@ -4935,7 +4935,18 @@ class CompilerBridge {
                 return null
             }
             val lineStartOffset = document.getLineStartOffset(line - 1)
-            return lineStartOffset + character
+            val lineEndOffset = document.getLineEndOffset(line - 1)
+            if (character < 0) {
+                System.err.println("CompilerBridge: lineColToOffset — character $character is negative, clamping to 0")
+                return lineStartOffset
+            }
+
+            val lineLength = lineEndOffset - lineStartOffset
+            val safeCharacter = character.coerceAtMost(lineLength)
+            if (safeCharacter != character) {
+                System.err.println("CompilerBridge: lineColToOffset — character $character clamped to line length $lineLength (line=$line)")
+            }
+            return lineStartOffset + safeCharacter
         }
         // Fallback for LightVirtualFile-backed files where document may be null:
         // compute offset from raw text
@@ -4950,7 +4961,44 @@ class CompilerBridge {
             System.err.println("CompilerBridge: lineColToOffset — fallback: line $line not found (reached line $currentLine at offset $offset, textLen=${text.length})")
             return null
         }
-        return offset + character
+
+        var lineEndOffset = offset
+        while (lineEndOffset < text.length && text[lineEndOffset] != '\n') {
+            lineEndOffset++
+        }
+        if (character < 0) {
+            return offset
+        }
+
+        val lineLength = lineEndOffset - offset
+        val safeCharacter = character.coerceAtMost(lineLength)
+        if (safeCharacter != character) {
+            System.err.println("CompilerBridge: lineColToOffset — fallback character $character clamped to line length $lineLength (line=$line)")
+        }
+        return offset + safeCharacter
+    }
+
+    private fun findHoverElement(ktFile: KtFile, line: Int, offset: Int): PsiElement? {
+        val directHit = ktFile.findElementAt(offset)
+        if (directHit != null) {
+            return directHit
+        }
+
+        val document = ktFile.viewProvider.document ?: return null
+        if (line < 1 || line > document.lineCount) {
+            return null
+        }
+
+        val lineStartOffset = document.getLineStartOffset(line - 1)
+        var probe = offset - 1
+        while (probe >= lineStartOffset) {
+            val candidate = ktFile.findElementAt(probe)
+            if (candidate != null) {
+                return candidate
+            }
+            probe--
+        }
+        return null
     }
 
     private fun findKotlinStdlibJars(): List<Path> {

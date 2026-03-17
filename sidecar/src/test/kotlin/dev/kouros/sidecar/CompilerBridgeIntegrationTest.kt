@@ -113,6 +113,36 @@ class CompilerBridgeIntegrationTest {
     }
 
     @Test
+    fun `hover - line-end position still resolves symbol`() {
+        // Clean.kt line 1: "class Greeter("
+        //                            ^14 (0-based, after '(')
+        val uri = "file://$testSourceDir/Clean.kt"
+        val result = bridge.hover(uri, line = 1, character = 14)
+
+        val contents = result.get("contents")?.asString
+        assertNotNull(contents, "hover at line-end boundary should return contents, got: null")
+        assertTrue(
+            contents.contains("Greeter"),
+            "hover should mention 'Greeter', got: $contents"
+        )
+    }
+
+    @Test
+    fun `hover - oversized character is clamped to line end`() {
+        // Clean.kt line 1: "class Greeter("
+        //                                  ^120 (well beyond line length)
+        val uri = "file://$testSourceDir/Clean.kt"
+        val result = bridge.hover(uri, line = 1, character = 120)
+
+        val contents = result.get("contents")?.asString
+        assertNotNull(contents, "hover with oversized character should still return contents, got: null")
+        assertTrue(
+            contents.contains("Greeter"),
+            "hover should mention 'Greeter' when character is clamped, got: $contents"
+        )
+    }
+
+    @Test
     fun `hover - constructor reference`() {
         // Clean.kt line 10: "    val greeter = Greeter("World")"
         //                                     ^18 (0-based)

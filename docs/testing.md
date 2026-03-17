@@ -63,6 +63,7 @@ Unit tests for the sidecar cover the compiler bridge in isolation.
 - Resolve a definition location for a function call
 - Compute completions at a cursor position in a partial expression
 - Verify completions include auto-import suggestions
+- Resolve hover content when the cursor is at end-of-line or oversized column offsets (boundary fallback)
 - Analyze a snippet using `-Xcontext-parameters`, verify no false-positive errors
 - Analyze a snippet using `-Xmulti-dollar-interpolation`, verify correct parsing
 - Handle an empty file (no diagnostics, no crash)
