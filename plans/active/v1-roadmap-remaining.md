@@ -62,7 +62,7 @@ Further optimization can be deferred to post-v1.
   - [x] Sidecar crash notification (already shows in logs)
   - [ ] Out of memory suggestion
   - [x] Sidecar JAR not found (shows WARNING via LSP showMessage)
-- [ ] Zed status bar integration
+- [x] Zed status bar integration (`CheckingForUpdate` during startup, `None` when command is ready, `Failed` on missing/invalid binary)
 - [x] Graceful degradation when sidecar is down (returns empty results)
 
 #### Verification Gates
