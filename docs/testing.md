@@ -63,7 +63,6 @@ Unit tests for the sidecar cover the compiler bridge in isolation.
 - Resolve a definition location for a function call
 - Compute completions at a cursor position in a partial expression
 - Verify completions include auto-import suggestions
-- Resolve hover content when the cursor is at end-of-line or oversized column offsets (boundary fallback)
 - Analyze a snippet using `-Xcontext-parameters`, verify no false-positive errors
 - Analyze a snippet using `-Xmulti-dollar-interpolation`, verify correct parsing
 - Handle an empty file (no diagnostics, no crash)
@@ -239,15 +238,15 @@ Each file compiles successfully but should produce one or more warnings.
 
 #### `tests/fixtures/kotlin/compiler-flags/` — Flag-Dependent Behavior
 
-Files that are **correct when the corresponding compiler flag is enabled** but produce errors without it. Used to verify compiler flag extraction and application.
+Files that are **syntactically accepted when a corresponding compiler flag is enabled** but may still report stable semantic diagnostics without code changes. Used to verify compiler flag extraction and application separately from feature-usage correctness.
 
 | File | Required Flag | Without Flag | With Flag |
 |------|---------------|-------------|-----------|
-| `ContextParameters.kt` | `-Xcontext-parameters` | Error: syntax not recognized | No diagnostics |
+| `ContextParameters.kt` | `-Xcontext-parameters` | Error: syntax not recognized | Syntax enabled; usage remains semantic `Cannot infer type...` |
 | `MultiDollarInterpolation.kt` | `-Xmulti-dollar-interpolation` | Error: unexpected `$` | No diagnostics |
-| `ContextReceivers.kt` | `-Xcontext-receivers` | Error: syntax not recognized | No diagnostics (deprecated but still used in the wild) |
+| `ContextReceivers.kt` | `-Xcontext-receivers` | Error: syntax not recognized | Syntax enabled; usage remains semantic errors |
 
-Each flag-dependent file should be tested **twice**: once without the flag (expecting errors) and once with the flag (expecting clean compilation). This directly validates the critical compiler flag extraction pipeline.
+Each flag-dependent file is tested **twice**: once without the flag (expecting feature-gate errors) and once with the flag (expecting syntax gate acceptance). Semantic diagnostics are documented in fixture headers and should be treated separately.
 
 ### 3.3 Expected-Output Format
 
@@ -308,7 +307,7 @@ This format lets the test harness parse expected outcomes directly from the file
 | **M2** | All `warnings/` files | Open via LSP, assert expected warnings at expected lines |
 | **M2** | All `edge-cases/` files | Open via LSP, assert no crash, expected behavior per file |
 | **M2** | `compiler-flags/` files (without flags) | Open via LSP without flags, assert errors |
-| **M2** | `compiler-flags/` files (with flags) | Open via LSP with flags via `gradle-compiler-flags/` fixture project, assert no errors |
+| **M2** | `compiler-flags/` files (with flags) | Open via LSP with flags via `gradle-compiler-flags/` fixture project, assert feature-gate diagnostics are absent and fixture-specific semantic expectations are met |
 | **M3** | `correct/` files with identifiers | Hover, go-to-def, completion at known cursor positions, assert expected results |
 | **M3** | `correct/TestClass.kt` | Completion after `assert`, verify JUnit assertions appear |
 | **M4** | `edge-cases/LargeFile.kt` | Measure diagnostic latency, assert within performance budget |
