@@ -41,9 +41,11 @@ The runtime manifest now also records:
 - `mainClass`
 - `analyzerVersion`
 - `targetPlatform`
+- `validatedSameMinor`
 - `classpath`
 
 `analyzerVersion` and `targetPlatform` are used during runtime discovery to reject cached payloads built for a different kotlin-analyzer release or platform.
+`validatedSameMinor` lists the Kotlin major.minor lines for which same-minor patch fallback has been explicitly validated. If a manifest does not declare validation for the requested line, runtime selection skips same-minor fallback and moves on to the cross-minor bundled fallback path instead.
 
 Do **not** embed the runtime payloads inside the Rust binary via `include_bytes!()`. They are large and versioned independently; embedding them would bloat the binary, slow compilation, and prevent runtime selection per project. Ship them alongside the binary in the archive.
 
@@ -228,4 +230,4 @@ The Rust binary and sidecar runtimes share a single version number. This version
 - GitHub release tag (`v0.1.0`)
 - Release archive filenames (`kotlin-analyzer-0.1.0-aarch64-apple-darwin.tar.gz`)
 
-The pinned Kotlin compiler version (`2.3.10` for v1) is documented in release notes and in the sidecar's `build.gradle.kts`. Bumping the Kotlin compiler version is a deliberate act that requires testing.
+Each bundled sidecar runtime declares its Kotlin compiler version in its runtime manifest and in `sidecar/build.gradle.kts`. Adding or changing a bundled Kotlin line is a deliberate act that requires validation before the manifest marks that line as eligible for same-minor fallback.

@@ -267,6 +267,10 @@ Recommendation:
 - treat exact patch match as preferred
 - permit same-minor fallback only after validation
 
+Status:
+
+- Implemented on 2026-03-27 via runtime manifest validation metadata (`validatedSameMinor`) enforced by Rust-side runtime selection.
+
 Reason:
 
 The Analysis API is not stable enough to assume all patch combinations are harmless without testing.

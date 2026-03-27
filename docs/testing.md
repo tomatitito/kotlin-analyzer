@@ -52,10 +52,11 @@ Unit tests for the Rust binary cover individual modules in isolation with no JVM
 
 **`runtime.rs` — Sidecar Runtime Selection**
 - Prefer exact Kotlin runtime matches when available
-- Fall back to the newest runtime from the same minor line when an exact patch is unavailable
+- Fall back to the newest runtime from the same minor line only when that line is marked as validated in the runtime manifest
 - Fall back to the newest bundled runtime when no compatible line is available
 - Resolve runtime manifests relative to their runtime directory
 - Reject cached or provisioned runtimes with mismatched analyzer version, platform, or missing classpath entries
+- Parse and enforce manifest validation metadata for same-minor fallback decisions
 - Emit warning text only for fallback selections, not exact matches
 
 ### JVM Side

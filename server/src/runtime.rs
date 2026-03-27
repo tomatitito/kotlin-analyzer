@@ -71,6 +71,7 @@ pub struct AvailableSidecarRuntime {
     pub kotlin_version: Option<String>,
     pub classpath: Vec<PathBuf>,
     pub main_class: Option<String>,
+    validated_same_minor_lines: Vec<KotlinVersionLine>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +84,8 @@ struct RuntimeManifest {
     analyzer_version: Option<String>,
     #[serde(rename = "targetPlatform")]
     target_platform: Option<String>,
+    #[serde(rename = "validatedSameMinor", default)]
+    validated_same_minor: Vec<String>,
     classpath: Vec<PathBuf>,
 }
 
@@ -150,7 +153,9 @@ pub fn select_sidecar_runtime(
                 .filter_map(|runtime| {
                     let version = runtime.kotlin_version.as_deref()?;
                     let parsed = KotlinVersion::parse(version)?;
-                    if parsed.same_minor(&requested_version) {
+                    if parsed.same_minor(&requested_version)
+                        && runtime.supports_same_minor_fallback(&requested_version)
+                    {
                         Some((parsed, runtime))
                     } else {
                         None
@@ -246,6 +251,15 @@ impl RuntimeDiscoveryContext {
     }
 }
 
+impl AvailableSidecarRuntime {
+    fn supports_same_minor_fallback(&self, requested_version: &KotlinVersion) -> bool {
+        let requested_line = requested_version.line();
+        self.validated_same_minor_lines
+            .iter()
+            .any(|line| line == &requested_line)
+    }
+}
+
 fn discover_available_sidecar_runtimes(
     context: &RuntimeDiscoveryContext,
 ) -> Vec<AvailableSidecarRuntime> {
@@ -265,6 +279,7 @@ fn discover_available_sidecar_runtimes(
             kotlin_version: None,
             classpath: vec![bundled],
             main_class: None,
+            validated_same_minor_lines: Vec::new(),
         });
     }
 
@@ -279,6 +294,7 @@ fn discover_available_sidecar_runtimes(
                 kotlin_version: read_dev_kotlin_version(repo_root.join("sidecar/build.gradle.kts")),
                 classpath: vec![dev_jar],
                 main_class: None,
+                validated_same_minor_lines: Vec::new(),
             });
         }
     }
@@ -582,6 +598,21 @@ fn load_runtime_manifest(path: &Path) -> Option<AvailableSidecarRuntime> {
         kotlin_version: Some(manifest.kotlin_version),
         classpath,
         main_class: Some(manifest.main_class),
+        validated_same_minor_lines: manifest
+            .validated_same_minor
+            .into_iter()
+            .filter_map(|line| match KotlinVersionLine::parse(&line) {
+                Some(parsed) => Some(parsed),
+                None => {
+                    tracing::warn!(
+                        manifest = %path.display(),
+                        invalid_line = line,
+                        "ignoring invalid validated same-minor entry in sidecar runtime manifest"
+                    );
+                    None
+                }
+            })
+            .collect(),
     })
 }
 
@@ -627,6 +658,13 @@ impl KotlinVersion {
     fn same_minor(&self, other: &Self) -> bool {
         self.major == other.major && self.minor == other.minor
     }
+
+    fn line(&self) -> KotlinVersionLine {
+        KotlinVersionLine {
+            major: self.major,
+            minor: self.minor,
+        }
+    }
 }
 
 impl Ord for KotlinVersion {
@@ -646,6 +684,24 @@ impl PartialOrd for KotlinVersion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KotlinVersionLine {
+    major: u32,
+    minor: u32,
+}
+
+impl KotlinVersionLine {
+    fn parse(raw: &str) -> Option<Self> {
+        let mut parts = raw.splitn(2, '-');
+        let numbers = parts.next()?;
+        let mut numbers = numbers.split('.');
+        Some(Self {
+            major: numbers.next()?.parse().ok()?,
+            minor: numbers.next()?.parse().ok()?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,7 +712,17 @@ mod tests {
             kotlin_version: Some(version.to_string()),
             classpath: vec![PathBuf::from(format!("{version}.jar"))],
             main_class: None,
+            validated_same_minor_lines: Vec::new(),
         }
+    }
+
+    fn validated_runtime(version: &str, validated_lines: &[&str]) -> AvailableSidecarRuntime {
+        let mut runtime = runtime(version);
+        runtime.validated_same_minor_lines = validated_lines
+            .iter()
+            .filter_map(|line| KotlinVersionLine::parse(line))
+            .collect();
+        runtime
     }
 
     #[test]
@@ -673,7 +739,11 @@ mod tests {
 
     #[test]
     fn selection_prefers_newest_same_minor_fallback() {
-        let available = vec![runtime("2.2.10"), runtime("2.2.21"), runtime("2.3.0")];
+        let available = vec![
+            validated_runtime("2.2.10", &["2.2"]),
+            validated_runtime("2.2.21", &["2.2"]),
+            runtime("2.3.0"),
+        ];
         let selected = select_sidecar_runtime(Some("2.2.5"), &available).unwrap();
 
         assert_eq!(selected.kotlin_version.as_deref(), Some("2.2.21"));
@@ -724,6 +794,7 @@ mod tests {
             r#"{
   "kotlinVersion": "2.2.21",
   "mainClass": "dev.kouros.sidecar.launcher.LauncherMain",
+  "validatedSameMinor": ["2.2"],
   "classpath": [
     "launcher/sidecar-launcher.jar",
     "payload/sidecar-impl.jar"
@@ -745,6 +816,10 @@ mod tests {
                 runtime_dir.join("launcher/sidecar-launcher.jar"),
                 runtime_dir.join("payload/sidecar-impl.jar"),
             ]
+        );
+        assert_eq!(
+            runtime.validated_same_minor_lines,
+            vec![KotlinVersionLine { major: 2, minor: 2 }]
         );
     }
 
@@ -840,6 +915,18 @@ mod tests {
         assert_eq!(runtime.kotlin_version.as_deref(), Some("2.2.21"));
         assert!(cache_root.join("2.2.21/manifest.json").exists());
         assert!(cache_root.join("2.2.21/payload/sidecar-impl.jar").exists());
+    }
+
+    #[test]
+    fn same_minor_fallback_requires_validation() {
+        let available = vec![runtime("2.2.21"), runtime("2.3.0")];
+        let selected = select_sidecar_runtime(Some("2.2.5"), &available).unwrap();
+
+        assert_eq!(selected.kotlin_version.as_deref(), Some("2.3.0"));
+        assert_eq!(
+            selected.selection_reason,
+            RuntimeSelectionReason::BundledFallback
+        );
     }
 
     #[test]

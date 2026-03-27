@@ -30,7 +30,7 @@ repositories {
     maven("https://maven.pkg.jetbrains.space/kotlin/p/kotlin/kotlin-ide-plugin-dependencies")
 }
 
-val analysisApiVersion = "2.1.20"  // Latest stable with published -for-ide artifacts
+val analysisApiVersion = "2.2.21"
 
 dependencies {
     // From Maven Central
@@ -66,18 +66,23 @@ The Analysis API surface is annotated with `@InternalApi` and experimental opt-i
 
 Mitigations:
 
-1. **Pin to a specific Kotlin version** (e.g., 2.3.10). Do not track Kotlin releases eagerly.
+1. **Keep version-bound code behind runtime packaging.** kotlin-analyzer now builds versioned sidecar payloads and selects one before the JVM starts, so Analysis API lines remain isolated at the process classpath boundary.
 2. **Abstract behind a stable interface layer.** The sidecar defines its own `CompilerBridge` interface that encapsulates all direct Analysis API calls. When the upstream API changes, only the bridge implementation needs updating -- the rest of the sidecar and the Rust frontend are unaffected.
 
 ### Version Management Strategy
 
-The sidecar ships with a pinned Analysis API version. All `-for-ide` artifacts and `kotlin-compiler` must be at the same version — mismatches cause `NoSuchMethodError` (confirmed by spike).
+The sidecar runtime remains version-locked internally: every payload must keep `kotlin-compiler` and all `-for-ide` artifacts on the exact same version, or Analysis API linkage will fail with `NoSuchMethodError`.
 
-#### v1: Single pinned version
+What changed is distribution. kotlin-analyzer now ships multiple versioned runtime payloads and lets the Rust frontend select one per project before sidecar startup.
 
-v1 ships with Kotlin 2.3.10 and documents this as a supported version constraint. Users whose projects target a different Kotlin minor version may see false-positive diagnostics for new language features or missing resolution for new stdlib APIs.
+#### Current runtime-selection model
 
-This is the same model rust-analyzer uses: it tracks Rust compiler releases rather than attempting to support every version simultaneously.
+- `ProjectModel.kotlin_version` is extracted during project resolution.
+- Rust selects the sidecar runtime before spawning the JVM.
+- Exact runtime matches are preferred.
+- Same-minor fallback is permitted only for lines that are explicitly marked as validated in the runtime manifest.
+- If neither exact nor validated same-minor runtimes are available, Rust falls back to the newest bundled runtime and surfaces a warning.
+- Provisioned runtimes are cached locally for offline reuse after first installation.
 
 #### Tracking new Kotlin releases
 
@@ -85,18 +90,14 @@ JetBrains ships stable Kotlin releases roughly every 3-4 months.
 
 Update process:
 
-1. **Automated version check.** A scheduled CI workflow checks JetBrains Space for new `-for-ide` artifact versions weekly and opens a PR when one appears. Dependabot does not support JetBrains Space repos, so this is a custom script (`curl` + version comparison against the Maven metadata XML).
-2. **Spike validation gate.** The `spike/analysis-api/` project runs as a CI fixture against the new version. If session creation, diagnostics, and compiler flag application still work, the update is safe. If not, the PR flags a breaking API change for manual investigation.
-3. **Patch vs. minor updates.** Patch updates within a minor line (e.g., 2.3.10 -> 2.3.20) are expected to be safe and can be merged after CI passes. Minor version bumps (e.g., 2.3.x -> 2.4.0) may include API changes and require manual review of the `CompilerBridge` interface.
-4. **Release cadence.** kotlin-analyzer releases a new version within two weeks of each stable Kotlin release, after validation.
+1. **Add a new runtime payload.** Introduce a new Kotlin line in the sidecar packaging build and keep every compiler and `-for-ide` dependency aligned to that exact version.
+2. **Spike validation gate.** The `spike/analysis-api/` project runs as a fixture against the new version. If session creation, diagnostics, and compiler flag application still work, the update is safe. If not, the PR flags a breaking API change for manual investigation.
+3. **Runtime-manifest validation.** Only mark a major.minor line as eligible for same-minor fallback after focused validation for that line. This metadata is emitted into the runtime manifest and enforced by Rust-side runtime selection.
+4. **Release cadence.** kotlin-analyzer can ship a new runtime payload independently of changing the runtime-selection architecture, as long as the payload has passed validation.
 
-#### Future: Matching the project's Kotlin version
+#### Future expansion
 
-The pinned-version approach breaks when a user's project uses a Kotlin version newer than what the sidecar ships with. The `CompilerBridge` abstraction layer is the seam for addressing this in a future version. Options to evaluate post-v1:
-
-- **Download matching artifacts on first use.** Detect the project's Kotlin version from Gradle (the Tooling API already extracts this), pull the matching `-for-ide` artifacts from JetBrains Space, and cache them locally. Adds a network dependency and first-run delay but eliminates version mismatch entirely.
-- **Bundle multiple compiler versions.** Ship 2-3 recent versions and select at runtime. Increases the distribution size (~70 MB per version) but works offline.
-- **Warn on mismatch.** Detect the project's Kotlin version, compare against the bundled version, and surface a diagnostic if they differ. The user at least understands why features are missing.
+The current implementation provisions exact-match runtimes from local source directories into a local cache. The same seam can later support remote downloads of matching payloads without changing how the Rust frontend selects or launches runtimes.
 
 ---
 

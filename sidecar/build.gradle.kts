@@ -57,6 +57,9 @@ fun versionedRuntimeDependencies(kotlinVersion: String) = buildList {
 
 fun String.runtimeTaskSuffix(): String = replace(Regex("[^A-Za-z0-9]"), "_")
 
+fun kotlinVersionLine(version: String): String =
+    version.substringBefore('-').split('.').take(2).joinToString(".")
+
 /**
  * Helper to add a "-for-ide" artifact with transitive deps disabled.
  * These JARs are self-contained (fat JARs merging internal modules),
@@ -202,6 +205,7 @@ supportedRuntimeKotlinVersions.forEach { runtimeKotlinVersion ->
                 "mainClass" to "dev.kouros.sidecar.launcher.LauncherMain",
                 "analyzerVersion" to project.version.toString(),
                 "targetPlatform" to "any",
+                "validatedSameMinor" to listOf(kotlinVersionLine(runtimeKotlinVersion)),
                 "classpath" to buildList {
                     add("launcher/${launcherJar.get().archiveFileName.get()}")
                     add("payload/sidecar-impl.jar")
