@@ -360,7 +360,7 @@ Using `fwcd/tree-sitter-kotlin` — the de facto standard Kotlin tree-sitter gra
 
 ### 10.6 Distribution: extension downloads binary
 
-- **Decision**: The Zed extension downloads the `kotlin-analyzer` Rust binary (with bundled sidecar JAR) from GitHub releases. One platform-specific archive per target (darwin-arm64, darwin-amd64, linux-amd64, etc.).
+- **Decision**: The Zed extension downloads the `kotlin-analyzer` Rust binary together with bundled sidecar runtimes from GitHub releases. One platform-specific archive per target (darwin-arm64, darwin-amd64, linux-amd64, etc.).
 
 ---
 

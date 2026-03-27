@@ -1,5 +1,10 @@
+import groovy.json.JsonOutput
+import org.gradle.api.artifacts.ExternalModuleDependency
+import org.gradle.api.tasks.compile.JavaCompile
+import org.gradle.jvm.tasks.Jar
+
 plugins {
-    kotlin("jvm") version "2.1.20"
+    kotlin("jvm") version "2.2.0-RC2"
     id("com.github.johnrengelman.shadow") version "8.1.1"
     application
 }
@@ -14,7 +19,43 @@ repositories {
     maven("https://cache-redirector.jetbrains.com/intellij-dependencies")
 }
 
-val kotlinVersion = "2.1.20"
+val kotlinVersion = "2.2.0-RC2"
+val supportedRuntimeKotlinVersions = listOf(
+    kotlinVersion,
+    "2.2.21",
+)
+val analysisApiArtifacts = listOf(
+    "analysis-api-for-ide",
+    "analysis-api-standalone-for-ide",
+    "analysis-api-k2-for-ide",
+    "analysis-api-impl-base-for-ide",
+    "analysis-api-platform-interface-for-ide",
+    "low-level-api-fir-for-ide",
+    "symbol-light-classes-for-ide",
+)
+val runtimeDependencies = listOf(
+    "com.github.ben-manes.caffeine:caffeine:3.1.8",
+    "org.jetbrains.kotlinx:kotlinx-serialization-core-jvm:1.7.3",
+    "com.google.code.gson:gson:2.11.0",
+    "org.slf4j:slf4j-simple:2.0.16",
+)
+
+fun versionedRuntimeDependencies(kotlinVersion: String) = buildList {
+    add(dependencies.create("org.jetbrains.kotlin:kotlin-compiler:$kotlinVersion"))
+    analysisApiArtifacts.forEach { artifactId ->
+        add(
+            dependencies.create("org.jetbrains.kotlin:$artifactId:$kotlinVersion").also { dependency ->
+                (dependency as ExternalModuleDependency).isTransitive = false
+            }
+        )
+    }
+    add(dependencies.create("org.jetbrains.kotlin:kotlin-stdlib:$kotlinVersion"))
+    runtimeDependencies.forEach { dependencyNotation ->
+        add(dependencies.create(dependencyNotation))
+    }
+}
+
+fun String.runtimeTaskSuffix(): String = replace(Regex("[^A-Za-z0-9]"), "_")
 
 /**
  * Helper to add a "-for-ide" artifact with transitive deps disabled.
@@ -33,25 +74,22 @@ dependencies {
     implementation("org.jetbrains.kotlin:kotlin-compiler:$kotlinVersion")
 
     // Analysis API "-for-ide" artifacts from JetBrains Space repo
-    analysisApi("analysis-api-for-ide")
-    analysisApi("analysis-api-standalone-for-ide")
-    analysisApi("analysis-api-k2-for-ide")
-    analysisApi("analysis-api-impl-base-for-ide")
-    analysisApi("analysis-api-platform-interface-for-ide")
-    analysisApi("low-level-api-fir-for-ide")
-    analysisApi("symbol-light-classes-for-ide")
+    analysisApiArtifacts.forEach { artifactId ->
+        analysisApi(artifactId)
+    }
 
     // Runtime dependencies used by Analysis API internally
-    implementation("com.github.ben-manes.caffeine:caffeine:3.1.8")
+    implementation(runtimeDependencies[0])
+    implementation(runtimeDependencies[1])
 
     // JSON-RPC communication
-    implementation("com.google.code.gson:gson:2.11.0")
+    implementation(runtimeDependencies[2])
 
     // Kotlin stdlib (also used for test classpath)
     implementation(kotlin("stdlib"))
 
     // Logging
-    implementation("org.slf4j:slf4j-simple:2.0.16")
+    implementation(runtimeDependencies[3])
 
     // Testing
     testImplementation(kotlin("test"))
@@ -92,6 +130,97 @@ tasks.named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJ
     archiveClassifier.set("all")
     archiveVersion.set("")
     mergeServiceFiles()
+}
+
+val compileLauncherJava by tasks.registering(JavaCompile::class) {
+    source = fileTree("src/launcher/java")
+    classpath = files()
+    destinationDirectory.set(layout.buildDirectory.dir("classes/launcher/main"))
+    options.release.set(17)
+}
+
+val launcherJar by tasks.registering(Jar::class) {
+    dependsOn(compileLauncherJava)
+    archiveBaseName.set("sidecar-launcher")
+    archiveVersion.set("")
+    from(compileLauncherJava.map { it.destinationDirectory })
+    manifest {
+        attributes["Main-Class"] = "dev.kouros.sidecar.launcher.LauncherMain"
+    }
+}
+
+val assembleRuntimePayloads by tasks.registering {
+    group = "build"
+    description = "Assemble launcher + versioned sidecar payload layouts under build/runtime."
+}
+
+supportedRuntimeKotlinVersions.forEach { runtimeKotlinVersion ->
+    val taskName = "assembleRuntimePayload${runtimeKotlinVersion.runtimeTaskSuffix()}"
+    val runtimeDir = layout.buildDirectory.dir("runtime/$runtimeKotlinVersion")
+
+    val runtimeTask = tasks.register(taskName) {
+        group = "build"
+        description = "Assemble the sidecar runtime payload for Kotlin $runtimeKotlinVersion."
+        dependsOn(tasks.named("jar"), launcherJar)
+        outputs.dir(runtimeDir)
+
+        doLast {
+            val rootDir = runtimeDir.get().asFile
+            val launcherDir = rootDir.resolve("launcher")
+            val payloadDir = rootDir.resolve("payload")
+
+            delete(rootDir)
+            launcherDir.mkdirs()
+            payloadDir.mkdirs()
+
+            copy {
+                from(launcherJar.get().archiveFile)
+                into(launcherDir)
+            }
+
+            copy {
+                from(tasks.named<Jar>("jar").get().archiveFile)
+                into(payloadDir)
+                rename { "sidecar-impl.jar" }
+            }
+
+            val runtimeClasspathFiles = if (runtimeKotlinVersion == kotlinVersion) {
+                configurations.runtimeClasspath.get().resolve()
+            } else {
+                configurations
+                    .detachedConfiguration(*versionedRuntimeDependencies(runtimeKotlinVersion).toTypedArray())
+                    .resolve()
+            }.sortedBy { it.name }
+
+            copy {
+                from(runtimeClasspathFiles)
+                into(payloadDir)
+            }
+
+            val manifest = mapOf(
+                "kotlinVersion" to runtimeKotlinVersion,
+                "mainClass" to "dev.kouros.sidecar.launcher.LauncherMain",
+                "classpath" to buildList {
+                    add("launcher/${launcherJar.get().archiveFileName.get()}")
+                    add("payload/sidecar-impl.jar")
+                    runtimeClasspathFiles.forEach { file ->
+                        add("payload/${file.name}")
+                    }
+                },
+            )
+            rootDir.resolve("manifest.json").writeText(
+                JsonOutput.prettyPrint(JsonOutput.toJson(manifest))
+            )
+        }
+    }
+
+    assembleRuntimePayloads.configure {
+        dependsOn(runtimeTask)
+    }
+}
+
+tasks.named("assemble") {
+    dependsOn(assembleRuntimePayloads)
 }
 
 tasks.named<JavaExec>("run") {

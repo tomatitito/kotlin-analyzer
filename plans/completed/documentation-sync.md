@@ -37,9 +37,9 @@ Tasks:
 2. **Build the JVM sidecar:**
    ```bash
    cd sidecar
-   ./gradlew shadowJar
+   ./gradlew assembleRuntimePayloads
    ```
-   The JAR will be at `sidecar/build/libs/sidecar-all.jar`
+   The runtime layout will be at `sidecar/build/runtime/`
 
 3. **Build the Zed extension (WASM):**
    ```bash
@@ -53,7 +53,8 @@ Tasks:
    ```bash
    # Copy to local bin directory
    cp target/release/kotlin-analyzer ~/.local/bin/
-   cp sidecar/build/libs/sidecar-all.jar ~/.local/bin/sidecar.jar
+   rm -rf ~/.local/bin/sidecar-runtimes
+   cp -R sidecar/build/runtime ~/.local/bin/sidecar-runtimes
    ```
 
 2. **Install the Zed extension (dev mode):**
@@ -68,7 +69,7 @@ Tasks:
 ```bash
 # Full build and test
 cargo build --release && \
-(cd sidecar && ./gradlew shadowJar) && \
+(cd sidecar && ./gradlew assembleRuntimePayloads) && \
 cargo test --features integration
 ```
 ```

@@ -67,7 +67,7 @@ Homebrew's Rust was uninstalled. Rustup's toolchain at `~/.cargo/bin/rustc` (1.9
 
 ### Deployment note
 
-The sidecar JAR (`sidecar-all.jar`) must be placed next to the server binary for Zed to find it. When installing to `~/.local/bin/kotlin-analyzer`, also copy: `cp sidecar/build/libs/sidecar-all.jar ~/.local/bin/sidecar.jar`
+The sidecar runtimes must be placed next to the server binary for Zed to find them. When installing to `~/.local/bin/kotlin-analyzer`, also copy `sidecar/build/runtime` to `~/.local/bin/sidecar-runtimes`.
 
 ### Known quirk: Language server not triggered on workspace restore
 

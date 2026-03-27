@@ -216,7 +216,7 @@ analyze(ktFile) {
 
 After fixing, verify end-to-end:
 
-1. Build: `cargo build && cd sidecar && ./gradlew shadowJar`
+1. Build: `cargo build && (cd sidecar && ./gradlew assembleRuntimePayloads)`
 2. Open a project with context parameters in `my-zed`
 3. Confirm zero false diagnostics on `context(...)` syntax
 4. Confirm Arrow `raise { }` / `Raise<E>` resolves without errors

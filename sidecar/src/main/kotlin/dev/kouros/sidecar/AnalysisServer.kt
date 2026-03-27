@@ -93,7 +93,7 @@ class AnalysisServer(
 
         val result = JsonObject()
         result.addProperty("success", true)
-        result.addProperty("kotlinVersion", "2.1.20")
+        result.addProperty("kotlinVersion", SidecarRuntime.kotlinVersion)
         transport.sendResult(request.id, result)
     }
 

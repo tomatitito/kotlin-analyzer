@@ -5066,42 +5066,14 @@ class CompilerBridge {
         // Prefer version matching the compiler (2.1.20), fall back to any version
         val gradleCache = Paths.get(System.getProperty("user.home"), ".gradle", "caches", "modules-2", "files-2.1", "org.jetbrains.kotlin")
         if (gradleCache.toFile().exists()) {
-            val stdlibNames = listOf("kotlin-stdlib", "kotlin-stdlib-jdk7", "kotlin-stdlib-jdk8")
-            val preferredVersion = "2.1.20"
-
-            // Try preferred version first
-            val preferred = mutableListOf<Path>()
-            for (name in stdlibNames) {
-                val versionDir = gradleCache.resolve(name).resolve(preferredVersion).toFile()
-                if (!versionDir.exists()) continue
-                val jars = versionDir.walkTopDown()
-                    .filter { it.extension == "jar" && !it.name.contains("-sources") && !it.name.contains("-javadoc") }
-                    .toList()
-                if (jars.isNotEmpty()) {
-                    preferred.add(jars.first().toPath())
-                }
-            }
+            val preferred = findStdlibJarsInRepository(gradleCache, preferVersion = bundledKotlinVersion())
             if (preferred.isNotEmpty()) {
-                System.err.println("CompilerBridge: found ${preferred.size} stdlib JARs (v$preferredVersion) in Gradle cache: $preferred")
+                System.err.println("CompilerBridge: found ${preferred.size} stdlib JARs (v${bundledKotlinVersion()}) in Gradle cache: $preferred")
                 return preferred
             }
 
             // Fall back to any version (prefer newest)
-            val found = mutableListOf<Path>()
-            for (name in stdlibNames) {
-                val moduleDir = gradleCache.resolve(name).toFile()
-                if (!moduleDir.exists()) continue
-                val versionDirs = moduleDir.listFiles()?.filter { it.isDirectory }?.sortedDescending() ?: continue
-                for (versionDir in versionDirs) {
-                    val jars = versionDir.walkTopDown()
-                        .filter { it.extension == "jar" && !it.name.contains("-sources") && !it.name.contains("-javadoc") }
-                        .toList()
-                    if (jars.isNotEmpty()) {
-                        found.add(jars.first().toPath())
-                        break
-                    }
-                }
-            }
+            val found = findStdlibJarsInRepository(gradleCache)
             if (found.isNotEmpty()) {
                 System.err.println("CompilerBridge: found ${found.size} stdlib JARs (fallback) in Gradle cache: $found")
                 return found
@@ -5111,23 +5083,7 @@ class CompilerBridge {
         // 3. Search Maven local repo
         val m2Repo = Paths.get(System.getProperty("user.home"), ".m2", "repository", "org", "jetbrains", "kotlin")
         if (m2Repo.toFile().exists()) {
-            val stdlibNames = listOf("kotlin-stdlib", "kotlin-stdlib-jdk7", "kotlin-stdlib-jdk8")
-            val found = mutableListOf<Path>()
-
-            for (name in stdlibNames) {
-                val moduleDir = m2Repo.resolve(name).toFile()
-                if (!moduleDir.exists()) continue
-
-                val versionDirs = moduleDir.listFiles()?.filter { it.isDirectory }?.sortedDescending() ?: continue
-                for (versionDir in versionDirs) {
-                    val jar = versionDir.resolve("$name-${versionDir.name}.jar")
-                    if (jar.exists()) {
-                        found.add(jar.toPath())
-                        break
-                    }
-                }
-            }
-
+            val found = findStdlibJarsInRepository(m2Repo)
             if (found.isNotEmpty()) {
                 System.err.println("CompilerBridge: found ${found.size} stdlib JARs in Maven local: $found")
                 return found
@@ -5231,6 +5187,44 @@ class CompilerBridge {
         /**
          * Maps a -X compiler flag to a LanguageFeature enum value.
          */
+        fun bundledKotlinVersion(): String = SidecarRuntime.kotlinVersion
+
+        internal fun findStdlibJarsInRepository(repositoryRoot: Path, preferVersion: String? = null): List<Path> {
+            val stdlibNames = listOf("kotlin-stdlib", "kotlin-stdlib-jdk7", "kotlin-stdlib-jdk8")
+            val found = mutableListOf<Path>()
+
+            for (name in stdlibNames) {
+                val moduleDir = repositoryRoot.resolve(name).toFile()
+                if (!moduleDir.exists()) continue
+
+                val jar = if (preferVersion != null) {
+                    findFirstJar(moduleDir.toPath().resolve(preferVersion))
+                } else {
+                    moduleDir.listFiles()
+                        ?.filter { it.isDirectory }
+                        ?.sortedByDescending { it.name }
+                        ?.asSequence()
+                        ?.mapNotNull { findFirstJar(it.toPath()) }
+                        ?.firstOrNull()
+                }
+
+                if (jar != null) {
+                    found.add(jar)
+                }
+            }
+
+            return found
+        }
+
+        private fun findFirstJar(versionDir: Path): Path? {
+            val dir = versionDir.toFile()
+            if (!dir.exists()) return null
+
+            return dir.walkTopDown()
+                .firstOrNull { it.extension == "jar" && !it.name.contains("-sources") && !it.name.contains("-javadoc") }
+                ?.toPath()
+        }
+
         fun mapCompilerFlag(flag: String): LanguageFeature? {
             return when (flag) {
                 "-Xcontext-parameters" -> LanguageFeature.ContextParameters

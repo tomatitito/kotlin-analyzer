@@ -29,8 +29,11 @@ Download the [latest release](https://github.com/tomatitito/kotlin-analyzer/rele
 ```bash
 tar -xzf kotlin-analyzer-v0.2.0-macos-aarch64.tar.gz
 cp kotlin-analyzer ~/.local/bin/
-cp sidecar.jar ~/.local/bin/
+rm -rf ~/.local/bin/sidecar-runtimes
+cp -R sidecar-runtimes ~/.local/bin/
 ```
+
+`kotlin-analyzer` now ships the JVM sidecar as a versioned runtime directory rather than one monolithic `sidecar.jar`. This lets the Rust server choose a Kotlin-compatible Analysis API payload per project before starting the JVM sidecar.
 
 Then symlink the Zed extension:
 
@@ -148,8 +151,8 @@ kotlin-analyzer requires JDK 17+. It searches for Java in this order:
 # Rust LSP binary
 cd server && cargo build --release
 
-# JVM sidecar
-cd sidecar && ./gradlew shadowJar
+# JVM sidecar runtimes
+cd sidecar && ./gradlew assembleRuntimePayloads
 
 # Zed extension (WASM)
 cargo build --target wasm32-wasip1
@@ -159,11 +162,25 @@ cargo build --target wasm32-wasip1
 
 ```bash
 cp server/target/release/kotlin-analyzer ~/.local/bin/
-cp sidecar/build/libs/sidecar-all.jar ~/.local/bin/sidecar.jar
+rm -rf ~/.local/bin/sidecar-runtimes
+cp -R sidecar/build/runtime ~/.local/bin/sidecar-runtimes
 
 # Symlink the Zed extension (only needed once)
 ln -sfn "$(pwd)" ~/Library/Application\ Support/Zed/extensions/installed/kotlin-analyzer
 ```
+
+For development builds, use the helper script:
+
+```bash
+cargo build --manifest-path server/Cargo.toml && (cd sidecar && ./gradlew assembleRuntimePayloads) && ./scripts/install-dev-runtime.sh
+```
+
+That command:
+
+- builds the debug server binary
+- assembles the versioned JVM runtimes under `sidecar/build/runtime/`
+- installs `~/.local/bin/kotlin-analyzer`
+- installs `~/.local/bin/sidecar-runtimes/`
 
 ### Test
 
@@ -172,7 +189,7 @@ ln -sfn "$(pwd)" ~/Library/Application\ Support/Zed/extensions/installed/kotlin-
 cd server && cargo test
 
 # Full smoke test
-cargo build && (cd sidecar && ./gradlew shadowJar) && cd server && cargo test
+cargo build && (cd sidecar && ./gradlew assembleRuntimePayloads) && cd server && cargo test
 ```
 
 ## Documentation

@@ -110,10 +110,11 @@ rev = "ff2e742f946d060b68bfb9a3544184ecd61e1228"
 
 ## Deployment Requirements
 
-The sidecar JAR must be placed next to the server binary:
+The sidecar runtimes must be placed next to the server binary:
 ```bash
-cp sidecar/build/libs/sidecar-all.jar ~/.local/bin/sidecar.jar
 cp target/release/kotlin-analyzer ~/.local/bin/kotlin-analyzer
+rm -rf ~/.local/bin/sidecar-runtimes
+cp -R sidecar/build/runtime ~/.local/bin/sidecar-runtimes
 ```
 
 ## Known Limitations (Addressed)
@@ -128,14 +129,14 @@ cp target/release/kotlin-analyzer ~/.local/bin/kotlin-analyzer
 ```bash
 # Full build and test
 cargo build --release
-cd sidecar && ./gradlew shadowJar
+cd sidecar && ./gradlew assembleRuntimePayloads
 cargo test --features integration
 
 # Manual testing
 scripts/test-lsp-manually.py
 
 # Smoke test
-cargo build && (cd sidecar && ./gradlew shadowJar) && cargo test
+cargo build && (cd sidecar && ./gradlew assembleRuntimePayloads) && cargo test
 ```
 
 ## Architecture Notes

@@ -28,12 +28,14 @@ Archive contents:
 ```
 kotlin-analyzer-0.1.0-aarch64-apple-darwin/
 ├── kotlin-analyzer          # Rust binary (platform-specific)
-└── sidecar.jar        # Fat JAR with kotlin-compiler-embeddable (platform-independent)
+└── sidecar-runtimes/        # Launcher + versioned JVM runtime payloads
+    ├── 2.2.0-RC2/
+    └── 2.2.21/
 ```
 
-The sidecar JAR is a single fat JAR built with Gradle's `shadowJar` plugin. It contains `kotlin-compiler-embeddable` and all sidecar dependencies. The same JAR is included in every platform archive.
+Each runtime directory contains a `manifest.json`, a small launcher jar, and a payload classpath with the sidecar implementation plus the Kotlin compiler and Analysis API artifacts for that Kotlin line. Build this layout with `./gradlew assembleRuntimePayloads`.
 
-Do **not** embed the JAR inside the Rust binary via `include_bytes!()`. The JAR is 50-80 MB and embedding it would bloat the binary, slow compilation, and prevent updating the JAR independently. Ship them alongside each other in the archive.
+Do **not** embed the runtime payloads inside the Rust binary via `include_bytes!()`. They are large and versioned independently; embedding them would bloat the binary, slow compilation, and prevent runtime selection per project. Ship them alongside the binary in the archive.
 
 ---
 
@@ -145,9 +147,9 @@ strategy:
 1. **Checkout** repository
 2. **Install Rust** toolchain with target triple
 3. **Build Rust binary** (`cargo build --release --target $TARGET`)
-4. **Build sidecar JAR** (`./gradlew :sidecar:shadowJar`) — once, on any runner
+4. **Build sidecar runtimes** (`./gradlew :sidecar:assembleRuntimePayloads`) — once, on any runner
 5. **Run tests** (`cargo test`, `./gradlew :sidecar:test`)
-6. **Package archive** — combine Rust binary + sidecar JAR into `.tar.gz`
+6. **Package archive** — combine Rust binary + `sidecar-runtimes/` into `.tar.gz`
 7. **Upload artifact** — attach to GitHub Actions run (for CI) or GitHub release (for tags)
 
 #### Cross-Compilation
@@ -157,7 +159,7 @@ For the Linux target when building on macOS:
 - Use `cross` (Docker-based cross-compilation) or `cargo-zigbuild` (uses Zig as a C cross-compiler)
 - `cargo-zigbuild` is preferred — lighter weight, no Docker dependency, handles glibc version targeting
 
-The sidecar JAR is platform-independent. Build it once on any runner and include it in all platform archives.
+The sidecar runtimes are platform-independent. Build them once on any runner and include them in all platform archives.
 
 ---
 
@@ -183,7 +185,7 @@ The `LICENSE` file in the repository root contains the full Apache 2.0 text. Eac
 
 ## 7. Version Management
 
-The Rust binary and sidecar JAR share a single version number. This version is the source of truth and appears in:
+The Rust binary and sidecar runtimes share a single version number. This version is the source of truth and appears in:
 
 - `Cargo.toml` (`version = "0.1.0"`)
 - `sidecar/build.gradle.kts` (`version = "0.1.0"`)
@@ -192,4 +194,3 @@ The Rust binary and sidecar JAR share a single version number. This version is t
 - Release archive filenames (`kotlin-analyzer-0.1.0-aarch64-apple-darwin.tar.gz`)
 
 The pinned Kotlin compiler version (`2.3.10` for v1) is documented in release notes and in the sidecar's `build.gradle.kts`. Bumping the Kotlin compiler version is a deliberate act that requires testing.
-

@@ -94,7 +94,7 @@ cargo run -- --log-level debug             # run the server on stdin/stdout
 ### JVM sidecar
 
 ```bash
-cd sidecar && ./gradlew shadowJar          # build fat JAR
+cd sidecar && ./gradlew assembleRuntimePayloads   # build launcher + versioned runtime payloads
 cd sidecar && ./gradlew test               # unit tests
 ```
 
@@ -106,13 +106,13 @@ bash scripts/build-extension.sh            # build WASM component (wasip2) and c
 # symlink the extension into Zed's local extensions directory (macOS)
 ln -sfn "$(pwd)" ~/Library/Application\ Support/Zed/extensions/installed/kotlin-analyzer
 
-# symlink the server binary so the extension can find it and the sidecar JAR
+# symlink the server binary so the extension can find the built sidecar runtimes
 ln -sf "$(pwd)/server/target/debug/kotlin-analyzer" ~/.local/bin/kotlin-analyzer
 ```
 
 After symlinking, rebuild and restart Zed to pick up changes. The symlinks only need to be created once.
 
-**Important**: The binary at `~/.local/bin/kotlin-analyzer` must be a symlink (not a copy) so that the server can resolve its path back to the source tree to find the sidecar JAR at `sidecar/build/libs/sidecar-all.jar`.
+**Important**: The binary at `~/.local/bin/kotlin-analyzer` must be a symlink (not a copy) so that the server can resolve its path back to the source tree and find the versioned sidecar runtimes under `sidecar/build/runtime/`.
 
 **Trust**: This dev build of Zed (`my-zed`) requires worktree trust before starting language servers. If the LS doesn't start automatically, use `Cmd+Shift+P` → "Restart Language Server" to trigger it manually.
 
@@ -126,7 +126,7 @@ tree-sitter highlight tests/fixtures/kotlin/correct/BasicConstructs.kt
 ### Full smoke test
 
 ```bash
-cargo build && (cd sidecar && ./gradlew shadowJar) && cargo test
+cargo build && (cd sidecar && ./gradlew assembleRuntimePayloads) && cargo test
 ```
 
 ## Zed CLI

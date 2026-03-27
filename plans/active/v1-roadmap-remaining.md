@@ -61,14 +61,14 @@ Further optimization can be deferred to post-v1.
   - [x] Gradle extraction failed (shows WARNING via LSP showMessage)
   - [x] Sidecar crash notification (already shows in logs)
   - [ ] Out of memory suggestion
-  - [x] Sidecar JAR not found (shows WARNING via LSP showMessage)
+  - [x] Sidecar runtime not found (shows WARNING via LSP showMessage)
 - [x] Zed status bar integration (`CheckingForUpdate` during startup, `None` when command is ready, `Failed` on missing/invalid binary)
 - [x] Graceful degradation when sidecar is down (returns empty results)
 
 #### Verification Gates
 - [x] Test sidecar crash recovery (immediate cancellation working)
 - [ ] Test with no JVM installed
-- [ ] Test with missing/corrupted sidecar JAR
+- [ ] Test with missing/corrupted sidecar runtime
 - [ ] Test no-build-system fallback
 
 #### Publishing
@@ -92,7 +92,7 @@ Further optimization can be deferred to post-v1.
 2. ~~**Documentation sync and build instructions**~~ — Done. README updated, pre-commit hook added.
 
 ### Must Have (Blocking v1.0)
-1. ~~Error handling for missing JVM/JAR~~ — Already implemented (clear error messages shown to user via LSP showMessage)
+1. ~~Error handling for missing JVM/runtime~~ — Already implemented (clear error messages shown to user via LSP showMessage)
 2. Basic Zed status bar integration
 3. Publishing to Zed registry
 4. GitHub release with v1.0 binaries
@@ -111,7 +111,7 @@ Further optimization can be deferred to post-v1.
 - Performance targets met
 - v0.2.0 release created (stable baseline)
 - Documentation and build instructions updated
-- Error handling for missing JVM/JAR (user-facing messages via LSP)
+- Error handling for missing JVM/runtime (user-facing messages via LSP)
 - Zero compiler warnings
 - Enhanced hover: package/container info, documentation from library symbols (KDoc + Javadoc)
 - Rich annotation hover: meta-annotations (@Target, @Retention, @MustBeDocumented, @Component), supertypes, source origin
@@ -124,7 +124,7 @@ Further optimization can be deferred to post-v1.
 - Server logs PID and CLI args on startup for diagnostics
 - Bridge lock contention fix in `did_close` handler
 - Build script corrected to use `wasm32-wasip2` target
-- Binary install documented as symlink (required for sidecar JAR discovery)
+- Binary install documented as symlink (required for sidecar runtime discovery)
 - Project root discovery: server walks up from rootUri to find actual project root (fixes incorrect classpath/source root when Zed passes a deep source directory)
 - Startup race condition: `analyze_document` no longer logs WARN when bridge is initializing (expected during startup)
 - Integration tests fixed: proper channel-based LSP message handling (notifications vs requests), all tests pass
@@ -135,7 +135,7 @@ Further optimization can be deferred to post-v1.
 
 - [x] All core LSP features work
 - [x] Performance meets targets
-- [x] Clear error messages for common failures (JVM, JAR, Gradle, sidecar crash)
+- [x] Clear error messages for common failures (JVM, sidecar runtime, Gradle, sidecar crash)
 - [ ] Published to Zed extension registry
 - [ ] Works on macOS and Linux
 

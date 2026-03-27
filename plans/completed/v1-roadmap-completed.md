@@ -63,7 +63,7 @@ This document tracks all completed tasks from the v1 roadmap as of February 19, 
 - [x] GitHub Actions workflow configured
 - [x] Build matrix: macOS ARM + Linux x64
 - [x] Cross-platform Rust builds
-- [x] Sidecar JAR build (shadowJar)
+- [x] Sidecar runtime packaging build
 - [x] Automated packaging to .tar.gz
 - [x] Tag-triggered releases
 
@@ -80,7 +80,7 @@ This document tracks all completed tasks from the v1 roadmap as of February 19, 
 
 ### JVM Sidecar ✅
 - [x] Kotlin project scaffold
-- [x] Fat JAR with shadowJar (71MB)
+- [x] JVM sidecar packaging established
 - [x] kotlin-compiler 2.1.20
 - [x] Analysis API standalone setup
 - [x] JSON-RPC server on stdin/stdout

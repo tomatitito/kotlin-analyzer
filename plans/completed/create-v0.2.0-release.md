@@ -41,26 +41,26 @@ The current version has working LSP features (hover, rename, go-to-definition, f
 # Build Rust LSP binary
 cargo build --release
 
-# Build sidecar JAR
-cd sidecar && ./gradlew shadowJar
+# Build sidecar runtimes
+cd sidecar && ./gradlew assembleRuntimePayloads
 
 # Create release directory
 mkdir -p release/v0.2.0
 
 # Copy artifacts
 cp target/release/kotlin-analyzer release/v0.2.0/
-cp sidecar/build/libs/sidecar-all.jar release/v0.2.0/sidecar.jar
+cp -R sidecar/build/runtime release/v0.2.0/sidecar-runtimes
 ```
 
 ### 2. Create Platform Archives
 ```bash
 # macOS ARM64
 tar -czf kotlin-analyzer-v0.2.0-macos-aarch64.tar.gz \
-  -C release/v0.2.0 kotlin-analyzer sidecar.jar
+  -C release/v0.2.0 kotlin-analyzer sidecar-runtimes
 
 # Linux x64 (if available)
 # tar -czf kotlin-analyzer-v0.2.0-linux-x86_64.tar.gz \
-#   -C release/v0.2.0 kotlin-analyzer sidecar.jar
+#   -C release/v0.2.0 kotlin-analyzer sidecar-runtimes
 ```
 
 ### 3. Create Git Tag
@@ -105,7 +105,8 @@ This release establishes a working baseline with core LSP features functional.
    \`\`\`bash
    tar -xzf kotlin-analyzer-v0.2.0-macos-aarch64.tar.gz
    cp kotlin-analyzer ~/.local/bin/
-   cp sidecar.jar ~/.local/bin/
+   rm -rf ~/.local/bin/sidecar-runtimes
+   cp -R sidecar-runtimes ~/.local/bin/
    \`\`\`
 3. Install the Zed extension (dev mode for now)
 
@@ -153,7 +154,7 @@ gh release download v0.2.0
 
 ## Checklist
 
-- [ ] Build release artifacts (Rust binary + sidecar JAR)
+- [ ] Build release artifacts (Rust binary + sidecar runtimes)
 - [ ] Create platform archives (.tar.gz files)
 - [ ] Create and push git tag (v0.2.0)
 - [ ] Create GitHub release with binaries

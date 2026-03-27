@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 /// A concrete sidecar runtime that can be launched by the bridge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarRuntime {
@@ -36,6 +38,15 @@ pub struct AvailableSidecarRuntime {
     pub kotlin_version: Option<String>,
     pub classpath: Vec<PathBuf>,
     pub main_class: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeManifest {
+    #[serde(rename = "kotlinVersion")]
+    kotlin_version: String,
+    #[serde(rename = "mainClass")]
+    main_class: String,
+    classpath: Vec<PathBuf>,
 }
 
 pub fn resolve_sidecar_runtime(requested_kotlin_version: Option<&str>) -> Option<SidecarRuntime> {
@@ -148,6 +159,8 @@ fn runtimes_from_executable(exe: &Path) -> Option<Vec<AvailableSidecarRuntime>> 
     let exe_dir = exe.parent()?;
     let mut runtimes = Vec::new();
 
+    runtimes.extend(discover_manifest_runtimes(&exe_dir.join("sidecar-runtimes")));
+
     let bundled = exe_dir.join("sidecar.jar");
     if bundled.exists() {
         runtimes.push(AvailableSidecarRuntime {
@@ -158,6 +171,10 @@ fn runtimes_from_executable(exe: &Path) -> Option<Vec<AvailableSidecarRuntime>> 
     }
 
     let repo_root = exe_dir.parent()?.parent()?.parent()?;
+    runtimes.extend(discover_manifest_runtimes(
+        &repo_root.join("sidecar/build/runtime"),
+    ));
+
     let dev_jar = repo_root.join("sidecar/build/libs/sidecar-all.jar");
     if dev_jar.exists() {
         runtimes.push(AvailableSidecarRuntime {
@@ -172,6 +189,46 @@ fn runtimes_from_executable(exe: &Path) -> Option<Vec<AvailableSidecarRuntime>> 
     } else {
         Some(runtimes)
     }
+}
+
+fn discover_manifest_runtimes(root: &Path) -> Vec<AvailableSidecarRuntime> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+
+    let mut manifests = entries
+        .flatten()
+        .map(|entry| entry.path().join("manifest.json"))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    manifests.sort();
+
+    manifests
+        .into_iter()
+        .filter_map(|manifest| load_runtime_manifest(&manifest))
+        .collect()
+}
+
+fn load_runtime_manifest(path: &Path) -> Option<AvailableSidecarRuntime> {
+    let manifest_dir = path.parent()?;
+    let manifest = std::fs::read_to_string(path).ok()?;
+    let manifest: RuntimeManifest = serde_json::from_str(&manifest).ok()?;
+    let classpath = manifest
+        .classpath
+        .into_iter()
+        .map(|entry| manifest_dir.join(entry))
+        .collect::<Vec<_>>();
+
+    if classpath.is_empty() || classpath.iter().any(|entry| !entry.exists()) {
+        tracing::warn!(manifest = %path.display(), "ignoring incomplete sidecar runtime manifest");
+        return None;
+    }
+
+    Some(AvailableSidecarRuntime {
+        kotlin_version: Some(manifest.kotlin_version),
+        classpath,
+        main_class: Some(manifest.main_class),
+    })
 }
 
 fn read_dev_kotlin_version(build_file: PathBuf) -> Option<String> {
@@ -238,6 +295,7 @@ impl PartialOrd for KotlinVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn runtime(version: &str) -> AvailableSidecarRuntime {
         AvailableSidecarRuntime {
@@ -292,6 +350,43 @@ mod tests {
         assert_eq!(
             selected.selection_reason,
             RuntimeSelectionReason::DefaultBundled
+        );
+    }
+
+    #[test]
+    fn load_runtime_manifest_resolves_relative_classpath_entries() {
+        let dir = tempdir().unwrap();
+        let runtime_dir = dir.path().join("2.2.21");
+        std::fs::create_dir_all(runtime_dir.join("launcher")).unwrap();
+        std::fs::create_dir_all(runtime_dir.join("payload")).unwrap();
+        std::fs::write(runtime_dir.join("launcher/sidecar-launcher.jar"), b"launcher").unwrap();
+        std::fs::write(runtime_dir.join("payload/sidecar-impl.jar"), b"payload").unwrap();
+        std::fs::write(
+            runtime_dir.join("manifest.json"),
+            r#"{
+  "kotlinVersion": "2.2.21",
+  "mainClass": "dev.kouros.sidecar.launcher.LauncherMain",
+  "classpath": [
+    "launcher/sidecar-launcher.jar",
+    "payload/sidecar-impl.jar"
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let runtime = load_runtime_manifest(&runtime_dir.join("manifest.json")).unwrap();
+
+        assert_eq!(runtime.kotlin_version.as_deref(), Some("2.2.21"));
+        assert_eq!(
+            runtime.main_class.as_deref(),
+            Some("dev.kouros.sidecar.launcher.LauncherMain")
+        );
+        assert_eq!(
+            runtime.classpath,
+            vec![
+                runtime_dir.join("launcher/sidecar-launcher.jar"),
+                runtime_dir.join("payload/sidecar-impl.jar"),
+            ]
         );
     }
 }
