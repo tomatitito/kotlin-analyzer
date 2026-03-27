@@ -40,9 +40,7 @@ impl RuntimeSelectionReason {
     pub fn counter_name(self) -> &'static str {
         match self {
             RuntimeSelectionReason::ExactMatch => "runtime_selection.exact_match",
-            RuntimeSelectionReason::SameMinorFallback => {
-                "runtime_selection.same_minor_fallback"
-            }
+            RuntimeSelectionReason::SameMinorFallback => "runtime_selection.same_minor_fallback",
             RuntimeSelectionReason::BundledFallback => "runtime_selection.cross_minor_fallback",
             RuntimeSelectionReason::DefaultBundled => "runtime_selection.default_bundled",
         }
@@ -117,7 +115,10 @@ pub fn resolve_sidecar_runtime(requested_kotlin_version: Option<&str>) -> Option
         tracing::info!(
             counter = runtime.selection_reason.counter_name(),
             count = 1u64,
-            requested = runtime.requested_kotlin_version.as_deref().unwrap_or("unknown"),
+            requested = runtime
+                .requested_kotlin_version
+                .as_deref()
+                .unwrap_or("unknown"),
             selected = runtime.kotlin_version.as_deref().unwrap_or("unknown"),
             reason = runtime.selection_reason.description(),
             "sidecar runtime selection counter"
