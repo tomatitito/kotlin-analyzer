@@ -225,13 +225,14 @@ def run_session(server_bin: Path, compiler_flags: list[str], rel_paths: list[str
 
 def choose_default_server() -> Path:
     candidates = [
-        Path("/Users/dusty/devel/kotlin-analyzer/server/target/debug/kotlin-analyzer"),
-        Path("/Users/dusty/devel/symphony-workspaces/TOM-21/server/target/debug/kotlin-analyzer"),
+        ROOT / "server" / "target" / "debug" / "kotlin-analyzer",
+        Path.cwd() / "server" / "target" / "debug" / "kotlin-analyzer",
+        Path.home() / ".local" / "bin" / "kotlin-analyzer",
     ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
-    return Path("/Users/dusty/devel/kotlin-analyzer/server/target/debug/kotlin-analyzer")
+    return ROOT / "server" / "target" / "debug" / "kotlin-analyzer"
 
 
 def main() -> int:
