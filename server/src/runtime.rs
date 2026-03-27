@@ -36,6 +36,34 @@ impl RuntimeSelectionReason {
             RuntimeSelectionReason::DefaultBundled => "default bundled runtime",
         }
     }
+
+    pub fn counter_name(self) -> &'static str {
+        match self {
+            RuntimeSelectionReason::ExactMatch => "runtime_selection.exact_match",
+            RuntimeSelectionReason::SameMinorFallback => {
+                "runtime_selection.same_minor_fallback"
+            }
+            RuntimeSelectionReason::BundledFallback => "runtime_selection.cross_minor_fallback",
+            RuntimeSelectionReason::DefaultBundled => "runtime_selection.default_bundled",
+        }
+    }
+}
+
+impl SidecarRuntime {
+    pub fn selection_warning_message(&self) -> Option<String> {
+        let requested = self.requested_kotlin_version.as_deref()?;
+        let selected = self.kotlin_version.as_deref().unwrap_or("unknown");
+
+        match self.selection_reason {
+            RuntimeSelectionReason::ExactMatch | RuntimeSelectionReason::DefaultBundled => None,
+            RuntimeSelectionReason::SameMinorFallback => Some(format!(
+                "kotlin-analyzer: project requests Kotlin {requested}, but that exact runtime is unavailable. Using Kotlin {selected} from the same minor line instead."
+            )),
+            RuntimeSelectionReason::BundledFallback => Some(format!(
+                "kotlin-analyzer: project requests Kotlin {requested}, but that runtime is unavailable. Using bundled Kotlin {selected} instead; analysis may be inaccurate until a closer runtime is installed."
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +109,18 @@ pub fn resolve_sidecar_runtime(requested_kotlin_version: Option<&str>) -> Option
         return None;
     }
 
-    select_sidecar_runtime(requested_kotlin_version, &available)
+    let selected = select_sidecar_runtime(requested_kotlin_version, &available);
+    if let Some(runtime) = selected.as_ref() {
+        tracing::info!(
+            counter = runtime.selection_reason.counter_name(),
+            count = 1u64,
+            requested = runtime.requested_kotlin_version.as_deref().unwrap_or("unknown"),
+            selected = runtime.kotlin_version.as_deref().unwrap_or("unknown"),
+            reason = runtime.selection_reason.description(),
+            "sidecar runtime selection counter"
+        );
+    }
+    selected
 }
 
 pub fn select_sidecar_runtime(
@@ -374,6 +413,14 @@ fn provision_cached_runtime(
     }
 
     if copy_runtime_tree(source_runtime_dir, &staging_dir).is_err() {
+        tracing::warn!(
+            counter = "runtime_provision.failure",
+            count = 1u64,
+            requested = requested_kotlin_version,
+            source = %source_runtime_dir.display(),
+            destination = %destination_runtime_dir.display(),
+            "failed to stage sidecar runtime into cache"
+        );
         let _ = std::fs::remove_dir_all(&staging_dir);
         return None;
     }
@@ -400,6 +447,8 @@ fn provision_cached_runtime(
         Err(err) => {
             let _ = std::fs::remove_dir_all(&staging_dir);
             tracing::warn!(
+                counter = "runtime_provision.failure",
+                count = 1u64,
                 requested = requested_kotlin_version,
                 source = %source_runtime_dir.display(),
                 destination = %destination_runtime_dir.display(),
@@ -791,5 +840,54 @@ mod tests {
         assert_eq!(runtime.kotlin_version.as_deref(), Some("2.2.21"));
         assert!(cache_root.join("2.2.21/manifest.json").exists());
         assert!(cache_root.join("2.2.21/payload/sidecar-impl.jar").exists());
+    }
+
+    #[test]
+    fn same_minor_fallback_emits_warning_message() {
+        let runtime = SidecarRuntime {
+            requested_kotlin_version: Some("2.2.5".into()),
+            kotlin_version: Some("2.2.21".into()),
+            classpath: vec![PathBuf::from("2.2.21.jar")],
+            main_class: None,
+            selection_reason: RuntimeSelectionReason::SameMinorFallback,
+        };
+
+        assert_eq!(
+            runtime.selection_warning_message().as_deref(),
+            Some(
+                "kotlin-analyzer: project requests Kotlin 2.2.5, but that exact runtime is unavailable. Using Kotlin 2.2.21 from the same minor line instead."
+            )
+        );
+    }
+
+    #[test]
+    fn cross_minor_fallback_emits_warning_message() {
+        let runtime = SidecarRuntime {
+            requested_kotlin_version: Some("1.9.25".into()),
+            kotlin_version: Some("2.2.21".into()),
+            classpath: vec![PathBuf::from("2.2.21.jar")],
+            main_class: None,
+            selection_reason: RuntimeSelectionReason::BundledFallback,
+        };
+
+        assert_eq!(
+            runtime.selection_warning_message().as_deref(),
+            Some(
+                "kotlin-analyzer: project requests Kotlin 1.9.25, but that runtime is unavailable. Using bundled Kotlin 2.2.21 instead; analysis may be inaccurate until a closer runtime is installed."
+            )
+        );
+    }
+
+    #[test]
+    fn exact_match_does_not_emit_warning_message() {
+        let runtime = SidecarRuntime {
+            requested_kotlin_version: Some("2.2.21".into()),
+            kotlin_version: Some("2.2.21".into()),
+            classpath: vec![PathBuf::from("2.2.21.jar")],
+            main_class: None,
+            selection_reason: RuntimeSelectionReason::ExactMatch,
+        };
+
+        assert_eq!(runtime.selection_warning_message(), None);
     }
 }

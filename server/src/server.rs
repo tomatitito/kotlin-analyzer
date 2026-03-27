@@ -669,11 +669,17 @@ impl LanguageServer for KotlinLanguageServer {
             tracing::info!(
                 requested = requested_kotlin_version.as_deref().unwrap_or("unknown"),
                 selected = sidecar_runtime.kotlin_version.as_deref().unwrap_or("unknown"),
+                selection_counter = sidecar_runtime.selection_reason.counter_name(),
                 reason = sidecar_runtime.selection_reason.description(),
                 classpath = ?sidecar_runtime.classpath,
                 main_class = sidecar_runtime.main_class.as_deref().unwrap_or("<jar>"),
                 "selected sidecar runtime"
             );
+
+            if let Some(message) = sidecar_runtime.selection_warning_message() {
+                client.show_message(MessageType::WARNING, message).await;
+            }
+
             let bridge = Arc::new(Bridge::new(sidecar_runtime, java_path, config));
 
             // Store the bridge BEFORE starting so LSP requests that arrive

@@ -50,6 +50,14 @@ Unit tests for the Rust binary cover individual modules in isolation with no JVM
 - Handle missing `build.gradle.kts` (not a Gradle project)
 - Parse Maven `dependency:build-classpath` output (mocked)
 
+**`runtime.rs` — Sidecar Runtime Selection**
+- Prefer exact Kotlin runtime matches when available
+- Fall back to the newest runtime from the same minor line when an exact patch is unavailable
+- Fall back to the newest bundled runtime when no compatible line is available
+- Resolve runtime manifests relative to their runtime directory
+- Reject cached or provisioned runtimes with mismatched analyzer version, platform, or missing classpath entries
+- Emit warning text only for fallback selections, not exact matches
+
 ### JVM Side
 
 Unit tests for the sidecar cover the compiler bridge in isolation.
@@ -131,6 +139,8 @@ These tests spawn the actual Rust binary and JVM sidecar against real Kotlin pro
 - Request completions after `"hello".`, verify String methods appear
 - Open a Gradle project with dependencies, verify classpath is resolved
 - Open a project with `-Xcontext-parameters`, verify no false-positive errors
+- Open a project whose Kotlin version is not bundled but a same-minor runtime is available, verify one fallback warning is shown
+- Open a project whose Kotlin version is unavailable across bundled lines, verify one cross-minor fallback warning is shown
 
 **Execution:** These tests are slow (JVM startup + compilation). They run in CI on pushes to `main` and on pull requests, but not on every local `cargo test` invocation. Gate them behind a `#[cfg(feature = "integration")]` flag or a `#[ignore]` attribute with a CI-specific test runner configuration.
 

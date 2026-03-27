@@ -61,6 +61,15 @@ When a project requests a Kotlin version that is not currently bundled but is av
 
 Provision source directories can be supplied with `KOTLIN_ANALYZER_RUNTIME_SOURCE_DIRS` as an OS path list. In development, the server also checks `sidecar/build/runtime/` automatically when launched from the source tree.
 
+### Runtime Selection UX
+
+At startup, the server logs the requested Kotlin version, the selected runtime version, and the selection reason. When the selected runtime is not an exact match for the project, the server also sends one `window/showMessage` warning:
+
+- same-minor fallback: exact patch unavailable, using the newest available runtime from the same minor line
+- cross-minor fallback: exact line unavailable, using the newest bundled runtime and warning that analysis may be inaccurate
+
+Runtime-selection observability currently ships as structured log fields with counter names such as `runtime_selection.exact_match`, `runtime_selection.same_minor_fallback`, `runtime_selection.cross_minor_fallback`, `runtime_selection.default_bundled`, and `runtime_provision.failure`.
+
 ---
 
 ## 3. JVM Requirement

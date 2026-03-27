@@ -209,24 +209,33 @@ This phase currently provisions from local runtime source directories rather tha
 
 ## Phase 4: UX, Warnings, and Observability
 
+Status: Completed on 2026-03-27.
+
 ### Outcome
 
 Users can tell when they are running an exact match, a fallback, or an incompatible runtime.
 
 ### Changes
 
-- Show a warning when runtime selection falls back across minor lines.
-- Include selected runtime version in diagnostics/logging/health output.
+- Show one warning when runtime selection falls back from the requested project version:
+  - same-minor fallbacks explain that an exact patch match was unavailable
+  - cross-minor fallbacks explain that analysis may be inaccurate until a closer runtime is installed
+- Include selected runtime version and selection reason in startup logging.
 - Add telemetry-style counters in logs for:
   - exact matches
   - same-minor fallbacks
   - cross-minor fallbacks
+  - default bundled runtime selection
   - provisioning failures
 
 ### Acceptance
 
 - When fallback occurs, the user gets one clear message instead of silent misanalysis.
 - Debug logs are sufficient to explain runtime choice and cache behavior.
+
+### Notes
+
+The current implementation emits these counters as structured log fields rather than shipping a separate metrics backend.
 
 ## Testing Strategy
 
