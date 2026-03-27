@@ -90,7 +90,7 @@ impl zed::Extension for KotlinAnalyzerExtension {
             .map(|(_, v)| v.clone())
         {
             let local_bin = format!("{home}/.local/bin/kotlin-analyzer");
-            if fs::metadata(&local_bin).map_or(false, |metadata| metadata.is_file()) {
+            if fs::metadata(&local_bin).is_ok_and(|metadata| metadata.is_file()) {
                 Self::set_status(
                     language_server_id,
                     zed::LanguageServerInstallationStatus::None,
@@ -106,7 +106,7 @@ impl zed::Extension for KotlinAnalyzerExtension {
 
         // 3) Check if we already downloaded the binary.
         if let Some(path) = &self.cached_binary_path {
-            if fs::metadata(path).map_or(false, |metadata| metadata.is_file()) {
+            if fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
                 Self::set_status(
                     language_server_id,
                     zed::LanguageServerInstallationStatus::None,
@@ -125,7 +125,7 @@ impl zed::Extension for KotlinAnalyzerExtension {
             zed::LanguageServerInstallationStatus::Failed(message.clone()),
         );
         // 4) No local binary found — return a helpful error.
-        Err(message.into())
+        Err(message)
     }
 
     fn language_server_workspace_configuration(
