@@ -200,6 +200,8 @@ supportedRuntimeKotlinVersions.forEach { runtimeKotlinVersion ->
             val manifest = mapOf(
                 "kotlinVersion" to runtimeKotlinVersion,
                 "mainClass" to "dev.kouros.sidecar.launcher.LauncherMain",
+                "analyzerVersion" to project.version.toString(),
+                "targetPlatform" to "any",
                 "classpath" to buildList {
                     add("launcher/${launcherJar.get().archiveFileName.get()}")
                     add("payload/sidecar-impl.jar")

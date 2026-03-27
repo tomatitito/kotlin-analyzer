@@ -163,18 +163,30 @@ The sidecar is no longer a single monolithic shaded JAR tied to one compiler lin
 
 ## Phase 3: Local Cache and Provisioning
 
+Status: Completed on 2026-03-27.
+
 ### Outcome
 
 Projects can use a matching runtime even when it is not bundled in the release artifact.
 
 ### Changes
 
-- Add a local cache directory for sidecar runtimes, for example:
-  - `~/.cache/kotlin-analyzer/runtimes/<kotlin-version>/`
+- Add a local cache directory for sidecar runtimes keyed by:
+  - kotlin-analyzer version
+  - target platform
+  - Kotlin version
+- Support overriding the cache root with `KOTLIN_ANALYZER_RUNTIME_CACHE_DIR`.
 - On startup, runtime resolution checks:
   - bundled runtimes
   - cached runtimes
-  - optional download/provision path
+  - optional provision source directories
+- Support overriding provision source directories with `KOTLIN_ANALYZER_RUNTIME_SOURCE_DIRS`.
+- Provision exact-match runtimes into the cache with a temp-dir + atomic rename flow.
+- Validate cached runtime manifests against:
+  - directory/version match
+  - kotlin-analyzer version
+  - target platform
+  - classpath file existence
 - Cache key must include:
   - Kotlin version
   - kotlin-analyzer version
@@ -182,14 +194,18 @@ Projects can use a matching runtime even when it is not bundled in the release a
 
 ### Tasks
 
-- Define runtime manifest format.
-- Add integrity checks for cached payloads.
-- Add cleanup policy for old runtimes.
+- Define runtime manifest format. Completed.
+- Add integrity checks for cached payloads. Completed.
+- Add cleanup policy for old runtimes. Deferred.
 
 ### Acceptance
 
 - A missing exact runtime can be provisioned once and reused offline afterwards.
 - Corrupt cache entries are detected and replaced cleanly.
+
+### Notes
+
+This phase currently provisions from local runtime source directories rather than a remote download service. That preserves the runtime-selection seam for future network provisioning while delivering reusable local caching now.
 
 ## Phase 4: UX, Warnings, and Observability
 

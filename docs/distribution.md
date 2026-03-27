@@ -35,7 +35,31 @@ kotlin-analyzer-0.1.0-aarch64-apple-darwin/
 
 Each runtime directory contains a `manifest.json`, a small launcher jar, and a payload classpath with the sidecar implementation plus the Kotlin compiler and Analysis API artifacts for that Kotlin line. Build this layout with `./gradlew assembleRuntimePayloads`.
 
+The runtime manifest now also records:
+
+- `kotlinVersion`
+- `mainClass`
+- `analyzerVersion`
+- `targetPlatform`
+- `classpath`
+
+`analyzerVersion` and `targetPlatform` are used during runtime discovery to reject cached payloads built for a different kotlin-analyzer release or platform.
+
 Do **not** embed the runtime payloads inside the Rust binary via `include_bytes!()`. They are large and versioned independently; embedding them would bloat the binary, slow compilation, and prevent runtime selection per project. Ship them alongside the binary in the archive.
+
+### Runtime Cache
+
+At runtime, the server also maintains a local sidecar cache outside the release archive. The default cache root is platform-specific:
+
+- macOS: `~/Library/Caches/kotlin-analyzer/runtimes/<analyzer-version>/<target-platform>/`
+- Linux: `${XDG_CACHE_HOME:-~/.cache}/kotlin-analyzer/runtimes/<analyzer-version>/<target-platform>/`
+- Windows: `%LOCALAPPDATA%\\kotlin-analyzer\\runtimes\\<analyzer-version>\\<target-platform>\\`
+
+The cache root can be overridden with `KOTLIN_ANALYZER_RUNTIME_CACHE_DIR`.
+
+When a project requests a Kotlin version that is not currently bundled but is available from a provision source, the server copies that runtime into the cache and reuses it offline on later startups. Cache installs are staged into a temporary directory and then atomically renamed into place so partial installs are not treated as valid runtimes.
+
+Provision source directories can be supplied with `KOTLIN_ANALYZER_RUNTIME_SOURCE_DIRS` as an OS path list. In development, the server also checks `sidecar/build/runtime/` automatically when launched from the source tree.
 
 ---
 
@@ -151,6 +175,8 @@ strategy:
 5. **Run tests** (`cargo test`, `./gradlew :sidecar:test`)
 6. **Package archive** — combine Rust binary + `sidecar-runtimes/` into `.tar.gz`
 7. **Upload artifact** — attach to GitHub Actions run (for CI) or GitHub release (for tags)
+
+The packaged `sidecar-runtimes/` directory remains the primary bundled source. The local runtime cache is populated lazily on user machines and is not packaged into release archives.
 
 #### Cross-Compilation
 
