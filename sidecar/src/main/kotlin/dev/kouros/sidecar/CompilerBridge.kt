@@ -4968,7 +4968,6 @@ class CompilerBridge {
                 return null
             }
             val lineStartOffset = document.getLineStartOffset(line - 1)
-<<<<<<< HEAD
             val lineEndOffset = document.getLineEndOffset(line - 1)
             if (character < 0) {
                 System.err.println("CompilerBridge: lineColToOffset — character $character is negative, clamping to 0")
@@ -4980,15 +4979,6 @@ class CompilerBridge {
             if (safeCharacter != character) {
                 System.err.println("CompilerBridge: lineColToOffset — character $character clamped to line length $lineLength (line=$line)")
             }
-=======
-            val lineEndOffset = if (line - 1 < document.lineCount) {
-                document.getLineEndOffset(line - 1)
-            } else {
-                document.textLength
-            }
-            val lineLength = (lineEndOffset - lineStartOffset).coerceAtLeast(0)
-            val safeCharacter = character.coerceIn(0, lineLength)
->>>>>>> f411481 (feat(hover): add explicit no-result reason for hover)
             return lineStartOffset + safeCharacter
         }
         // Fallback for LightVirtualFile-backed files where document may be null:
@@ -5008,15 +4998,10 @@ class CompilerBridge {
             System.err.println("CompilerBridge: lineColToOffset — fallback: line $line not found (reached line $currentLine at offset $offset, textLen=${text.length})")
             return null
         }
-<<<<<<< HEAD
-
-=======
->>>>>>> f411481 (feat(hover): add explicit no-result reason for hover)
         var lineEndOffset = offset
         while (lineEndOffset < text.length && text[lineEndOffset] != '\n') {
             lineEndOffset++
         }
-<<<<<<< HEAD
         if (character < 0) {
             return offset
         }
@@ -5050,11 +5035,6 @@ class CompilerBridge {
             probe--
         }
         return null
-=======
-        val lineLength = (lineEndOffset - offset).coerceAtLeast(0)
-        val safeCharacter = character.coerceIn(0, lineLength)
-        return offset + safeCharacter
->>>>>>> f411481 (feat(hover): add explicit no-result reason for hover)
     }
 
     private fun findKotlinStdlibJars(): List<Path> {
