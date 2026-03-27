@@ -2,6 +2,12 @@
 
 All notable changes to kotlin-analyzer will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Sidecar semantic resolution now uses currently open virtual file content when resolving a request file, even when URI/path matching differs from stored virtual keys, so hover/completion/diagnostics/definitions reflect unsaved edits.
+
 ## [0.1.0] - 2026-02-19
 
 Initial release.

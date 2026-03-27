@@ -415,8 +415,9 @@ class CompilerBridge {
         System.err.println("CompilerBridge: analyze($uri) — found KtFile: ${ktFile.virtualFile?.path ?: "(ad-hoc)"}, name=${ktFile.name}")
 
         // Log content source for debugging
-        val isVirtualFile = virtualFiles.containsKey(uri) &&
-            findKtFileInSession(currentSession, uri)?.text != virtualFiles[uri]
+        val virtualContent = getVirtualFileContent(uri)
+        val isVirtualFile = virtualContent != null &&
+            findKtFileInSession(currentSession, uri)?.text != virtualContent
         System.err.println("CompilerBridge: analyze($uri) — using ${if (isVirtualFile) "virtual" else "session"} content (${ktFile.text.length} chars)")
 
         // For virtual files (content differs from session), collect names declared in the file.
@@ -548,7 +549,7 @@ class CompilerBridge {
             val fileUri = "file://$filePath"
 
             // Use virtual content if the file is open in the editor
-            val effectiveKtFile = if (virtualFiles.containsKey(fileUri)) {
+            val effectiveKtFile = if (hasVirtualFile(fileUri)) {
                 findKtFile(currentSession, fileUri) ?: ktFile
             } else {
                 ktFile
@@ -4644,8 +4645,8 @@ class CompilerBridge {
                 .forEach { file ->
                     val relativePath = file.relativeTo(rootFile).path
                     val uri = "file://${file.absolutePath}"
-                    val hasVirtualOverride = virtualFiles.containsKey(uri)
-                    val content = virtualFiles[uri] ?: file.readText()
+                    val hasVirtualOverride = hasVirtualFile(uri)
+                    val content = getVirtualFileContent(uri) ?: file.readText()
                     val target = shadowDir.resolve(relativePath)
                     target.parent.toFile().mkdirs()
                     Files.writeString(target, content)
@@ -4831,7 +4832,8 @@ class CompilerBridge {
 
         System.err.println("CompilerBridge: findKtFile($uri) — resolved path=$filePath, session has ${allSessionFiles.size} file(s)")
 
-        val virtualContent = virtualFiles[uri]
+        val virtualEntry = getVirtualFileEntry(uri)
+        val virtualContent = virtualEntry?.second
 
         // Helper: match a session file to the requested path (including shadow tree paths)
         fun matchesPath(ktFile: KtFile): Boolean {
@@ -4849,7 +4851,7 @@ class CompilerBridge {
             }
         } else {
             // Check if session file has matching content — by original path, temp dir path, or shadow path
-            val tempDiskPath = virtualFileDiskPaths[uri]
+            val tempDiskPath = virtualFileDiskPaths[uri] ?: virtualEntry?.let { virtualFileDiskPaths[it.first] }
             val sessionFile = allSessionFiles
                 .find {
                     matchesPath(it) ||
@@ -4864,7 +4866,8 @@ class CompilerBridge {
             // KtFile through PsiManager. This gives a proper VFS-backed file that the
             // custom KotlinProjectStructureProvider maps to the source module, enabling
             // full FIR resolution including class-body members.
-            val cached = lightFileCache[uri]
+            val cacheKey = virtualEntry?.first ?: uri
+            val cached = lightFileCache[cacheKey]
             if (cached != null && cached.first == virtualContent) {
                 System.err.println("CompilerBridge: findKtFile($uri) — using cached LightVirtualFile (${virtualContent.length} chars)")
                 return cached.second
@@ -4876,7 +4879,7 @@ class CompilerBridge {
                 val lightVf = com.intellij.testFramework.LightVirtualFile(fileName, virtualContent)
                 val psiFile = com.intellij.psi.PsiManager.getInstance(session.project).findFile(lightVf)
                 if (psiFile is KtFile) {
-                    lightFileCache[uri] = virtualContent to psiFile
+                    lightFileCache[cacheKey] = virtualContent to psiFile
                     return psiFile
                 }
                 System.err.println("CompilerBridge: LightVirtualFile did not produce KtFile: ${psiFile?.javaClass?.name}")
@@ -4960,6 +4963,16 @@ class CompilerBridge {
         }
     }
 
+    private fun getVirtualFileEntry(uri: String): Pair<String, String>? {
+        virtualFiles[uri]?.let { return uri to it }
+        val path = uriToPath(uri)
+        return virtualFiles.entries.firstOrNull { uriToPath(it.key) == path }?.let { it.key to it.value }
+    }
+
+    private fun getVirtualFileContent(uri: String): String? = getVirtualFileEntry(uri)?.second
+
+    private fun hasVirtualFile(uri: String): Boolean = getVirtualFileContent(uri) != null
+
     private fun lineColToOffset(ktFile: KtFile, line: Int, character: Int): Int? {
         val document = ktFile.viewProvider.document
         if (document != null) {
@@ -4974,7 +4987,7 @@ class CompilerBridge {
                 return lineStartOffset
             }
 
-            val lineLength = lineEndOffset - lineStartOffset
+            val lineLength = (lineEndOffset - lineStartOffset).coerceAtLeast(0)
             val safeCharacter = character.coerceAtMost(lineLength)
             if (safeCharacter != character) {
                 System.err.println("CompilerBridge: lineColToOffset — character $character clamped to line length $lineLength (line=$line)")
@@ -5006,7 +5019,7 @@ class CompilerBridge {
             return offset
         }
 
-        val lineLength = lineEndOffset - offset
+        val lineLength = (lineEndOffset - offset).coerceAtLeast(0)
         val safeCharacter = character.coerceAtMost(lineLength)
         if (safeCharacter != character) {
             System.err.println("CompilerBridge: lineColToOffset — fallback character $character clamped to line length $lineLength (line=$line)")
@@ -5036,7 +5049,6 @@ class CompilerBridge {
         }
         return null
     }
-
     private fun findKotlinStdlibJars(): List<Path> {
         // 1. Check java.class.path (works when running as individual JARs)
         val classpath = System.getProperty("java.class.path") ?: ""
