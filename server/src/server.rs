@@ -15,6 +15,7 @@ use tower_lsp::{Client, LanguageServer};
 use crate::bridge::{Bridge, SidecarState};
 use crate::config::{Config, FormattingTool};
 use crate::project;
+use crate::runtime;
 use crate::state::DocumentStore;
 
 /// The main language server implementation.
@@ -635,18 +636,22 @@ impl LanguageServer for KotlinLanguageServer {
 
             tracing::debug!("java found at {:?}", java_path);
 
-            // Find sidecar JAR - look relative to the server binary
-            let sidecar_jar = find_sidecar_jar();
-            let sidecar_jar = match sidecar_jar {
-                Some(p) => p,
+            let requested_kotlin_version = project_model
+                .as_ref()
+                .and_then(|model| model.kotlin_version.clone());
+
+            let sidecar_runtime =
+                runtime::resolve_sidecar_runtime(requested_kotlin_version.as_deref());
+            let sidecar_runtime = match sidecar_runtime {
+                Some(runtime) => runtime,
                 None => {
-                    tracing::warn!("sidecar JAR not found, semantic features unavailable");
+                    tracing::warn!("sidecar runtime not found, semantic features unavailable");
                     client
                         .send_notification::<lsp_types::notification::Progress>(ProgressParams {
                             token: token.clone(),
                             value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
                                 WorkDoneProgressEnd {
-                                    message: Some("sidecar.jar not found".to_string()),
+                                    message: Some("sidecar runtime not found".to_string()),
                                 },
                             )),
                         })
@@ -654,16 +659,22 @@ impl LanguageServer for KotlinLanguageServer {
                     client
                         .show_message(
                             MessageType::WARNING,
-                            "kotlin-analyzer: sidecar.jar not found. Semantic features are unavailable.",
+                            "kotlin-analyzer: sidecar runtime not found. Semantic features are unavailable.",
                         )
                         .await;
                     return;
                 }
             };
 
-            tracing::debug!("sidecar JAR found at {:?}", sidecar_jar);
-            tracing::debug!("creating Bridge with sidecar JAR and java path");
-            let bridge = Arc::new(Bridge::new(sidecar_jar, java_path, config));
+            tracing::info!(
+                requested = requested_kotlin_version.as_deref().unwrap_or("unknown"),
+                selected = sidecar_runtime.kotlin_version.as_deref().unwrap_or("unknown"),
+                reason = sidecar_runtime.selection_reason.description(),
+                classpath = ?sidecar_runtime.classpath,
+                main_class = sidecar_runtime.main_class.as_deref().unwrap_or("<jar>"),
+                "selected sidecar runtime"
+            );
+            let bridge = Arc::new(Bridge::new(sidecar_runtime, java_path, config));
 
             // Store the bridge BEFORE starting so LSP requests that arrive
             // during sidecar startup can reach it and wait for Ready state
@@ -2584,31 +2595,4 @@ impl KotlinLanguageServer {
             _ => SymbolKind::VARIABLE,
         }
     }
-}
-
-/// Finds the sidecar JAR relative to the server binary.
-fn find_sidecar_jar() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    // Resolve symlinks so the dev path works when the binary is symlinked
-    // (e.g. ~/.local/bin/kotlin-analyzer -> server/target/debug/kotlin-analyzer)
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    let exe_dir = exe.parent()?;
-
-    // Check next to the binary
-    let jar = exe_dir.join("sidecar.jar");
-    if jar.exists() {
-        return Some(jar);
-    }
-
-    // Check in the sidecar build output (development)
-    let dev_jar = exe_dir
-        .parent()?
-        .parent()?
-        .parent()?
-        .join("sidecar/build/libs/sidecar-all.jar");
-    if dev_jar.exists() {
-        return Some(dev_jar);
-    }
-
-    None
 }

@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod jsonrpc;
 mod project;
+mod runtime;
 mod server;
 mod state;
 

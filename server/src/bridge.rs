@@ -12,6 +12,7 @@ use tokio::time;
 use crate::config::Config;
 use crate::error::{BridgeError, Error};
 use crate::jsonrpc::{self, Request, Response};
+use crate::runtime::SidecarRuntime;
 
 /// Sidecar lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,7 +49,7 @@ pub struct Bridge {
     request_id: AtomicU64,
     pending: Arc<Mutex<Vec<PendingRequest>>>,
     request_tx: Mutex<mpsc::Sender<Request>>,
-    sidecar_jar: PathBuf,
+    runtime: SidecarRuntime,
     java_path: PathBuf,
     config: Arc<Mutex<Config>>,
     shutdown_notify: Arc<Notify>,
@@ -62,10 +63,10 @@ pub struct Bridge {
 
 impl Bridge {
     /// Creates a new bridge but does not start the sidecar yet.
-    pub fn new(sidecar_jar: PathBuf, java_path: PathBuf, config: Config) -> Self {
+    pub fn new(runtime: SidecarRuntime, java_path: PathBuf, config: Config) -> Self {
         tracing::debug!(
-            "Bridge::new called with sidecar_jar: {:?}, java_path: {:?}",
-            sidecar_jar,
+            "Bridge::new called with runtime: {:?}, java_path: {:?}",
+            runtime,
             java_path
         );
         let (request_tx, _request_rx) = mpsc::channel(32);
@@ -78,7 +79,7 @@ impl Bridge {
             request_id: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(Vec::new())),
             request_tx: Mutex::new(request_tx),
-            sidecar_jar,
+            runtime,
             java_path,
             config: Arc::new(Mutex::new(config)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -247,17 +248,33 @@ impl Bridge {
 
         let config = self.config.lock().await.clone();
         let max_memory = &config.sidecar_max_memory;
+        let runtime = self.runtime.clone();
 
-        let mut child = Command::new(&self.java_path)
+        let mut command = Command::new(&self.java_path);
+        command
             .arg(format!("-Xmx{max_memory}"))
             .arg("--add-opens")
             .arg("java.base/java.lang=ALL-UNNAMED")
             .arg("--add-opens")
             .arg("java.base/java.lang.reflect=ALL-UNNAMED")
             .arg("--add-opens")
-            .arg("java.base/java.util=ALL-UNNAMED")
-            .arg("-jar")
-            .arg(&self.sidecar_jar)
+            .arg("java.base/java.util=ALL-UNNAMED");
+
+        match runtime.main_class.as_deref() {
+            Some(main_class) => {
+                let classpath = std::env::join_paths(&runtime.classpath)
+                    .map_err(|e| BridgeError::SpawnFailed(e.to_string()))?;
+                command.arg("-cp").arg(classpath).arg(main_class);
+            }
+            None => {
+                let sidecar_jar = runtime.classpath.first().ok_or_else(|| {
+                    BridgeError::SpawnFailed("sidecar runtime classpath is empty".into())
+                })?;
+                command.arg("-jar").arg(sidecar_jar);
+            }
+        }
+
+        let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -394,7 +411,35 @@ impl Bridge {
 
         // Wait for initialize response with timeout
         match time::timeout(Duration::from_secs(30), response_rx).await {
-            Ok(Ok(Ok(_result))) => {
+            Ok(Ok(Ok(result))) => {
+                if let Some(actual_version) = result.get("kotlinVersion").and_then(|v| v.as_str()) {
+                    match runtime.kotlin_version.as_deref() {
+                        Some(selected_version) if selected_version != actual_version => {
+                            tracing::warn!(
+                                "sidecar reported Kotlin runtime {} after selecting {} ({})",
+                                actual_version,
+                                selected_version,
+                                runtime.selection_reason.description()
+                            );
+                        }
+                        Some(selected_version) => {
+                            tracing::info!(
+                                "sidecar ready with Kotlin runtime {} ({})",
+                                selected_version,
+                                runtime.selection_reason.description()
+                            );
+                        }
+                        None => {
+                            tracing::info!(
+                                "sidecar ready with Kotlin runtime {} ({})",
+                                actual_version,
+                                runtime.selection_reason.description()
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!("sidecar initialize response did not include kotlinVersion");
+                }
                 tracing::debug!("sidecar initialized successfully");
                 Self::set_state(&self.state, &self.state_watch_tx, SidecarState::Ready).await;
                 tracing::info!("sidecar ready");
@@ -747,7 +792,13 @@ mod tests {
     #[test]
     fn initial_state_is_stopped() {
         let bridge = Bridge::new(
-            PathBuf::from("sidecar.jar"),
+            SidecarRuntime {
+                requested_kotlin_version: None,
+                kotlin_version: Some("2.2.21".into()),
+                classpath: vec![PathBuf::from("sidecar.jar")],
+                main_class: None,
+                selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
+            },
             PathBuf::from("/usr/bin/java"),
             Config::default(),
         );
@@ -759,7 +810,13 @@ mod tests {
     #[test]
     fn next_id_increments() {
         let bridge = Bridge::new(
-            PathBuf::from("sidecar.jar"),
+            SidecarRuntime {
+                requested_kotlin_version: None,
+                kotlin_version: Some("2.2.21".into()),
+                classpath: vec![PathBuf::from("sidecar.jar")],
+                main_class: None,
+                selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
+            },
             PathBuf::from("/usr/bin/java"),
             Config::default(),
         );
@@ -771,7 +828,13 @@ mod tests {
     #[tokio::test]
     async fn request_before_start_returns_not_ready() {
         let bridge = Bridge::new(
-            PathBuf::from("sidecar.jar"),
+            SidecarRuntime {
+                requested_kotlin_version: None,
+                kotlin_version: Some("2.2.21".into()),
+                classpath: vec![PathBuf::from("sidecar.jar")],
+                main_class: None,
+                selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
+            },
             PathBuf::from("/usr/bin/java"),
             Config::default(),
         );
@@ -789,7 +852,13 @@ mod tests {
     #[tokio::test]
     async fn wait_for_ready_returns_immediately_when_ready() {
         let bridge = Bridge::new(
-            PathBuf::from("sidecar.jar"),
+            SidecarRuntime {
+                requested_kotlin_version: None,
+                kotlin_version: Some("2.2.21".into()),
+                classpath: vec![PathBuf::from("sidecar.jar")],
+                main_class: None,
+                selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
+            },
             PathBuf::from("/usr/bin/java"),
             Config::default(),
         );
@@ -803,7 +872,13 @@ mod tests {
     #[tokio::test]
     async fn wait_for_ready_blocks_during_starting() {
         let bridge = Bridge::new(
-            PathBuf::from("sidecar.jar"),
+            SidecarRuntime {
+                requested_kotlin_version: None,
+                kotlin_version: Some("2.2.21".into()),
+                classpath: vec![PathBuf::from("sidecar.jar")],
+                main_class: None,
+                selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
+            },
             PathBuf::from("/usr/bin/java"),
             Config::default(),
         );
@@ -831,7 +906,13 @@ mod tests {
     #[tokio::test]
     async fn wait_for_ready_waits_then_times_out_on_degraded() {
         let bridge = Bridge::new(
-            PathBuf::from("sidecar.jar"),
+            SidecarRuntime {
+                requested_kotlin_version: None,
+                kotlin_version: Some("2.2.21".into()),
+                classpath: vec![PathBuf::from("sidecar.jar")],
+                main_class: None,
+                selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
+            },
             PathBuf::from("/usr/bin/java"),
             Config::default(),
         );
@@ -869,5 +950,23 @@ mod tests {
 
         let result = rx.await.unwrap();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn bridge_stores_selected_runtime_for_restarts() {
+        let runtime = SidecarRuntime {
+            requested_kotlin_version: Some("2.2.20".into()),
+            kotlin_version: Some("2.2.21".into()),
+            classpath: vec![PathBuf::from("runtime.jar")],
+            main_class: Some("dev.kouros.sidecar.MainKt".into()),
+            selection_reason: crate::runtime::RuntimeSelectionReason::SameMinorFallback,
+        };
+        let bridge = Bridge::new(
+            runtime.clone(),
+            PathBuf::from("/usr/bin/java"),
+            Config::default(),
+        );
+
+        assert_eq!(bridge.runtime, runtime);
     }
 }
