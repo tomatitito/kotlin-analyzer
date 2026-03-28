@@ -1,0 +1,10 @@
+{% import "shared/common" %}
+<html>
+<head>
+    <title>{{ title }}</title>
+</head>
+<body>
+{% block content %}{% endblock %}
+    <footer>{{ footer }}</footer>
+</body>
+</html>

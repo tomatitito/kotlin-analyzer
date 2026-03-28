@@ -38,6 +38,29 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 
+private data class TemplateSymbolReference(
+    val templateUri: String,
+    val line: Int,
+    val column: Int,
+    val startOffset: Int,
+    val endOffset: Int,
+)
+
+private data class TemplateSymbolProducer(
+    val declarationUri: String,
+    val declarationOffset: Int,
+    val declarationLine: Int,
+    val declarationColumn: Int,
+    val declarationName: String,
+    val templateUris: Set<String>,
+)
+
+private data class TemplateLinkReference(
+    val targetTemplateUri: String,
+    val startOffset: Int,
+    val endOffset: Int,
+)
+
 /**
  * Abstraction over the Kotlin Analysis API.
  * Encapsulates all direct Analysis API calls so that upstream API changes
@@ -70,6 +93,19 @@ class CompilerBridge {
     private var initCompilerFlags = emptyList<String>()
     private var initJdkHome = ""
     private var initSourceRoots = emptyList<String>()
+    private val templateFileExtensions = setOf("peb", "html", "htm")
+    private val templateLanguageKeywords = setOf(
+        "and", "as", "assert", "break", "by", "continue", "do", "else", "false",
+        "for", "if", "in", "is", "not", "or", "true", "while", "with", "endfor",
+        "endif", "endset", "else", "macro", "set", "import", "include", "extends",
+        "for", "endmacro",
+    )
+    private var templateIndexReady = false
+    private var templateIndexRoot = ""
+    private val templateFilesByKey = mutableMapOf<String, MutableSet<String>>()
+    private val templateVariableReferencesByName = mutableMapOf<String, MutableList<TemplateSymbolReference>>() // variable -> template references
+    private val templateVariableProducersByName = mutableMapOf<String, MutableList<TemplateSymbolProducer>>() // variable -> kotlin producers
+    private val templateLinksByFile = mutableMapOf<String, MutableList<TemplateLinkReference>>() // template file -> link refs (include/extends/import)
 
     /**
      * Initializes the Analysis API session with the given project configuration.
@@ -246,7 +282,7 @@ class CompilerBridge {
                         if (stdlibModule != null) addRegularDependency(stdlibModule)
                         if (classpathModule != null) addRegularDependency(classpathModule)
                     }
-                    sourceModule = mainModule
+        sourceModule = mainModule
                     addModule(mainModule)
                 }
             }
@@ -287,6 +323,8 @@ class CompilerBridge {
         // Build the symbol index from all discovered files
         symbolIndex.rebuildFromSession(session!!)
         System.err.println("CompilerBridge: symbol index built with ${symbolIndex.size()} declarations")
+
+        rebuildTemplateIndex(initProjectRoot)
     }
 
     /**
@@ -295,6 +333,9 @@ class CompilerBridge {
     fun updateFile(uri: String, text: String) {
         virtualFiles[uri] = text
         updateFileInSession(uri, text)
+        if (isTemplateLikeUri(uri) || isKotlinUri(uri)) {
+            templateIndexReady = false
+        }
 
         // Detect on-disk file edits: the session's FIR caches are baked in at creation
         // time, so when an on-disk file's content changes, the session must be rebuilt
@@ -359,6 +400,9 @@ class CompilerBridge {
     fun removeFile(uri: String) {
         virtualFiles.remove(uri)
         symbolIndex.removeFile(uri)
+        if (isTemplateLikeUri(uri) || isKotlinUri(uri)) {
+            templateIndexReady = false
+        }
         if (uri in dirtyOnDiskFiles) {
             dirtyOnDiskFiles.remove(uri)
             sessionDirty = true
@@ -815,9 +859,28 @@ class CompilerBridge {
      */
     fun definition(uri: String, line: Int, character: Int): JsonObject {
         ensureSessionCurrent()
+        ensureTemplateIndexReady()
         val result = JsonObject()
         val locationsArray = JsonArray()
         val perfStart = System.currentTimeMillis()
+
+        if (isTemplateLikeUri(uri)) {
+            val normalizedTemplateUri = normalizeTemplateUri(uri)
+            val filePath = uriToPath(normalizedTemplateUri)
+            val templateText = getTemplateText(filePath)
+            if (templateText == null) {
+                result.add("locations", locationsArray)
+                return result
+            }
+            val cursorOffset = lineColToOffset(templateText, line, character)
+            if (cursorOffset != null) {
+                val templateLocs = definitionFromTemplate(normalizedTemplateUri, cursorOffset)
+                templateLocs.forEach { locationsArray.add(it) }
+            }
+            System.err.println("[PERF] method=definition uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
+            result.add("locations", locationsArray)
+            return result
+        }
 
         val currentSession = session ?: run {
             result.add("locations", locationsArray)
@@ -840,6 +903,27 @@ class CompilerBridge {
                     // Find the reference element
                     var current: PsiElement? = element
                     while (current != null) {
+                        if (current is KtStringTemplateExpression) {
+                            val literal = current.text.trim()
+                            val startQuote = literal.indexOfFirst { it == '"' }
+                            val endQuote = literal.lastIndexOf('"')
+                            if (startQuote >= 0 && endQuote > startQuote + 1) {
+                                val templateKey = literal.substring(startQuote + 1, endQuote)
+                                val templateUri = resolveTemplateUri(templateKey)
+                                if (templateUri != null) {
+                                    val lineNumber = current.containingFile?.viewProvider?.document?.let { doc ->
+                                        doc.getLineNumber(current.textOffset) + 1
+                                    } ?: 1
+                                    val loc = JsonObject()
+                                    loc.addProperty("uri", templateUri)
+                                    loc.addProperty("line", lineNumber)
+                                    loc.addProperty("column", 0)
+                                    locationsArray.add(loc)
+                                    break
+                                }
+                            }
+                        }
+
                         // Handle annotation entries: resolve to the annotation class
                         if (current is org.jetbrains.kotlin.psi.KtAnnotationEntry) {
                             try {
@@ -1004,6 +1088,390 @@ class CompilerBridge {
         return null
     }
 
+    private fun isTemplateLikeUri(uri: String): Boolean {
+        val lowerUri = uri.lowercase()
+        return lowerUri.endsWith(".peb") || lowerUri.endsWith(".html") || lowerUri.endsWith(".htm")
+    }
+
+    private fun isKotlinUri(uri: String): Boolean {
+        return uri.lowercase().endsWith(".kt")
+    }
+
+    private fun ensureTemplateIndexReady() {
+        if (templateIndexReady && templateIndexRoot.isNotEmpty()) return
+        if (templateIndexRoot.isNotEmpty()) {
+            rebuildTemplateIndex(templateIndexRoot)
+            return
+        }
+        if (initProjectRoot.isNotEmpty()) {
+            rebuildTemplateIndex(initProjectRoot)
+        }
+    }
+
+    private fun rebuildTemplateIndex(projectRoot: String) {
+        templateIndexReady = false
+        templateFilesByKey.clear()
+        templateVariableReferencesByName.clear()
+        templateVariableProducersByName.clear()
+        templateLinksByFile.clear()
+        templateIndexRoot = projectRoot
+
+        if (projectRoot.isEmpty()) {
+            System.err.println("CompilerBridge: template index skipped (missing project root)")
+            templateIndexReady = true
+            return
+        }
+
+        val templateRoots = listOf(
+            File(projectRoot, "src/main/resources/templates"),
+            File(projectRoot, "src/test/resources/templates"),
+        )
+        val templateFiles = templateRoots
+            .filter { it.exists() && it.isDirectory }
+            .flatMap { root ->
+                root.walk()
+                    .filter { it.isFile }
+                    .filter { templateFileExtensions.contains(it.extension.lowercase()) }
+                    .toList()
+            }
+
+        for (templateFile in templateFiles) {
+            val templateUri = toTemplateFileUri(templateFile)
+            registerTemplateFileKeys(templateUri, templateFile)
+            parseTemplateFile(templateUri, templateFile.readText())
+        }
+
+        currentSessionOrNull()?.let { session ->
+            indexTemplateProducersFromSession(session, projectRoot)
+        }
+        templateIndexReady = true
+        System.err.println("CompilerBridge: template index built with ${templateFiles.size} template file(s)")
+    }
+
+    private fun registerTemplateFileKeys(templateUri: String, templateFile: File) {
+        val keyCandidate = templateFile.name.substringBeforeLast('.')
+        addTemplateKey(templateUri, keyCandidate)
+
+        val filePath = templateFile.toPath()
+        val templateRoots = listOf(
+            File(templateIndexRoot, "src/main/resources/templates").toPath(),
+            File(templateIndexRoot, "src/test/resources/templates").toPath(),
+        )
+        val rootPrefix = templateRoots.asSequence().firstNotNullOfOrNull { rootPath ->
+            if (filePath.startsWith(rootPath)) {
+                templateFile.toPath().parent.toFile().toPath()
+                    .let { rootPath.relativize(filePath).toString() }
+            } else {
+                null
+            }
+        } ?: ""
+        if (rootPrefix.isNotEmpty()) {
+            val relativePath = rootPrefix
+            addTemplateKey(templateUri, relativePath.substringBeforeLast('.'))
+            addTemplateKey(templateUri, "/$relativePath")
+            addTemplateKey(templateUri, "/${relativePath.substringBeforeLast('.')}")
+            addTemplateKey(templateUri, relativePath.substringBeforeLast('.'))
+        }
+        addTemplateKey(templateUri, templateFile.name)
+    }
+
+    private fun addTemplateKey(templateUri: String, key: String) {
+        val normalized = normalizeTemplateKey(key)
+        if (normalized.isNotBlank()) {
+            templateFilesByKey.getOrPut(normalized) { mutableSetOf() }.add(templateUri)
+        }
+    }
+
+    private fun normalizeTemplateKey(key: String): String {
+        return key
+            .trim()
+            .replace('\\', '/')
+            .trim('/')
+            .substringBefore('?')
+            .substringBefore('#')
+    }
+
+    private fun parseTemplateFile(templateUri: String, text: String) {
+        parseTemplateVariableReferences(templateUri, text)
+        parseTemplateIncludesAndImports(templateUri, text)
+    }
+
+    private fun parseTemplateVariableReferences(templateUri: String, text: String) {
+        val mustachePattern = Regex("\\{\\{\\s*(.*?)\\s*}}")
+        for (mustache in mustachePattern.findAll(text)) {
+            val expression = mustache.groupValues[1]
+            val exprStart = mustache.range.first + 2
+            for (match in Regex("[A-Za-z_][A-Za-z0-9_]*").findAll(expression)) {
+                val name = match.value
+                if (!isTemplateVariableCandidate(name)) continue
+                val startOffset = exprStart + match.range.first
+                val endOffset = exprStart + match.range.last + 1
+                val lineInfo = lineColFromOffset(text, startOffset)
+                templateVariableReferencesByName
+                    .getOrPut(name) { mutableListOf() }
+                    .add(
+                        TemplateSymbolReference(
+                            templateUri = templateUri,
+                            line = lineInfo.first,
+                            column = lineInfo.second,
+                            startOffset = startOffset,
+                            endOffset = endOffset,
+                        )
+                    )
+            }
+        }
+    }
+
+    private fun parseTemplateIncludesAndImports(templateUri: String, text: String) {
+        val includePattern = Regex("\\{%\\s*(include|extends|import)\\s+([^%}]*)%\\}", RegexOption.IGNORE_CASE)
+        for (match in includePattern.findAll(text)) {
+            val body = match.groupValues[2]
+            val target = Regex("\"([^\"]+)\"|'([^']+)'").find(body)?.groupValues?.getOrNull(1)
+                ?: Regex("'([^']+)'|\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
+            if (target != null && target.isNotBlank()) {
+                val normalized = resolveTemplateUri(target)
+                val linkRef = TemplateLinkReference(
+                    targetTemplateUri = normalized ?: target,
+                    startOffset = match.range.first,
+                    endOffset = match.range.last + 1
+                )
+                templateLinksByFile.getOrPut(templateUri) { mutableListOf() }.add(linkRef)
+            }
+        }
+    }
+
+    private fun isTemplateVariableCandidate(name: String): Boolean {
+        if (name.isBlank()) return false
+        if (name.length > 1 && name.first().isDigit()) return false
+        if (templateLanguageKeywords.contains(name.lowercase())) return false
+        return true
+    }
+
+    private fun lineColFromOffset(text: String, offset: Int): Pair<Int, Int> {
+        if (offset <= 0) return 1 to 0
+        val safeOffset = offset.coerceIn(0, text.length)
+        var line = 1
+        var lineStart = 0
+        var i = 0
+        while (i < safeOffset) {
+            if (text[i] == '\n') {
+                line++
+                lineStart = i + 1
+            }
+            i++
+        }
+        return line to (safeOffset - lineStart)
+    }
+
+    private fun lineColToOffset(text: String, line: Int, character: Int): Int? {
+        if (line < 1) return null
+        var currentLine = 1
+        var offset = 0
+        while (offset < text.length && currentLine < line) {
+            if (text[offset] == '\n') currentLine++
+            offset++
+        }
+        if (currentLine != line) return null
+        val lineStart = offset
+        var lineEnd = lineStart
+        while (lineEnd < text.length && text[lineEnd] != '\n') {
+            lineEnd++
+        }
+        val clamped = character.coerceIn(0, lineEnd - lineStart)
+        return lineStart + clamped
+    }
+
+    private fun resolveTemplateUri(key: String): String? {
+        if (key.isBlank()) return null
+        val normalized = normalizeTemplateKey(key)
+        val fromKeys = templateFilesByKey[normalized]?.firstOrNull()
+        if (fromKeys != null) return fromKeys
+
+        val withPebble = if (normalized.endsWith(".peb")) normalized else "$normalized.peb"
+        templateFilesByKey[withPebble]?.firstOrNull()?.let { return it }
+        val withHtml = if (normalized.endsWith(".html")) normalized else "$normalized.html"
+        templateFilesByKey[withHtml]?.firstOrNull()?.let { return it }
+        val withHtm = if (normalized.endsWith(".htm")) normalized else "$normalized.htm"
+        templateFilesByKey[withHtm]?.firstOrNull()?.let { return it }
+        return null
+    }
+
+    private fun resolveTemplateUriFromPath(currentTemplateUri: String, target: String): String? {
+        val normalized = normalizeTemplateKey(target)
+        resolveTemplateUri(normalized)?.let { return it }
+
+        if (target.contains('/')) {
+            resolveTemplateUri(target)?.let { return it }
+        }
+        if (!target.startsWith("./") && target.isNotBlank()) {
+            val baseDir = File(uriToPath(currentTemplateUri)).parentFile
+            val relative = File(baseDir, target).absolutePath
+            val relativeFromRoot = normalizeTemplateKey(relative.substringAfter("templates/"))
+            resolveTemplateUri(relativeFromRoot)?.let { return it }
+        }
+        return resolveTemplateUri(target)
+    }
+
+    private fun getTemplateText(path: String): String? {
+        return try {
+            val uriText = getVirtualFileContent("file://$path")
+            if (uriText != null) return uriText
+            val file = File(path)
+            if (file.exists()) file.readText() else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun definitionFromTemplate(uri: String, cursorOffset: Int): List<JsonObject> {
+        val results = mutableListOf<JsonObject>()
+        val templateText = getTemplateText(uriToPath(uri)) ?: return results
+
+        val links = templateLinksByFile[uri] ?: emptyList()
+        for (linkRef in links) {
+            if (cursorOffset in linkRef.startOffset until linkRef.endOffset) {
+                val target = linkRef.targetTemplateUri
+                results.add(
+                    JsonObject().apply {
+                        addProperty("uri", resolveTemplateUriFromPath(uri, target) ?: target)
+                        addProperty("line", 1)
+                        addProperty("column", 0)
+                    }
+                )
+                return results
+            }
+        }
+
+        for ((name, references) in templateVariableReferencesByName) {
+            for (ref in references) {
+                if (ref.templateUri != uri) continue
+                if (cursorOffset !in ref.startOffset until ref.endOffset) continue
+                val producers = templateVariableProducersByName[name] ?: continue
+                for (producer in producers) {
+                    results.add(
+                        JsonObject().apply {
+                            addProperty("uri", producer.declarationUri)
+                            addProperty("line", producer.declarationLine)
+                            addProperty("column", producer.declarationColumn)
+                        }
+                    )
+                }
+                if (results.isNotEmpty()) return results
+            }
+        }
+        return results
+    }
+
+    private fun addPebbleTemplateReferences(declaration: KtNamedDeclaration, locationsArray: JsonArray) {
+        val declarationUri = "file://${declaration.containingFile?.virtualFile?.path}"
+        val declarationOffset = declaration.textOffset
+        for ((templateVariable, producers) in templateVariableProducersByName) {
+            for (producer in producers) {
+                if (producer.declarationUri != declarationUri || producer.declarationOffset != declarationOffset) continue
+                val references = templateVariableReferencesByName[templateVariable] ?: emptyList()
+                for (reference in references) {
+                    val isDup = (0 until locationsArray.size()).any { i ->
+                        val existing = locationsArray[i].asJsonObject
+                        existing.get("uri")?.asString == reference.templateUri &&
+                            existing.get("line")?.asInt == reference.line &&
+                            existing.get("column")?.asInt == reference.column
+                    }
+                    if (isDup) continue
+                    val loc = JsonObject()
+                    loc.addProperty("uri", reference.templateUri)
+                    loc.addProperty("line", reference.line)
+                    loc.addProperty("column", reference.column)
+                    locationsArray.add(loc)
+                }
+            }
+        }
+    }
+
+    private fun currentSessionOrNull(): StandaloneAnalysisAPISession? = session
+
+    private fun indexTemplateProducersFromSession(currentSession: StandaloneAnalysisAPISession, projectRoot: String) {
+        val allSessionFiles = currentSession.modulesWithFiles.entries
+            .flatMap { (_, files) -> files }
+            .filterIsInstance<KtFile>()
+
+        for (ktFile in allSessionFiles) {
+            if (!ktFile.virtualFile.path.startsWith(projectRoot)) continue
+            val fileUri = "file://${ktFile.virtualFile.path}"
+            val fileFunctions = PsiTreeUtil.collectElementsOfType(ktFile, KtNamedFunction::class.java)
+            for (function in fileFunctions) {
+                indexTemplateProducerFromFunction(function, fileUri)
+            }
+        }
+    }
+
+    private fun indexTemplateProducerFromFunction(function: KtNamedFunction, declarationFileUri: String) {
+        val functionText = function.text
+        val templateNames = collectTemplateNamesFromFunction(functionText)
+        if (templateNames.isEmpty()) return
+
+        val templateUris = templateNames.mapNotNull { resolveTemplateUri(it) }.toSet()
+        if (templateUris.isEmpty()) return
+
+        val producerTargets = resolveTemplateProducerTargets(function)
+        if (producerTargets.isEmpty()) return
+
+        for (producer in producerTargets) {
+            val variableName = producer.first
+            val declaration = producer.second
+            val declarationOffset = declaration.textOffset
+            val document = declaration.containingFile?.viewProvider?.document
+            val line = document?.let { it.getLineNumber(declarationOffset) + 1 } ?: 1
+            val lineStart = document?.let { it.getLineStartOffset(it.getLineNumber(declarationOffset)) } ?: 0
+            val declarationColumn = declarationOffset - lineStart
+            val declarationName = declaration.name ?: variableName
+            templateVariableProducersByName
+                .getOrPut(variableName) { mutableListOf() }
+                .add(
+                    TemplateSymbolProducer(
+                        declarationUri = "file://${declaration.containingFile?.virtualFile?.path}",
+                        declarationOffset = declarationOffset,
+                        declarationLine = line,
+                        declarationColumn = declarationColumn,
+                        declarationName = declarationName,
+                        templateUris = templateUris,
+                    )
+                )
+        }
+    }
+
+    private fun collectTemplateNamesFromFunction(functionText: String): Set<String> {
+        val names = mutableSetOf<String>()
+        val returnPattern = Regex("return\\s+\"([^\"]+)\"")
+        for (match in returnPattern.findAll(functionText)) {
+            val name = match.groupValues[1]
+            if (name.isNotBlank()) names.add(name)
+        }
+        val modelAndViewPattern = Regex("ModelAndView\\(\\s*\"([^\"]+)\"")
+        for (match in modelAndViewPattern.findAll(functionText)) {
+            val name = match.groupValues[1]
+            if (name.isNotBlank()) names.add(name)
+        }
+        return names
+    }
+
+    private fun resolveTemplateProducerTargets(function: KtNamedFunction): List<Pair<String, KtNamedDeclaration>> {
+        val targets = mutableListOf<Pair<String, KtNamedDeclaration>>()
+        val parameterByName = function.valueParameters.associateBy({ it.name }, { it })
+        val locals = PsiTreeUtil.collectElementsOfType(function, KtProperty::class.java)
+
+        val addAttributePattern = Regex("addAttribute\\s*\\(\\s*\"([^\"]+)\"\\s*,([^\\)]*)\\)")
+        for (match in addAttributePattern.findAll(function.text)) {
+            val templateVariable = match.groupValues[1]
+            val rhs = match.groupValues[2].trim()
+            val rhsName = rhs.substringBefore('.').substringBefore(')').trim()
+            val declaration = parameterByName[rhsName]
+                ?: locals.firstOrNull { it.name == rhsName }
+                ?: function
+            targets.add(templateVariable to declaration)
+        }
+        return targets
+    }
+
     /**
      * Builds a definition location from a resolved PsiElement (PSI-based fallback).
      */
@@ -1066,6 +1534,7 @@ class CompilerBridge {
      * to the target declaration by walking the PSI tree of the containing file.
      */
     fun references(uri: String, line: Int, character: Int): JsonObject {
+        ensureTemplateIndexReady()
         val result = JsonObject()
         val locationsArray = JsonArray()
         val perfStart = System.currentTimeMillis()
@@ -1108,6 +1577,9 @@ class CompilerBridge {
                     declLoc.addProperty("line", declLine)
                     declLoc.addProperty("column", declCol)
                     locationsArray.add(declLoc)
+                }
+                if (targetDeclaration is KtNamedDeclaration) {
+                    addPebbleTemplateReferences(targetDeclaration, locationsArray)
                 }
             }
 
@@ -3140,6 +3612,12 @@ class CompilerBridge {
     fun shutdown() {
         session = null
         Disposer.dispose(disposable)
+        templateIndexReady = false
+        templateIndexRoot = ""
+        templateFilesByKey.clear()
+        templateVariableReferencesByName.clear()
+        templateVariableProducersByName.clear()
+        templateLinksByFile.clear()
         // Clean up virtual file temp directory
         virtualFileTempDir?.let { dir ->
             try {
@@ -4960,6 +5438,21 @@ class CompilerBridge {
             uri.removePrefix("file://")
         } else {
             uri
+        }
+    }
+
+    private fun toTemplateFileUri(file: File): String = "file://${normalizeFilePath(file.absolutePath)}"
+
+    private fun normalizeTemplateUri(uri: String): String {
+        val path = uriToPath(uri)
+        return "file://${normalizeFilePath(path)}"
+    }
+
+    private fun normalizeFilePath(path: String): String {
+        return try {
+            File(path).canonicalFile.absolutePath
+        } catch (_: Exception) {
+            path
         }
     }
 

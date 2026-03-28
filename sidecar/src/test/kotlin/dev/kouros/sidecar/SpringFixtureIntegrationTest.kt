@@ -90,10 +90,10 @@ class SpringFixtureIntegrationTest {
 
     @Test
     fun `hover - RestController annotation resolves`() {
-        // Example.kt line 14: "@RestController"
+        // Example.kt line 15: "@RestController"
         //                       ^1 (0-based)
         val uri = "file://$sourceRoot/Example.kt"
-        val result = bridge.hover(uri, line = 14, character = 1)
+        val result = bridge.hover(uri, line = 15, character = 1)
 
         val contents = result.get("contents")?.asString
         assertNotNull(contents, "hover on @RestController should return contents")
@@ -105,10 +105,10 @@ class SpringFixtureIntegrationTest {
 
     @Test
     fun `hover - GetMapping annotation resolves`() {
-        // Example.kt line 17: "    @GetMapping("/greet/{name}")"
+        // Example.kt line 18: "    @GetMapping("/greeting/{name}")"
         //                           ^5 (0-based)
         val uri = "file://$sourceRoot/Example.kt"
-        val result = bridge.hover(uri, line = 17, character = 5)
+        val result = bridge.hover(uri, line = 18, character = 5)
 
         val contents = result.get("contents")?.asString
         assertNotNull(contents, "hover on @GetMapping should return contents")
@@ -120,10 +120,10 @@ class SpringFixtureIntegrationTest {
 
     @Test
     fun `hover - PathVariable annotation resolves`() {
-        // Example.kt line 18: "    fun greet(@PathVariable name: String, ..."
+        // Example.kt line 20: "        @PathVariable name: String,"
         //                                     ^18 (0-based)
         val uri = "file://$sourceRoot/Example.kt"
-        val result = bridge.hover(uri, line = 18, character = 18)
+        val result = bridge.hover(uri, line = 20, character = 18)
 
         val contents = result.get("contents")?.asString
         assertNotNull(contents, "hover on @PathVariable should return contents")
@@ -135,10 +135,10 @@ class SpringFixtureIntegrationTest {
 
     @Test
     fun `hover - ResponseStatusException resolves`() {
-        // Example.kt line 29: "        throw ResponseStatusException(..."
+        // Example.kt line 42: "        throw ResponseStatusException(..."
         //                                    ^14 (0-based)
         val uri = "file://$sourceRoot/Example.kt"
-        val result = bridge.hover(uri, line = 29, character = 14)
+        val result = bridge.hover(uri, line = 42, character = 14)
 
         val contents = result.get("contents")?.asString
         assertNotNull(contents, "hover on ResponseStatusException should return contents")
@@ -150,10 +150,10 @@ class SpringFixtureIntegrationTest {
 
     @Test
     fun `hover - HttpStatus enum resolves`() {
-        // Example.kt line 29: "        throw ResponseStatusException(HttpStatus.NOT_FOUND, ...)"
+        // Example.kt line 42: "        throw ResponseStatusException(HttpStatus.NOT_FOUND, ...)"
         //                                                             ^43 (0-based)
         val uri = "file://$sourceRoot/Example.kt"
-        val result = bridge.hover(uri, line = 29, character = 43)
+        val result = bridge.hover(uri, line = 42, character = 43)
 
         val contents = result.get("contents")?.asString
         assertNotNull(contents, "hover on HttpStatus should return contents")
@@ -167,15 +167,108 @@ class SpringFixtureIntegrationTest {
 
     @Test
     fun `definition - RestController annotation resolves to Spring source`() {
-        // Example.kt line 14: "@RestController"
+        // Example.kt line 15: "@RestController"
         val uri = "file://$sourceRoot/Example.kt"
-        val result = bridge.definition(uri, line = 14, character = 1)
+        val result = bridge.definition(uri, line = 15, character = 1)
 
         val locations = result.getAsJsonArray("locations")
         assertNotNull(locations, "locations array should be present")
         assertTrue(
             locations.size() > 0,
             "should find definition for @RestController"
+        )
+    }
+
+    @Test
+    fun `definition - controller return resolves template`() {
+        // Example.kt line 27: `return "greeting"`
+        val uri = "file://$sourceRoot/Example.kt"
+        val result = bridge.definition(uri, line = 27, character = 15)
+
+        val locations = result.getAsJsonArray("locations")
+        assertNotNull(locations, "locations array should be present")
+        assertTrue(
+            locations.size() > 0,
+            "should find template definition for greeting return value"
+        )
+        val uriValue = locations[0].asJsonObject.get("uri")?.asString ?: ""
+        assertTrue(
+            uriValue.contains("greeting.peb"),
+            "greeting return should define to greeting.peb, got: $uriValue"
+        )
+    }
+
+    @Test
+    fun `definition - template include resolves to partial`() {
+        val uri = "file://$sourceRoot/../resources/templates/greeting.peb"
+        val result = bridge.definition(uri, line = 2, character = 13)
+
+        val locations = result.getAsJsonArray("locations")
+        assertNotNull(locations, "locations array should be present")
+        assertTrue(
+            locations.size() > 0,
+            "include in greeting.peb should define to a template file"
+        )
+        val uriValue = locations[0].asJsonObject.get("uri")?.asString ?: ""
+        assertTrue(
+            uriValue.contains("partials/_header.peb"),
+            "include should resolve to partial template, got: $uriValue"
+        )
+    }
+
+    @Test
+    fun `definition - template extends resolves to base`() {
+        val uri = "file://$sourceRoot/../resources/templates/greeting.peb"
+        val result = bridge.definition(uri, line = 1, character = 12)
+
+        val locations = result.getAsJsonArray("locations")
+        assertNotNull(locations, "locations array should be present")
+        assertTrue(
+            locations.size() > 0,
+            "extends in greeting.peb should define to a template file"
+        )
+        val uriValue = locations[0].asJsonObject.get("uri")?.asString ?: ""
+        assertTrue(
+            uriValue.contains("base.peb"),
+            "extends should resolve to base.peb, got: $uriValue"
+        )
+    }
+
+    @Test
+    fun `definition - template variable resolves to kotlin producer`() {
+        val uri = "file://$sourceRoot/../resources/templates/greeting.peb"
+        val result = bridge.definition(uri, line = 4, character = 13)
+
+        val locations = result.getAsJsonArray("locations")
+        assertNotNull(locations, "locations array should be present")
+        assertTrue(
+            locations.size() > 0,
+            "template variable should resolve to Kotlin declaration"
+        )
+        val uriValue = locations[0].asJsonObject.get("uri")?.asString ?: ""
+        assertTrue(
+            uriValue.endsWith("Example.kt"),
+            "template variable should resolve into Example.kt, got: $uriValue"
+        )
+    }
+
+    @Test
+    fun `references - kotlin references include pebble hits`() {
+        val uri = "file://$sourceRoot/Example.kt"
+        // Example.kt line 24: `val resolvedTitle = title ?: "Guest"`
+        val result = bridge.references(uri, line = 24, character = 17)
+
+        val locations = result.getAsJsonArray("locations")
+        assertNotNull(locations, "locations array should be present")
+        assertTrue(
+            locations.size() >= 1,
+            "should find at least one reference for resolvedTitle"
+        )
+
+        val uris = locations.map { it.asJsonObject.get("uri")?.asString ?: "" }.toSet()
+        assertTrue(
+            uris.any { it.contains("greeting.peb") },
+            "references should include template usage in greeting.peb, got: $uris"
         )
     }
 

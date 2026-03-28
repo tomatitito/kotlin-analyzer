@@ -201,10 +201,10 @@ class SpringWebResolutionTest {
             sourceRoots = listOf(fixtureSourceDir),
         )
 
-        // Example.kt line 14: "@RestController"
+        // Example.kt line 15: "@RestController"
         //                       ^1 (0-based, on "R" of RestController)
         val uri = "file://$fixtureSourceDir/Example.kt"
-        val result = bridge.hover(uri, line = 14, character = 1)
+        val result = bridge.hover(uri, line = 15, character = 1)
 
         val contents = result.get("contents")?.asString
         assertNotNull(contents, "hover should return contents for @RestController annotation")
@@ -241,10 +241,10 @@ class SpringWebResolutionTest {
             sourceRoots = listOf(fixtureSourceDir),
         )
 
-        // Example.kt line 17: "    @GetMapping("/greet/{name}")"
+        // Example.kt line 18: "    @GetMapping("/greeting/{name}")"
         //                           ^5 (0-based, on "G")
         val uri = "file://$fixtureSourceDir/Example.kt"
-        val result = bridge.hover(uri, line = 17, character = 5)
+        val result = bridge.hover(uri, line = 18, character = 5)
 
         val contents = result.get("contents")?.asString
         assertNotNull(contents, "hover should return contents for @GetMapping annotation")
@@ -275,10 +275,10 @@ class SpringWebResolutionTest {
             sourceRoots = listOf(fixtureSourceDir),
         )
 
-        // Example.kt line 29: "        throw ResponseStatusException(...)"
+        // Example.kt line 42: "        throw ResponseStatusException(...)"
         //                                ^14 (0-based, on "R")
         val uri = "file://$fixtureSourceDir/Example.kt"
-        val result = bridge.hover(uri, line = 29, character = 14)
+        val result = bridge.hover(uri, line = 42, character = 14)
 
         val contents = result.get("contents")?.asString
         assertNotNull(contents, "hover should return contents for ResponseStatusException")
@@ -306,10 +306,10 @@ class SpringWebResolutionTest {
             sourceRoots = listOf(fixtureSourceDir),
         )
 
-        // Example.kt line 29: "        throw ResponseStatusException(HttpStatus.NOT_FOUND, ...)"
+        // Example.kt line 42: "        throw ResponseStatusException(HttpStatus.NOT_FOUND, ...)"
         //                                                         ^39 (0-based, on "H")
         val uri = "file://$fixtureSourceDir/Example.kt"
-        val result = bridge.hover(uri, line = 29, character = 39)
+        val result = bridge.hover(uri, line = 42, character = 39)
 
         val contents = result.get("contents")?.asString
         assertNotNull(contents, "hover should return contents for HttpStatus")
@@ -335,10 +335,10 @@ class SpringWebResolutionTest {
             sourceRoots = listOf(fixtureSourceDir),
         )
 
-        // Example.kt line 14: "@RestController"
+        // Example.kt line 15: "@RestController"
         //                       ^1 (0-based, on "R" of RestController)
         val uri = "file://$fixtureSourceDir/Example.kt"
-        val result = bridge.definition(uri, line = 14, character = 1)
+        val result = bridge.definition(uri, line = 15, character = 1)
 
         val locations = result.getAsJsonArray("locations")
         assertNotNull(locations, "locations array should be present")
@@ -374,10 +374,10 @@ class SpringWebResolutionTest {
             sourceRoots = listOf(fixtureSourceDir),
         )
 
-        // Example.kt line 29: "        throw ResponseStatusException(...)"
+        // Example.kt line 42: "        throw ResponseStatusException(...)"
         //                                ^14 (0-based, on "R")
         val uri = "file://$fixtureSourceDir/Example.kt"
-        val result = bridge.definition(uri, line = 29, character = 14)
+        val result = bridge.definition(uri, line = 42, character = 14)
 
         val locations = result.getAsJsonArray("locations")
         assertNotNull(locations, "locations array should be present")
@@ -415,10 +415,10 @@ class SpringWebResolutionTest {
         )
 
         // Test completion inside @GetMapping annotation arguments
-        // Example.kt line 17: "    @GetMapping("/greet/{name}")"
+        // Example.kt line 18: "    @GetMapping("/greeting/{name}")"
         //                           ^5 (on "G")
         val uri = "file://$fixtureSourceDir/Example.kt"
-        val result = bridge.completion(uri, line = 17, character = 5)
+        val result = bridge.completion(uri, line = 18, character = 5)
 
         val items = result.getAsJsonArray("items")
         assertNotNull(items, "completion items array should be present")

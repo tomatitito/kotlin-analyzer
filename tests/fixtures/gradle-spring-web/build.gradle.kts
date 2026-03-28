@@ -8,6 +8,7 @@ repositories {
 
 dependencies {
     implementation("org.springframework:spring-web:6.2.3")
+    implementation("org.springframework:spring-webmvc:6.2.3")
     implementation("io.arrow-kt:arrow-core:2.1.0")
 }
 
