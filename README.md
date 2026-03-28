@@ -11,7 +11,7 @@ A Kotlin language server for the [Zed](https://zed.dev) editor, providing semant
 - **Signature Help** - Parameter hints when typing function arguments
 - **Find References** - Locate usages of a symbol within the current file
 - **Formatting** - Code formatting via ktfmt or ktlint
-- **Syntax Highlighting** - Tree-sitter based highlighting for Kotlin 2.x syntax
+- **Syntax Highlighting** - Tree-sitter based highlighting for Kotlin 2.x syntax and Pebble templates
 - **Text Objects** - Function, class, comment, and parameter text objects
 - **Runnables** - Detect `fun main()` and `@Test` annotated functions
 
@@ -112,7 +112,7 @@ For projects without Gradle or Maven, create a `.kotlin-analyzer.json` in the pr
 
 The system consists of three components:
 
-- **Zed extension** (Rust/WASM) - Registers Kotlin language support, manages tree-sitter queries for syntax highlighting, and downloads/launches the LSP binary.
+- **Zed extension** (Rust/WASM) - Registers Kotlin and Pebble language support, manages tree-sitter queries for syntax highlighting, and downloads/launches the LSP binary.
 - **Rust LSP server** - Handles the LSP protocol, document state management, project model extraction, formatting, and sidecar process lifecycle.
 - **JVM sidecar** - Runs the Kotlin Analysis API (K2/FIR-backed) in standalone mode for semantic analysis. Communicates with the Rust server via JSON-RPC over stdin/stdout.
 
@@ -138,8 +138,6 @@ kotlin-analyzer requires JDK 17+. It searches for Java in this order:
 - Check that `build.gradle.kts` / `pom.xml` is in the workspace root
 - For non-standard projects, create a `.kotlin-analyzer.json` configuration
 - Check Zed logs for errors during project resolution
-- If the project uses a Kotlin version that is not bundled, check the startup warning and logs to see whether the server selected an exact match, a validated same-minor fallback, or a cross-minor bundled fallback
-- If you are using development builds, ensure `~/.local/bin/kotlin-analyzer` is a symlink to the source-tree binary so the server can resolve `sidecar/build/runtime/`
 
 ### Formatting not working
 

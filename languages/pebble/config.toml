@@ -1,0 +1,4 @@
+name = "Pebble"
+grammar = "pebble"
+path_suffixes = ["peb", "pebble"]
+line_comments = ["# "]

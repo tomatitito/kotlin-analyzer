@@ -116,16 +116,18 @@ zed-kotlin/
 ├── Cargo.toml           # Rust cdylib, depends on zed_extension_api
 ├── src/
 │   └── lib.rs           # Extension trait implementation
-└── languages/kotlin/
-    ├── config.toml      # Language definition
-    ├── highlights.scm
-    ├── brackets.scm
-    ├── outline.scm
-    ├── indents.scm
-    ├── injections.scm
-    ├── overrides.scm
-    ├── textobjects.scm
-    └── runnables.scm
+├── languages/kotlin/
+│   ├── config.toml      # Language definition
+│   ├── highlights.scm
+│   ├── brackets.scm
+│   ├── outline.scm
+│   ├── indents.scm
+│   ├── injections.scm
+│   ├── overrides.scm
+│   ├── textobjects.scm
+│   └── runnables.scm
+└── languages/pebble/
+    └── config.toml      # Language definition
 ```
 
 ### extension.toml
@@ -135,7 +137,7 @@ Declares the language server with a download URL pattern pointing to GitHub rele
 ```toml
 [language_servers.kotlin-analyzer]
 name = "kotlin-analyzer"
-languages = ["Kotlin"]
+languages = ["Kotlin", "Pebble"]
 ```
 
 ### src/lib.rs
