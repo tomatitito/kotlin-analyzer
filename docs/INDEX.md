@@ -27,4 +27,5 @@ The project also includes a Zed extension (Rust/WASM) that registers Kotlin lang
 | Plan | Status | Description |
 |------|--------|-------------|
 | [v1 Roadmap](../plans/active/v1-roadmap.md) | **Active** | 4-milestone plan: extension + tree-sitter, LSP + sidecar + diagnostics, core semantic features, polish + release |
+| [Pebble Support](../plans/active/pebble-support.md) | **Active** | Phased plan for Pebble language registration, Spring view/model indexing, and Kotlin↔Pebble definition/reference navigation |
 | [Original Research](../plans/completed/research.md) | Completed | Initial research and architecture exploration (superseded by docs above) |
