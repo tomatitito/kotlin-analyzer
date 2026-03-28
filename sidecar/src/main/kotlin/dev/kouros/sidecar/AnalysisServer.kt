@@ -51,12 +51,17 @@ class AnalysisServer(
             "textDocument/didOpen" -> handleDidOpen(request)
             "textDocument/didChange" -> handleDidChange(request)
             "textDocument/didClose" -> handleDidClose(request)
+            "pebble/textDocument/didOpen" -> handlePebbleDidOpen(request)
+            "pebble/textDocument/didChange" -> handlePebbleDidChange(request)
+            "pebble/textDocument/didClose" -> handlePebbleDidClose(request)
             "analyze" -> handleAnalyze(request)
             "analyzeAll" -> handleAnalyzeAll(request)
             "hover" -> handleHover(request)
             "completion" -> handleCompletion(request)
             "definition" -> handleDefinition(request)
             "references" -> handleReferences(request)
+            "pebble/definition" -> handlePebbleDefinition(request)
+            "pebble/references" -> handlePebbleReferences(request)
             "signatureHelp" -> handleSignatureHelp(request)
             "formatting" -> handleFormatting(request)
             "rename" -> handleRename(request)
@@ -133,6 +138,26 @@ class AnalysisServer(
         val uri = params.get("uri")?.asString ?: return
         bridge.removeFile(uri)
         // Notifications don't get a response
+    }
+
+    private fun handlePebbleDidOpen(request: JsonRpcRequest) {
+        val params = request.params ?: return
+        val uri = params.get("uri")?.asString ?: return
+        val text = params.get("text")?.asString ?: return
+        bridge.updatePebbleFile(uri, text)
+    }
+
+    private fun handlePebbleDidChange(request: JsonRpcRequest) {
+        val params = request.params ?: return
+        val uri = params.get("uri")?.asString ?: return
+        val text = params.get("text")?.asString ?: return
+        bridge.updatePebbleFile(uri, text)
+    }
+
+    private fun handlePebbleDidClose(request: JsonRpcRequest) {
+        val params = request.params ?: return
+        val uri = params.get("uri")?.asString ?: return
+        bridge.removePebbleFile(uri)
     }
 
     private fun handleAnalyze(request: JsonRpcRequest) {
@@ -228,6 +253,42 @@ class AnalysisServer(
 
         val result = bridge.references(uri, line, character)
         transport.sendResult(request.id, result)
+    }
+
+    private fun handlePebbleDefinition(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("locations", com.google.gson.JsonArray()) })
+            return
+        }
+        val uri = params.get("uri")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("locations", com.google.gson.JsonArray()) })
+            return
+        }
+        val line = params.get("line")?.asInt ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("locations", com.google.gson.JsonArray()) })
+            return
+        }
+        val character = params.get("character")?.asInt ?: 0
+
+        transport.sendResult(request.id, bridge.pebbleDefinition(uri, line, character))
+    }
+
+    private fun handlePebbleReferences(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("locations", com.google.gson.JsonArray()) })
+            return
+        }
+        val uri = params.get("uri")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("locations", com.google.gson.JsonArray()) })
+            return
+        }
+        val line = params.get("line")?.asInt ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("locations", com.google.gson.JsonArray()) })
+            return
+        }
+        val character = params.get("character")?.asInt ?: 0
+
+        transport.sendResult(request.id, bridge.pebbleReferences(uri, line, character))
     }
 
     private fun handleSignatureHelp(request: JsonRpcRequest) {

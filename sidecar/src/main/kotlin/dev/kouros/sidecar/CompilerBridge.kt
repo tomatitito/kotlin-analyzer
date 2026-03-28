@@ -48,6 +48,8 @@ class CompilerBridge {
     private var sourceModule: KaModule? = null
     private var disposable = Disposer.newDisposable("compiler-bridge")
     private val virtualFiles = mutableMapOf<String, String>() // uri -> content
+    private val pebbleDocuments = PebbleDocumentStore()
+    private val pebbleIndex = PebbleTemplateIndex()
     private val symbolIndex = SymbolIndex()
 
     // Temp directory for virtual files so FIR can discover them as source root files
@@ -367,6 +369,45 @@ class CompilerBridge {
             virtualFilesOnDisk.remove(uri)
             sessionDirty = true
         }
+    }
+
+    fun updatePebbleFile(uri: String, text: String) {
+        pebbleDocuments.put(uri, text)
+        pebbleIndex.update(uri, text)
+    }
+
+    fun removePebbleFile(uri: String) {
+        pebbleDocuments.remove(uri)
+        pebbleIndex.remove(uri)
+    }
+
+    fun pebbleDefinition(uri: String, line: Int, character: Int): JsonObject {
+        val result = JsonObject()
+        val locationsArray = JsonArray()
+        val targetUri = pebbleIndex.definition(uri, line, character)
+        if (targetUri != null) {
+            val location = JsonObject()
+            location.addProperty("uri", targetUri)
+            location.addProperty("line", 1)
+            location.addProperty("column", 0)
+            locationsArray.add(location)
+        }
+        result.add("locations", locationsArray)
+        return result
+    }
+
+    fun pebbleReferences(uri: String, line: Int, character: Int): JsonObject {
+        val result = JsonObject()
+        val locationsArray = JsonArray()
+        for (reference in pebbleIndex.referencesAt(uri, line, character)) {
+            val location = JsonObject()
+            location.addProperty("uri", reference.sourceUri)
+            location.addProperty("line", reference.range.startLine)
+            location.addProperty("column", reference.range.startColumn)
+            locationsArray.add(location)
+        }
+        result.add("locations", locationsArray)
+        return result
     }
 
     /**

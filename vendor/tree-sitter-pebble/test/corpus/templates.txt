@@ -1,0 +1,106 @@
+==================
+Template directives
+==================
+
+{% extends "layouts/base.peb" %}
+{% import "macros/forms.peb" as forms %}
+{% block content %}
+  <section class="user-card">
+    <h1>{{ user.name | title }}</h1>
+    {% if user.active and user.roles[0] != "guest" %}
+      <p>{{ forms.input("email", user.email) }}</p>
+      {% include "partials/details.peb" %}
+    {% endif %}
+    {# Rendered only for active users #}
+  </section>
+{% endblock %}
+
+---
+
+(source_file
+  (directive
+    (tag_name)
+    (template_item
+      (expression
+        (string_literal))))
+  (directive
+    (tag_name)
+    (template_item
+      (expression
+        (string_literal)))
+    (template_item
+      (keyword))
+    (template_item
+      (expression
+        (identifier))))
+  (directive
+    (tag_name)
+    (template_item
+      (expression
+        (identifier))))
+  (text)
+  (output
+    (template_item
+      (expression
+        (member_expression
+          (identifier)
+          (identifier))))
+    (template_item
+      (operator))
+    (template_item
+      (expression
+        (identifier))))
+  (text)
+  (directive
+    (tag_name)
+    (template_item
+      (expression
+        (member_expression
+          (identifier)
+          (identifier))))
+    (template_item
+      (keyword))
+    (template_item
+      (expression
+        (subscript_expression
+          (member_expression
+            (identifier)
+            (identifier))
+          (template_item
+            (expression
+              (number_literal))))))
+    (template_item
+      (operator))
+    (template_item
+      (expression
+        (string_literal))))
+  (text)
+  (output
+    (template_item
+      (expression
+        (call_expression
+          (member_expression
+            (identifier)
+            (identifier))
+          (template_item
+            (expression
+              (string_literal)))
+          (template_item)
+          (template_item
+            (expression
+              (member_expression
+                (identifier)
+                (identifier))))))))
+  (text)
+  (directive
+    (tag_name)
+    (template_item
+      (expression
+        (string_literal))))
+  (directive
+    (tag_name))
+  (comment)
+  (text)
+  (directive
+    (tag_name))
+  (text))

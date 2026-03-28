@@ -1,0 +1,20 @@
+{
+  "grammars": [
+    {
+      "name": "pebble",
+      "camelcase": "Pebble",
+      "scope": "source.pebble",
+      "path": ".",
+      "file-types": [
+        "peb",
+        "pebble"
+      ],
+      "highlights": "queries/highlights.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.0.1",
+    "license": "MIT",
+    "description": "Tree-sitter grammar for Pebble templates"
+  }
+}

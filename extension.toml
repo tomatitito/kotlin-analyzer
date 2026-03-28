@@ -4,7 +4,8 @@ version = "0.1.0"
 schema_version = 1
 authors = ["Jens Kouros <jens.kouros@posteo.de>"]
 description = "Kotlin language support with Analysis API-backed language server."
-repository = "https://github.com/jenskouros/kotlin-analyzer"
+repository = "https://github.com/tomatitito/kotlin-analyzer"
+languages = ["languages/kotlin", "languages/pebble"]
 
 [lib]
 kind = "Rust"
@@ -15,8 +16,10 @@ repository = "https://github.com/fwcd/tree-sitter-kotlin"
 rev = "ff2e742f946d060b68bfb9a3544184ecd61e1228"
 
 [grammars.pebble]
-repository = "https://github.com/HarmonicLabs/pebble-tree-sitter"
-rev = "ad560ef071ecd2c708bef119aa98c71cb0ef147c"
+repository = "https://github.com/tomatitito/kotlin-analyzer"
+rev = "298a12dc568fb5b3f983c0382b509a3d67e72b67"
+path = "vendor/tree-sitter-pebble"
 
 [language_servers.kotlin-analyzer]
+name = "Kotlin Analyzer"
 languages = ["Kotlin", "Pebble"]

@@ -46,10 +46,75 @@ class AnalysisServerTest {
         assertTrue(initializeResult.get("success").asBoolean)
     }
 
+    @Test
+    fun `pebble definition resolves indexed template target`() {
+        val layoutUri = "file:///workspace/src/main/resources/templates/layouts/base.peb"
+        val pageUri = "file:///workspace/src/main/resources/templates/users/detail.peb"
+        val input = buildString {
+            appendRpcNotification(
+                method = "pebble/textDocument/didOpen",
+                params = JsonObject().apply {
+                    addProperty("uri", layoutUri)
+                    addProperty("text", "base")
+                },
+            )
+            appendRpcNotification(
+                method = "pebble/textDocument/didOpen",
+                params = JsonObject().apply {
+                    addProperty("uri", pageUri)
+                    addProperty("text", """{% extends "layouts/base" %}""")
+                },
+            )
+            appendRpcRequest(
+                id = 1,
+                method = "pebble/definition",
+                params = JsonObject().apply {
+                    addProperty("uri", pageUri)
+                    addProperty("line", 1)
+                    addProperty("character", 15)
+                },
+            )
+            appendRpcRequest(
+                id = 2,
+                method = "shutdown",
+                params = JsonObject(),
+            )
+        }.toByteArray()
+
+        val output = ByteArrayOutputStream()
+        val server = AnalysisServer(
+            transport = JsonRpcTransport(
+                input = ByteArrayInputStream(input),
+                output = output,
+            ),
+        )
+
+        server.run()
+
+        val responses = parseResponses(output.toString(Charsets.UTF_8))
+        val definitionResult = responses.first { it.get("id").asLong == 1L }
+            .getAsJsonObject("result")
+        val locations = definitionResult.getAsJsonArray("locations")
+
+        assertEquals(1, locations.size())
+        assertEquals(layoutUri, locations[0].asJsonObject.get("uri").asString)
+    }
+
     private fun StringBuilder.appendRpcRequest(id: Long, method: String, params: JsonObject) {
         val body = JsonObject().apply {
             addProperty("jsonrpc", "2.0")
             addProperty("id", id)
+            addProperty("method", method)
+            add("params", params)
+        }.toString()
+
+        append("Content-Length: ${body.toByteArray(Charsets.UTF_8).size}\r\n\r\n")
+        append(body)
+    }
+
+    private fun StringBuilder.appendRpcNotification(method: String, params: JsonObject) {
+        val body = JsonObject().apply {
+            addProperty("jsonrpc", "2.0")
             addProperty("method", method)
             add("params", params)
         }.toString()
