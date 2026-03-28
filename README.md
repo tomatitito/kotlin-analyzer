@@ -11,7 +11,7 @@ A Kotlin language server for the [Zed](https://zed.dev) editor, providing semant
 - **Signature Help** - Parameter hints when typing function arguments
 - **Find References** - Locate usages of a symbol within the current file
 - **Formatting** - Code formatting via ktfmt or ktlint
-- **Syntax Highlighting** - Tree-sitter based highlighting for Kotlin 2.x syntax
+- **Syntax Highlighting** - Tree-sitter based highlighting for Kotlin 2.x and Pebble
 - **Text Objects** - Function, class, comment, and parameter text objects
 - **Runnables** - Detect `fun main()` and `@Test` annotated functions
 
@@ -29,19 +29,8 @@ Download the [latest release](https://github.com/tomatitito/kotlin-analyzer/rele
 ```bash
 tar -xzf kotlin-analyzer-v0.2.0-macos-aarch64.tar.gz
 cp kotlin-analyzer ~/.local/bin/
-rm -rf ~/.local/bin/sidecar-runtimes
-cp -R sidecar-runtimes ~/.local/bin/
+cp sidecar.jar ~/.local/bin/
 ```
-
-`kotlin-analyzer` now ships the JVM sidecar as a versioned runtime directory rather than one monolithic `sidecar.jar`. This lets the Rust server choose a Kotlin-compatible Analysis API payload per project before starting the JVM sidecar.
-
-Runtime selection policy:
-
-- prefer an exact Kotlin version match when available
-- otherwise use the newest runtime from the same major.minor line only when that line has been explicitly validated in the runtime manifest
-- otherwise fall back to the newest bundled runtime and warn that analysis may be inaccurate
-
-Bundled runtimes are the primary source. The server can also reuse cached runtimes under the local runtime cache, override the cache root with `KOTLIN_ANALYZER_RUNTIME_CACHE_DIR`, and search additional provision source directories from `KOTLIN_ANALYZER_RUNTIME_SOURCE_DIRS`.
 
 Then symlink the Zed extension:
 
@@ -103,7 +92,7 @@ For projects without Gradle or Maven, create a `.kotlin-analyzer.json` in the pr
   "sourceRoots": ["src/main/kotlin"],
   "classpath": ["libs/some-library.jar"],
   "compilerFlags": ["-Xcontext-parameters"],
-  "kotlinVersion": "2.2.21",
+  "kotlinVersion": "2.1.20",
   "jdkHome": "/path/to/jdk"
 }
 ```
@@ -112,7 +101,7 @@ For projects without Gradle or Maven, create a `.kotlin-analyzer.json` in the pr
 
 The system consists of three components:
 
-- **Zed extension** (Rust/WASM) - Registers Kotlin language support, manages tree-sitter queries for syntax highlighting, and downloads/launches the LSP binary.
+- **Zed extension** (Rust/WASM) - Registers Kotlin and Pebble language support, manages tree-sitter queries for syntax highlighting, and downloads/launches the LSP binary.
 - **Rust LSP server** - Handles the LSP protocol, document state management, project model extraction, formatting, and sidecar process lifecycle.
 - **JVM sidecar** - Runs the Kotlin Analysis API (K2/FIR-backed) in standalone mode for semantic analysis. Communicates with the Rust server via JSON-RPC over stdin/stdout.
 
@@ -138,8 +127,6 @@ kotlin-analyzer requires JDK 17+. It searches for Java in this order:
 - Check that `build.gradle.kts` / `pom.xml` is in the workspace root
 - For non-standard projects, create a `.kotlin-analyzer.json` configuration
 - Check Zed logs for errors during project resolution
-- If the project uses a Kotlin version that is not bundled, check the startup warning and logs to see whether the server selected an exact match, a validated same-minor fallback, or a cross-minor bundled fallback
-- If you are using development builds, ensure `~/.local/bin/kotlin-analyzer` is a symlink to the source-tree binary so the server can resolve `sidecar/build/runtime/`
 
 ### Formatting not working
 
@@ -161,8 +148,8 @@ kotlin-analyzer requires JDK 17+. It searches for Java in this order:
 # Rust LSP binary
 cd server && cargo build --release
 
-# JVM sidecar runtimes
-cd sidecar && ./gradlew assembleRuntimePayloads
+# JVM sidecar
+cd sidecar && ./gradlew shadowJar
 
 # Zed extension (WASM)
 cargo build --target wasm32-wasip1
@@ -171,28 +158,12 @@ cargo build --target wasm32-wasip1
 ### Install locally
 
 ```bash
-ln -sf "$(pwd)/server/target/release/kotlin-analyzer" ~/.local/bin/kotlin-analyzer
-rm -rf ~/.local/bin/sidecar-runtimes
-cp -R sidecar/build/runtime ~/.local/bin/sidecar-runtimes
+cp server/target/release/kotlin-analyzer ~/.local/bin/
+cp sidecar/build/libs/sidecar-all.jar ~/.local/bin/sidecar.jar
 
 # Symlink the Zed extension (only needed once)
 ln -sfn "$(pwd)" ~/Library/Application\ Support/Zed/extensions/installed/kotlin-analyzer
 ```
-
-For local source-tree development, keep `~/.local/bin/kotlin-analyzer` as a symlink rather than a copied binary. The server uses its resolved executable path to locate versioned runtimes under `sidecar/build/runtime/`.
-
-For development builds, use the helper script:
-
-```bash
-cargo build --manifest-path server/Cargo.toml && (cd sidecar && ./gradlew assembleRuntimePayloads) && ./scripts/install-dev-runtime.sh
-```
-
-That command:
-
-- builds the debug server binary
-- assembles the versioned JVM runtimes under `sidecar/build/runtime/`
-- installs `~/.local/bin/kotlin-analyzer` as a symlink
-- installs `~/.local/bin/sidecar-runtimes/`
 
 ### Test
 
@@ -201,7 +172,7 @@ That command:
 cd server && cargo test
 
 # Full smoke test
-cargo build && (cd sidecar && ./gradlew assembleRuntimePayloads) && cd server && cargo test
+cargo build && (cd sidecar && ./gradlew shadowJar) && cd server && cargo test
 ```
 
 ## Documentation

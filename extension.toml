@@ -14,5 +14,9 @@ version = "0.7.0"
 repository = "https://github.com/fwcd/tree-sitter-kotlin"
 rev = "ff2e742f946d060b68bfb9a3544184ecd61e1228"
 
+[grammars.pebble]
+repository = "https://github.com/HarmonicLabs/pebble-tree-sitter"
+rev = "ad560ef071ecd2c708bef119aa98c71cb0ef147c"
+
 [language_servers.kotlin-analyzer]
-languages = ["Kotlin"]
+languages = ["Kotlin", "Pebble"]
