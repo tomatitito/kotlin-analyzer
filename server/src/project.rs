@@ -61,6 +61,15 @@ pub fn detect_build_system(root: &Path) -> BuildSystem {
     }
 }
 
+fn has_project_root_marker(root: &Path) -> bool {
+    root.join("build.gradle.kts").exists()
+        || root.join("build.gradle").exists()
+        || root.join("settings.gradle.kts").exists()
+        || root.join("settings.gradle").exists()
+        || root.join("pom.xml").exists()
+        || root.join(".kotlin-analyzer.json").exists()
+}
+
 /// Walks up from `start` looking for a directory that contains a build system
 /// marker (build.gradle.kts, build.gradle, pom.xml, settings.gradle.kts,
 /// settings.gradle, .kotlin-analyzer.json) or a VCS root (.git).
@@ -69,14 +78,8 @@ pub fn detect_build_system(root: &Path) -> BuildSystem {
 pub fn find_project_root(start: &Path) -> PathBuf {
     let mut current = start.to_path_buf();
     loop {
-        // Build system markers
-        if current.join("build.gradle.kts").exists()
-            || current.join("build.gradle").exists()
-            || current.join("settings.gradle.kts").exists()
-            || current.join("settings.gradle").exists()
-            || current.join("pom.xml").exists()
-            || current.join(".kotlin-analyzer.json").exists()
-        {
+        // Build system and explicit analyzer config markers
+        if has_project_root_marker(&current) {
             return current;
         }
         // VCS root as fallback — better than a deep source directory
@@ -90,6 +93,64 @@ pub fn find_project_root(start: &Path) -> PathBuf {
     }
     // No marker found — use the original path
     start.to_path_buf()
+}
+
+/// If `root` has no build system marker but contains exactly one nested build
+/// root, prefer that nested root. This helps when editors open a VCS root while
+/// the actual build lives in a single subdirectory (for example, `sidecar/`).
+pub fn prefer_nested_build_root(root: &Path) -> PathBuf {
+    if has_project_root_marker(root) {
+        return root.to_path_buf();
+    }
+
+    let mut candidates = Vec::new();
+    collect_nested_build_roots(root, 0, 3, &mut candidates);
+    candidates.sort();
+    candidates.dedup();
+
+    if candidates.len() == 1 {
+        candidates.remove(0)
+    } else {
+        root.to_path_buf()
+    }
+}
+
+fn collect_nested_build_roots(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    candidates: &mut Vec<PathBuf>,
+) {
+    if depth > max_depth {
+        return;
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if name.starts_with('.') || name == "target" || name == "build" {
+            continue;
+        }
+
+        if detect_build_system(&path) != BuildSystem::None {
+            candidates.push(path);
+            continue;
+        }
+
+        collect_nested_build_roots(&path, depth + 1, max_depth, candidates);
+    }
 }
 
 /// Resolves the project model from the build system.
@@ -1012,6 +1073,61 @@ GENERATED_SOURCE_ROOT=/project/lib/build/generated/ksp/main/kotlin
         fs::write(dir.path().join("settings.gradle.kts"), "").unwrap();
 
         let found = find_project_root(&src);
+        assert_eq!(found, dir.path());
+    }
+
+    #[test]
+    fn prefer_nested_build_root_for_single_module_repo() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let nested = dir.path().join("sidecar");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("build.gradle.kts"), "").unwrap();
+
+        let found = prefer_nested_build_root(dir.path());
+        assert_eq!(found, nested);
+    }
+
+    #[test]
+    fn prefer_nested_build_root_keeps_root_when_multiple_modules_exist() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let app = dir.path().join("app");
+        let lib = dir.path().join("lib");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(app.join("build.gradle.kts"), "").unwrap();
+        fs::write(lib.join("build.gradle.kts"), "").unwrap();
+
+        let found = prefer_nested_build_root(dir.path());
+        assert_eq!(found, dir.path());
+    }
+
+    #[test]
+    fn prefer_nested_build_root_keeps_settings_gradle_root() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("settings.gradle.kts"), "").unwrap();
+
+        let nested = dir.path().join("app");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("build.gradle.kts"), "").unwrap();
+
+        let found = prefer_nested_build_root(dir.path());
+        assert_eq!(found, dir.path());
+    }
+
+    #[test]
+    fn prefer_nested_build_root_keeps_manual_config_root() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".kotlin-analyzer.json"), "{}").unwrap();
+
+        let nested = dir.path().join("sidecar");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("build.gradle.kts"), "").unwrap();
+
+        let found = prefer_nested_build_root(dir.path());
         assert_eq!(found, dir.path());
     }
 }

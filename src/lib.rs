@@ -1,5 +1,3 @@
-use std::fs;
-
 use zed_extension_api::{self as zed, LanguageServerId, Result};
 
 struct KotlinAnalyzerExtension {
@@ -59,26 +57,16 @@ impl zed::Extension for KotlinAnalyzerExtension {
 
         // 1) Check if kotlin-analyzer is on PATH (dev override or system install).
         if let Some(path) = worktree.which("kotlin-analyzer") {
-            if let Ok(metadata) = fs::metadata(&path) {
-                if metadata.is_file() {
-                    Self::set_status(
-                        language_server_id,
-                        zed::LanguageServerInstallationStatus::None,
-                    );
-                    return Ok(zed::Command {
-                        command: path,
-                        args: base_args,
-                        env,
-                    });
-                }
-            }
-
-            let message = format!("Resolved kotlin-analyzer at {path}, but it is not executable");
+            eprintln!("kotlin-analyzer: using PATH-discovered binary: {path}");
             Self::set_status(
                 language_server_id,
-                zed::LanguageServerInstallationStatus::Failed(message.clone()),
+                zed::LanguageServerInstallationStatus::None,
             );
-            return Err(message);
+            return Ok(zed::Command {
+                command: path,
+                args: base_args,
+                env,
+            });
         }
 
         // 2) Check well-known local install path.
@@ -90,33 +78,30 @@ impl zed::Extension for KotlinAnalyzerExtension {
             .map(|(_, v)| v.clone())
         {
             let local_bin = format!("{home}/.local/bin/kotlin-analyzer");
-            if fs::metadata(&local_bin).is_ok_and(|metadata| metadata.is_file()) {
-                Self::set_status(
-                    language_server_id,
-                    zed::LanguageServerInstallationStatus::None,
-                );
-                self.cached_binary_path = Some(local_bin.clone());
-                return Ok(zed::Command {
-                    command: local_bin,
-                    args: base_args,
-                    env,
-                });
-            }
+            eprintln!("kotlin-analyzer: falling back to well-known path: {local_bin}");
+            Self::set_status(
+                language_server_id,
+                zed::LanguageServerInstallationStatus::None,
+            );
+            self.cached_binary_path = Some(local_bin.clone());
+            return Ok(zed::Command {
+                command: local_bin,
+                args: base_args,
+                env,
+            });
         }
 
         // 3) Check if we already downloaded the binary.
         if let Some(path) = &self.cached_binary_path {
-            if fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
-                Self::set_status(
-                    language_server_id,
-                    zed::LanguageServerInstallationStatus::None,
-                );
-                return Ok(zed::Command {
-                    command: path.clone(),
-                    args: base_args,
-                    env,
-                });
-            }
+            Self::set_status(
+                language_server_id,
+                zed::LanguageServerInstallationStatus::None,
+            );
+            return Ok(zed::Command {
+                command: path.clone(),
+                args: base_args,
+                env,
+            });
         }
 
         let message = Self::command_not_found_error();

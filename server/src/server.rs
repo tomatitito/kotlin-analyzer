@@ -346,7 +346,8 @@ impl LanguageServer for KotlinLanguageServer {
         // real project root that has build.gradle.kts, pom.xml, etc.
         if let Some(root_uri) = params.root_uri {
             if let Ok(path) = root_uri.to_file_path() {
-                let resolved = project::find_project_root(&path);
+                let resolved =
+                    project::prefer_nested_build_root(&project::find_project_root(&path));
                 if resolved != path {
                     tracing::info!(
                         "resolved project root from {} to {}",
