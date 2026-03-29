@@ -17,7 +17,7 @@ rev = "ff2e742f946d060b68bfb9a3544184ecd61e1228"
 
 [grammars.pebble]
 repository = "https://github.com/tomatitito/kotlin-analyzer"
-rev = "298a12dc568fb5b3f983c0382b509a3d67e72b67"
+rev = "53b4238b3b4d5dfc07b515748a3c686257f754ca"
 path = "vendor/tree-sitter-pebble"
 
 [language_servers.kotlin-analyzer]
