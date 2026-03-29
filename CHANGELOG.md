@@ -4,6 +4,14 @@ All notable changes to kotlin-analyzer will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-29
+
+### Added
+
+- Pebble language support in the Zed extension, including language registration, Tree-sitter queries, and injected HTML parsing for template text.
+- Vendored Pebble Tree-sitter grammar wired into the extension manifest and release source.
+- Pebble template indexing in the JVM sidecar for template-aware analysis groundwork.
+
 ### Fixed
 
 - Sidecar semantic resolution now uses currently open virtual file content when resolving a request file, even when URI/path matching differs from stored virtual keys, so hover/completion/diagnostics/definitions reflect unsaved edits.
