@@ -182,15 +182,18 @@ For local source-tree development, keep `~/.local/bin/kotlin-analyzer` as a syml
 For development builds, use the helper script:
 
 ```bash
-cargo build --manifest-path server/Cargo.toml && (cd sidecar && ./gradlew assembleRuntimePayloads) && ./scripts/install-dev-runtime.sh
+./scripts/rebuild-dev.sh
 ```
 
-That command:
+That script:
 
-- builds the debug server binary
-- assembles the versioned JVM runtimes under `sidecar/build/runtime/`
-- installs `~/.local/bin/kotlin-analyzer` as a symlink
-- installs `~/.local/bin/sidecar-runtimes/`
+- rebuilds the sidecar runtime payloads
+- rebuilds the debug server binary
+- rebuilds `extension.wasm`
+- refreshes the `~/.local/bin/kotlin-analyzer` symlink
+- refreshes the Zed dev extension symlink under `~/Library/Application Support/Zed/extensions/installed/kotlin-analyzer`
+
+After it finishes, fully restart `my-zed`/Zed so the rebuilt sidecar payloads are picked up.
 
 ### Test
 

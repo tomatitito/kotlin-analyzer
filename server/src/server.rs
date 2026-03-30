@@ -16,7 +16,7 @@ use crate::bridge::{Bridge, SidecarState};
 use crate::config::{Config, FormattingTool};
 use crate::project;
 use crate::runtime;
-use crate::state::DocumentStore;
+use crate::state::{DocumentKind, DocumentStore};
 
 /// The main language server implementation.
 pub struct KotlinLanguageServer {
@@ -90,7 +90,11 @@ impl KotlinLanguageServer {
         let (text, version) = {
             let documents = self.documents.lock().await;
             match documents.get(uri) {
-                Some(d) => (d.text.clone(), d.version),
+                Some(d) if d.kind.supports_kotlin_analysis() => (d.text.clone(), d.version),
+                Some(_) => {
+                    tracing::debug!("analyze_document: skipping non-Kotlin document {}", uri);
+                    return;
+                }
                 None => return,
             }
         };
@@ -240,13 +244,18 @@ impl KotlinLanguageServer {
                                     if let Some(doc) = documents.get(&uri) {
                                         let text = doc.text.clone();
                                         let version = doc.version;
+                                        let kind = doc.kind;
                                         drop(documents);
 
-                                        let _ = bridge.notify("textDocument/didChange", Some(serde_json::json!({
+                                        let _ = bridge.notify(kind.did_change_method(), Some(serde_json::json!({
                                             "uri": uri.as_str(),
                                             "version": version,
                                             "text": text,
                                         }))).await;
+
+                                        if !kind.supports_kotlin_analysis() {
+                                            continue;
+                                        }
 
                                         match bridge.request("analyze", Some(serde_json::json!({
                                             "uri": uri.as_str(),
@@ -764,10 +773,12 @@ impl LanguageServer for KotlinLanguageServer {
 
                     // Replay all open documents: send didOpen + analyze for each
                     // file that was opened before the sidecar was ready.
-                    let open_docs: Vec<(Url, String, i32)> = {
+                    let open_docs: Vec<(Url, String, i32, DocumentKind)> = {
                         let docs = documents_holder.lock().await;
                         docs.all()
-                            .map(|(uri, doc)| (uri.clone(), doc.text.clone(), doc.version))
+                            .map(|(uri, doc)| {
+                                (uri.clone(), doc.text.clone(), doc.version, doc.kind)
+                            })
                             .collect()
                     };
 
@@ -786,11 +797,11 @@ impl LanguageServer for KotlinLanguageServer {
                         guard.as_ref().map(Arc::clone)
                     };
                     if let Some(bridge) = bridge_arc {
-                        for (uri, text, version) in &open_docs {
+                        for (uri, text, version, kind) in &open_docs {
                             tracing::debug!("replay: sending didOpen for {}", uri);
                             let _ = bridge
                                 .notify(
-                                    "textDocument/didOpen",
+                                    kind.did_open_method(),
                                     Some(serde_json::json!({
                                         "uri": uri.as_str(),
                                         "version": version,
@@ -802,7 +813,7 @@ impl LanguageServer for KotlinLanguageServer {
                             // Send didChange + analyze
                             let _ = bridge
                                 .notify(
-                                    "textDocument/didChange",
+                                    kind.did_change_method(),
                                     Some(serde_json::json!({
                                         "uri": uri.as_str(),
                                         "version": version,
@@ -810,6 +821,10 @@ impl LanguageServer for KotlinLanguageServer {
                                     })),
                                 )
                                 .await;
+
+                            if !kind.supports_kotlin_analysis() {
+                                continue;
+                            }
 
                             match bridge
                                 .request(
@@ -1082,6 +1097,7 @@ impl LanguageServer for KotlinLanguageServer {
         let uri = params.text_document.uri.clone();
         let text = params.text_document.text.clone();
         let version = params.text_document.version;
+        let kind = DocumentKind::from_language_id(&params.text_document.language_id, &uri);
 
         tracing::debug!(
             "did_open: {} (version {}, {} bytes)",
@@ -1105,14 +1121,14 @@ impl LanguageServer for KotlinLanguageServer {
                         .await;
                 }
             }
-            documents.open(uri.clone(), text.clone(), version);
+            documents.open(uri.clone(), text.clone(), version, kind);
         }
 
         // Notify sidecar
         if let Some(bridge) = self.get_bridge().await {
             let _ = bridge
                 .notify(
-                    "textDocument/didOpen",
+                    kind.did_open_method(),
                     Some(serde_json::json!({
                         "uri": uri.as_str(),
                         "version": version,
@@ -1145,6 +1161,13 @@ impl LanguageServer for KotlinLanguageServer {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri.clone();
+        let kind = {
+            let documents = self.documents.lock().await;
+            documents
+                .get(&uri)
+                .map(|doc| doc.kind)
+                .unwrap_or_else(|| DocumentKind::from_uri(&uri))
+        };
 
         {
             let mut documents = self.documents.lock().await;
@@ -1155,7 +1178,7 @@ impl LanguageServer for KotlinLanguageServer {
         if let Some(bridge) = self.get_bridge().await {
             let _ = bridge
                 .notify(
-                    "textDocument/didClose",
+                    kind.did_close_method(),
                     Some(serde_json::json!({
                         "uri": uri.as_str(),
                     })),
@@ -1172,6 +1195,18 @@ impl LanguageServer for KotlinLanguageServer {
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
         tracing::debug!("did_save: {}", uri);
+
+        let should_analyze = {
+            let documents = self.documents.lock().await;
+            documents
+                .get(&uri)
+                .map(|doc| doc.kind.supports_kotlin_analysis())
+                .unwrap_or_else(|| DocumentKind::from_uri(&uri).supports_kotlin_analysis())
+        };
+
+        if !should_analyze {
+            return;
+        }
 
         // Trigger fresh analysis on save (bypasses debounce for immediate feedback)
         self.analyze_document(&uri).await;
@@ -1277,6 +1312,13 @@ impl LanguageServer for KotlinLanguageServer {
     ) -> LspResult<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
+        let method = {
+            let documents = self.documents.lock().await;
+            documents
+                .get(&uri)
+                .map(|doc| doc.kind.definition_method())
+                .unwrap_or_else(|| DocumentKind::from_uri(&uri).definition_method())
+        };
 
         let bridge = match self.get_bridge().await {
             Some(b) => b,
@@ -1285,7 +1327,7 @@ impl LanguageServer for KotlinLanguageServer {
 
         match bridge
             .request(
-                "definition",
+                method,
                 Some(serde_json::json!({
                     "uri": uri.as_str(),
                     "line": position.line + 1,
@@ -1316,6 +1358,13 @@ impl LanguageServer for KotlinLanguageServer {
     async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
+        let method = {
+            let documents = self.documents.lock().await;
+            documents
+                .get(&uri)
+                .map(|doc| doc.kind.references_method())
+                .unwrap_or_else(|| DocumentKind::from_uri(&uri).references_method())
+        };
 
         let bridge = match self.get_bridge().await {
             Some(b) => b,
@@ -1324,7 +1373,7 @@ impl LanguageServer for KotlinLanguageServer {
 
         match bridge
             .request(
-                "references",
+                method,
                 Some(serde_json::json!({
                     "uri": uri.as_str(),
                     "line": position.line + 1,

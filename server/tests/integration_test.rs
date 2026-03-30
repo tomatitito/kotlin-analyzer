@@ -9,6 +9,7 @@ use std::io::{BufRead, Read, Write};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
+use tempfile::tempdir;
 
 /// Test helper to start the LSP server and communicate with it.
 ///
@@ -237,9 +238,16 @@ impl LspTestClient {
     }
 
     fn initialize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.initialize_with_root("file:///tmp/test-project")
+    }
+
+    fn initialize_with_root(
+        &mut self,
+        root_uri: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let params = json!({
             "processId": std::process::id(),
-            "rootUri": "file:///tmp/test-project",
+            "rootUri": root_uri,
             "capabilities": {
                 "textDocument": {
                     "hover": { "dynamicRegistration": false },
@@ -278,10 +286,19 @@ impl LspTestClient {
     }
 
     fn open_document(&mut self, uri: &str, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.open_document_with_language(uri, "kotlin", text)
+    }
+
+    fn open_document_with_language(
+        &mut self,
+        uri: &str,
+        language_id: &str,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let params = json!({
             "textDocument": {
                 "uri": uri,
-                "languageId": "kotlin",
+                "languageId": language_id,
                 "version": 1,
                 "text": text
             }
@@ -326,6 +343,37 @@ impl LspTestClient {
                 .and_then(|m| m.as_str())
                 .unwrap_or("Unknown error");
             return Err(format!("Hover request failed: {}", message).into());
+        }
+
+        Ok(None)
+    }
+
+    fn definition(
+        &mut self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        let response = self.send_request("textDocument/definition", params)?;
+
+        if let Some(result) = response.get("result") {
+            if result.is_null() {
+                return Ok(None);
+            }
+            return Ok(Some(result.clone()));
+        }
+
+        if let Some(error) = response.get("error") {
+            let message = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown error");
+            return Err(format!("Definition request failed: {}", message).into());
         }
 
         Ok(None)
@@ -448,6 +496,105 @@ fn test_sidecar_stays_alive() {
         "Sidecar appears to have died - hover request failed: {:?}",
         result.err()
     );
+}
+
+#[test]
+fn test_pebble_template_definition_routes_through_pebble_bridge() {
+    let workspace = tempdir().expect("failed to create temporary workspace");
+    let templates_dir = workspace
+        .path()
+        .join("src/main/resources/templates");
+    std::fs::create_dir_all(templates_dir.join("layouts")).expect("failed to create layouts dir");
+    std::fs::create_dir_all(templates_dir.join("macros")).expect("failed to create macros dir");
+    std::fs::create_dir_all(templates_dir.join("partials")).expect("failed to create partials dir");
+    std::fs::create_dir_all(templates_dir.join("users")).expect("failed to create users dir");
+
+    let extends_path = templates_dir.join("layouts/base.peb");
+    let import_path = templates_dir.join("macros/forms.peb");
+    let include_path = templates_dir.join("partials/details.peb");
+    let page_path = templates_dir.join("users/detail.peb");
+
+    std::fs::write(&extends_path, "{% block content %}{% endblock %}\n").expect("failed to write base template");
+    std::fs::write(&import_path, "{% macro input(name, value) %}{{ value }}{% endmacro %}\n").expect("failed to write macro template");
+    std::fs::write(&include_path, "<p>details</p>\n").expect("failed to write partial template");
+
+    let page_text = r#"{% extends "layouts/base.peb" %}
+{% import "macros/forms.peb" as forms %}
+
+{% block content %}
+  <section class="user-card">
+    <h1>{{ user.name | title }}</h1>
+    {% if user.active and user.roles[0] != "guest" %}
+      <p>{{ forms.input("email", user.email) }}</p>
+      {% include "partials/details.peb" %}
+    {% endif %}
+  </section>
+{% endblock %}
+"#;
+    std::fs::write(&page_path, page_text).expect("failed to write page template");
+
+    let root_uri = format!("file://{}", workspace.path().display());
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize_with_root(&root_uri)
+        .expect("Failed to initialize LSP server");
+
+    let extends_uri = format!("file://{}", extends_path.display());
+    let import_uri = format!("file://{}", import_path.display());
+    let include_uri = format!("file://{}", include_path.display());
+    let page_uri = format!("file://{}", page_path.display());
+
+    client
+        .open_document_with_language(&page_uri, "plaintext", page_text)
+        .expect("Failed to open pebble page");
+
+    let extends_definition = client
+        .definition(&page_uri, 0, 15)
+        .expect("extends definition request failed")
+        .expect("extends definition returned null");
+    let import_definition = client
+        .definition(&page_uri, 1, 14)
+        .expect("import definition request failed")
+        .expect("import definition returned null");
+    let include_definition = client
+        .definition(&page_uri, 8, 18)
+        .expect("include definition request failed")
+        .expect("include definition returned null");
+
+    let extends_target = extends_definition
+        .get("uri")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            extends_definition
+                .as_array()
+                .and_then(|values| values.first())
+                .and_then(|value| value.get("uri"))
+                .and_then(|value| value.as_str())
+        });
+    let import_target = import_definition
+        .get("uri")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            import_definition
+                .as_array()
+                .and_then(|values| values.first())
+                .and_then(|value| value.get("uri"))
+                .and_then(|value| value.as_str())
+        });
+    let include_target = include_definition
+        .get("uri")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            include_definition
+                .as_array()
+                .and_then(|values| values.first())
+                .and_then(|value| value.get("uri"))
+                .and_then(|value| value.as_str())
+        });
+
+    assert_eq!(extends_target, Some(extends_uri.as_str()));
+    assert_eq!(import_target, Some(import_uri.as_str()));
+    assert_eq!(include_target, Some(include_uri.as_str()));
 }
 
 #[test]

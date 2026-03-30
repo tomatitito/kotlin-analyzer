@@ -1,6 +1,8 @@
 package dev.kouros.sidecar
 
 import java.net.URI
+import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.Paths
 
 internal enum class PebbleReferenceKind {
@@ -202,13 +204,13 @@ internal class PebbleTemplateIndex(
 
     fun definition(uri: String, line: Int, character: Int): String? {
         val reference = findTemplateReferenceAt(uri, line, character) ?: return null
-        return resolveTemplate(reference.targetTemplate)
+        return resolveTemplate(reference.sourceUri, reference.targetTemplate)
     }
 
     fun referencesAt(uri: String, line: Int, character: Int): List<PebbleTemplateReference> {
         val reference = findTemplateReferenceAt(uri, line, character)
         if (reference != null) {
-            val targetUri = resolveTemplate(reference.targetTemplate) ?: return emptyList()
+            val targetUri = resolveTemplate(reference.sourceUri, reference.targetTemplate) ?: return emptyList()
             return referencesToTemplate(targetUri)
         }
         return referencesToTemplate(uri)
@@ -240,13 +242,13 @@ internal class PebbleTemplateIndex(
 
         for (facts in factsByUri.values) {
             for (reference in facts.templateReferences) {
-                val targetUri = resolveTemplate(reference.targetTemplate) ?: continue
+                val targetUri = resolveTemplate(reference.sourceUri, reference.targetTemplate) ?: continue
                 referencesByResolvedTarget.getOrPut(targetUri) { mutableListOf() }.add(reference)
             }
         }
     }
 
-    private fun resolveTemplate(targetTemplate: String): String? {
+    private fun resolveTemplate(sourceUri: String, targetTemplate: String): String? {
         val normalized = normalizeTemplateName(targetTemplate)
         val candidates = buildList {
             add(normalized)
@@ -260,7 +262,47 @@ internal class PebbleTemplateIndex(
 
         return candidates.firstNotNullOfOrNull { candidate ->
             aliasesToUris[candidate]?.sorted()?.firstOrNull()
+                ?: resolveTemplateOnDisk(sourceUri, candidate)
         }
+    }
+
+    private fun resolveTemplateOnDisk(sourceUri: String, candidate: String): String? {
+        val sourcePath = uriToPath(sourceUri) ?: return null
+
+        sourcePath.parent?.let { parent ->
+            val resolved = parent.resolve(candidate).normalize()
+            if (Files.isRegularFile(resolved)) {
+                return resolved.toUri().toString()
+            }
+        }
+
+        val templateRoots = templateRoots(sourcePath)
+        return templateRoots.firstNotNullOfOrNull { root ->
+            val resolved = root.resolve(candidate).normalize()
+            if (Files.isRegularFile(resolved)) {
+                resolved.toUri().toString()
+            } else {
+                null
+            }
+        }
+    }
+
+    private fun templateRoots(sourcePath: Path): List<Path> {
+        val normalized = sourcePath.normalize()
+        val markers = listOf("templates", "views")
+        val roots = linkedSetOf<Path>()
+        for (index in 0 until normalized.nameCount) {
+            if (normalized.getName(index).toString() in markers) {
+                roots.add(normalized.root?.resolve(normalized.subpath(0, index + 1)) ?: normalized.subpath(0, index + 1))
+            }
+        }
+        return roots.toList()
+    }
+
+    private fun uriToPath(uri: String): Path? = try {
+        Paths.get(URI(uri)).normalize()
+    } catch (_: Exception) {
+        null
     }
 
     private fun templateAliases(uri: String): Set<String> {

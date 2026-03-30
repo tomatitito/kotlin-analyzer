@@ -1,6 +1,8 @@
 package dev.kouros.sidecar
 
 import org.junit.jupiter.api.Test
+import java.nio.file.Files
+import kotlin.io.path.writeText
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -75,6 +77,44 @@ class PebbleTemplateIndexTest {
         index.remove(pageUri)
         assertTrue(index.referencesToTemplate(altUri).isEmpty())
         assertNull(index.definition(pageUri, line = 1, character = 15))
+    }
+
+    @Test
+    fun `definition falls back to on-disk target template when target is not open`() {
+        val tempDir = Files.createTempDirectory("pebble-index-test")
+        val templatesDir = tempDir.resolve("src/main/resources/templates")
+        Files.createDirectories(templatesDir.resolve("layouts"))
+        Files.createDirectories(templatesDir.resolve("users"))
+
+        val basePath = templatesDir.resolve("layouts/base.peb")
+        val pagePath = templatesDir.resolve("users/detail.peb")
+        basePath.writeText("base")
+        pagePath.writeText("{% extends \"layouts/base\" %}")
+
+        val index = PebbleTemplateIndex()
+        val pageUri = pagePath.toUri().toString()
+        index.update(pageUri, pagePath.toFile().readText())
+
+        assertEquals(basePath.toUri().toString(), index.definition(pageUri, line = 1, character = 15))
+    }
+
+    @Test
+    fun `definition resolves relative on-disk include next to source template`() {
+        val tempDir = Files.createTempDirectory("pebble-index-relative-test")
+        val templatesDir = tempDir.resolve("src/frontend/templates")
+        Files.createDirectories(templatesDir.resolve("outfits"))
+        Files.createDirectories(templatesDir.resolve("_icons"))
+
+        val targetPath = templatesDir.resolve("script.peb")
+        val sourcePath = templatesDir.resolve("outfits/carousel.peb")
+        targetPath.writeText("script")
+        sourcePath.writeText("{% include \"../script\" %}")
+
+        val index = PebbleTemplateIndex()
+        val sourceUri = sourcePath.toUri().toString()
+        index.update(sourceUri, sourcePath.toFile().readText())
+
+        assertEquals(targetPath.toUri().toString(), index.definition(sourceUri, line = 1, character = 15))
     }
 
     @Test
