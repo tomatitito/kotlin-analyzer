@@ -5,6 +5,7 @@ import com.intellij.psi.util.PsiTreeUtil
 import org.jetbrains.kotlin.psi.KtBlockExpression
 import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtClassBody
+import org.jetbrains.kotlin.psi.KtClassOrObject
 import org.jetbrains.kotlin.psi.KtDeclarationWithBody
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtFile
@@ -36,17 +37,31 @@ internal data class SpringModelAttributeFact(
     val producerType: String?,
 )
 
+internal data class PebbleUsageLocation(
+    val uri: String,
+    val line: Int,
+    val column: Int,
+)
+
+private data class PebbleResolvedVariable(
+    val producerLocation: KotlinSourceLocation?,
+    val producerType: String?,
+)
+
 internal class PebbleSpringIndex(
     private val templateIndex: PebbleTemplateIndex,
 ) {
     private val viewFactsByUri = linkedMapOf<String, MutableList<SpringViewFact>>()
     private val modelFactsByTemplateAndName = linkedMapOf<Pair<String, String>, MutableList<SpringModelAttributeFact>>()
+    private val kotlinFilesByUri = linkedMapOf<String, KtFile>()
 
     fun rebuild(kotlinFilesByUri: Map<String, KtFile>) {
         viewFactsByUri.clear()
         modelFactsByTemplateAndName.clear()
+        this.kotlinFilesByUri.clear()
+        this.kotlinFilesByUri.putAll(kotlinFilesByUri.toSortedMap())
 
-        for ((uri, ktFile) in kotlinFilesByUri.toSortedMap()) {
+        for ((uri, ktFile) in this.kotlinFilesByUri) {
             indexFile(uri, ktFile)
         }
     }
@@ -56,16 +71,75 @@ internal class PebbleSpringIndex(
             ?.firstOrNull { it.range.contains(line, character) }
             ?.templateUri
 
-    fun definitionForPebbleVariableRoot(uri: String, line: Int, character: Int): SpringModelAttributeFact? {
+    fun definitionForPebbleSymbol(uri: String, line: Int, character: Int): KotlinSourceLocation? {
         val variable = templateIndex.facts(uri)
             ?.variableReferences
             ?.firstOrNull { it.range.contains(line, character) }
             ?: return null
-        val rootName = variable.segments.firstOrNull() ?: return null
-        return modelFactsByTemplateAndName[uri to rootName]
-            ?.sortedWith(compareBy<SpringModelAttributeFact>({ it.producerLocation.uri }, { it.producerLocation.line }, { it.producerLocation.column }))
-            ?.firstOrNull()
+        val segmentIndex = segmentIndexAt(variable, character) ?: return null
+        val resolvedRoot = resolveVariableForRoot(uri, variable.segments.firstOrNull() ?: return null) ?: return null
+
+        if (segmentIndex == 0) {
+            return resolvedRoot.producerLocation ?: resolvedRoot.producerType?.let(::resolveTypeLocation)
+        }
+
+        val ownerType = resolveVariableType(uri, variable.segments.take(segmentIndex)) ?: return null
+        val memberName = variable.segments.getOrNull(segmentIndex) ?: return null
+        return resolveMemberLocation(ownerType, memberName)
     }
+
+    fun producerTypeForPebbleVariableRoot(uri: String, line: Int, character: Int): String? {
+        val variable = templateIndex.facts(uri)
+            ?.variableReferences
+            ?.firstOrNull { it.range.contains(line, character) }
+            ?: return null
+        val segmentIndex = segmentIndexAt(variable, character) ?: return null
+        if (segmentIndex != 0) return null
+        val rootName = variable.segments.firstOrNull() ?: return null
+        return resolveVariableForRoot(uri, rootName)?.producerType
+    }
+
+    fun pebbleUsagesForDeclaration(declaration: PsiElement, declarationUri: String): List<PebbleUsageLocation> {
+        val declarationLocation = declaration.toSourceLocation(declarationUri)
+        val declarationName = (declaration as? KtNamedDeclaration)?.name ?: return emptyList()
+        val usages = linkedSetOf<PebbleUsageLocation>()
+        val declarationClassName = when (declaration) {
+            is KtClassOrObject -> declaration.name
+            is KtParameter -> if (declaration.hasValOrVar()) declaration.parents.filterIsInstance<KtClassOrObject>().firstOrNull()?.name else null
+            is KtProperty -> declaration.parents.filterIsInstance<KtClassOrObject>().firstOrNull()?.name
+            is KtNamedFunction -> declaration.parents.filterIsInstance<KtClassOrObject>().firstOrNull()?.name
+            else -> null
+        }
+
+        for ((templateUri, facts) in allTemplateFacts()) {
+            for (ref in facts.variableReferences) {
+                val resolvedRoot = resolveVariableForRoot(templateUri, ref.segments.firstOrNull() ?: continue) ?: continue
+
+                if (declarationLocation != null && resolvedRoot.producerLocation == declarationLocation) {
+                    usages.add(PebbleUsageLocation(templateUri, ref.range.startLine, ref.range.startColumn))
+                }
+
+                if (declarationClassName != null && normalizedTypeName(resolvedRoot.producerType) == declarationClassName) {
+                    when (declaration) {
+                        is KtClassOrObject -> usages.add(PebbleUsageLocation(templateUri, ref.range.startLine, ref.range.startColumn))
+                        is KtParameter -> if (declaration.hasValOrVar()) {
+                            val idx = ref.segments.indexOf(declarationName)
+                            if (idx > 0) usages.add(PebbleUsageLocation(templateUri, ref.range.startLine, segmentStartColumn(ref, idx)))
+                        }
+                        is KtProperty, is KtNamedFunction -> {
+                            val idx = ref.segments.indexOf(declarationName)
+                            if (idx > 0) usages.add(PebbleUsageLocation(templateUri, ref.range.startLine, segmentStartColumn(ref, idx)))
+                        }
+                    }
+                }
+            }
+        }
+
+        return usages.sortedWith(compareBy<PebbleUsageLocation>({ it.uri }, { it.line }, { it.column }))
+    }
+
+    private fun allTemplateFacts(): Sequence<Pair<String, PebbleTemplateFacts>> =
+        templateIndex.allFacts().toSortedMap().asSequence().map { it.key to it.value }
 
     private fun indexFile(uri: String, ktFile: KtFile) {
         val functions = PsiTreeUtil.collectElementsOfType(ktFile, KtNamedFunction::class.java)
@@ -197,6 +271,141 @@ internal class PebbleSpringIndex(
         else -> null
     }
 
+    private fun resolveVariableForRoot(uri: String, rootName: String): PebbleResolvedVariable? {
+        modelFactsByTemplateAndName[uri to rootName]
+            ?.sortedWith(compareBy<SpringModelAttributeFact>({ it.producerLocation.uri }, { it.producerLocation.line }, { it.producerLocation.column }))
+            ?.firstOrNull()
+            ?.let { return PebbleResolvedVariable(it.producerLocation, it.producerType) }
+
+        templateIndex.facts(uri)
+            ?.variableHints
+            ?.firstOrNull { it.name == rootName }
+            ?.let { return PebbleResolvedVariable(producerLocation = null, producerType = it.type) }
+
+        val alias = templateIndex.facts(uri)
+            ?.forLoopAliases
+            ?.firstOrNull { it.alias == rootName }
+            ?: return null
+        val sourceResolved = resolveVariableType(uri, alias.sourceSegments) ?: return null
+        val elementType = collectionElementType(sourceResolved) ?: return null
+        val sourceRoot = resolveVariableForRoot(uri, alias.sourceSegments.first())
+        return PebbleResolvedVariable(
+            producerLocation = sourceRoot?.producerLocation,
+            producerType = elementType,
+        )
+    }
+
+    private fun resolveVariableType(uri: String, segments: List<String>): String? {
+        if (segments.isEmpty()) return null
+        var currentType = resolveVariableForRoot(uri, segments.first())?.producerType ?: return null
+        for (segment in segments.drop(1)) {
+            currentType = resolveMemberType(currentType, segment) ?: return null
+        }
+        return currentType
+    }
+
+    private fun collectionElementType(typeName: String): String? {
+        val normalized = typeName.removeSuffix("?").trim()
+        if (normalized.startsWith("Array<") && normalized.endsWith(">")) {
+            return normalized.substringAfter('<').substringBeforeLast('>').trim()
+        }
+        val genericBase = normalized.substringBefore('<').substringAfterLast('.')
+        if (genericBase !in COLLECTION_TYPE_NAMES) return null
+        return normalized.substringAfter('<').substringBeforeLast('>', missingDelimiterValue = "").trim().ifEmpty { null }
+    }
+
+    private fun resolveMemberType(typeName: String, memberName: String): String? {
+        val targetClass = findClass(typeName) ?: return null
+
+        targetClass.primaryConstructorParameters
+            .firstOrNull { it.hasValOrVar() && it.name == memberName }
+            ?.typeReference
+            ?.text
+            ?.let { return it }
+
+        targetClass.declarations
+            .filterIsInstance<KtProperty>()
+            .firstOrNull { it.name == memberName }
+            ?.typeReference
+            ?.text
+            ?.let { return it }
+
+        targetClass.declarations
+            .filterIsInstance<KtNamedFunction>()
+            .firstOrNull { it.name == memberName }
+            ?.typeReference
+            ?.text
+            ?.let { return it }
+
+        return null
+    }
+
+    private fun resolveTypeLocation(typeName: String): KotlinSourceLocation? {
+        val targetClass = findClass(typeName) ?: return null
+        val targetUri = kotlinFilesByUri.entries.firstOrNull { (_, file) -> file == targetClass.containingKtFile }?.key ?: return null
+        return targetClass.toSourceLocation(targetUri)
+    }
+
+    private fun resolveMemberLocation(typeName: String, memberName: String): KotlinSourceLocation? {
+        val targetClass = findClass(typeName) ?: return null
+        val targetUri = kotlinFilesByUri.entries.firstOrNull { (_, file) -> file == targetClass.containingKtFile }?.key ?: return null
+
+        targetClass.primaryConstructorParameters
+            .firstOrNull { it.hasValOrVar() && it.name == memberName }
+            ?.toSourceLocation(targetUri)
+            ?.let { return it }
+
+        targetClass.declarations
+            .filterIsInstance<KtProperty>()
+            .firstOrNull { it.name == memberName }
+            ?.toSourceLocation(targetUri)
+            ?.let { return it }
+
+        targetClass.declarations
+            .filterIsInstance<KtNamedFunction>()
+            .firstOrNull { it.name == memberName }
+            ?.toSourceLocation(targetUri)
+            ?.let { return it }
+
+        return null
+    }
+
+    private fun findClass(typeName: String): KtClassOrObject? {
+        val normalizedTypeName = normalizedTypeName(typeName)
+        for ((_, ktFile) in kotlinFilesByUri) {
+            val classes = PsiTreeUtil.collectElementsOfType(ktFile, KtClassOrObject::class.java)
+            val targetClass = classes.firstOrNull { it.name == normalizedTypeName }
+            if (targetClass != null) return targetClass
+        }
+        return null
+    }
+
+    private fun normalizedTypeName(typeName: String?): String? = typeName
+        ?.substringBefore('<')
+        ?.removeSuffix("?")
+        ?.substringAfterLast('.')
+        ?.trim()
+        ?.ifEmpty { null }
+
+    private fun segmentIndexAt(variable: PebbleVariableReference, character: Int): Int? {
+        var column = variable.range.startColumn
+        variable.segments.forEachIndexed { index, segment ->
+            val start = column
+            val end = start + segment.length
+            if (character in start until end) return index
+            column = end + 1
+        }
+        return null
+    }
+
+    private fun segmentStartColumn(variable: PebbleVariableReference, segmentIndex: Int): Int {
+        var column = variable.range.startColumn
+        repeat(segmentIndex) { index ->
+            column += variable.segments[index].length + 1
+        }
+        return column
+    }
+
     private fun PsiElement.toSourceLocation(uri: String): KotlinSourceLocation? {
         val containingKtFile = containingFile as? KtFile ?: return null
         val range = toRange(containingKtFile) ?: return null
@@ -208,5 +417,19 @@ internal class PebbleSpringIndex(
         if (text.isEmpty()) return null
         val lineIndex = PebbleLineIndex(text)
         return lineIndex.range(textRange.startOffset, textRange.endOffset)
+    }
+
+    private companion object {
+        val COLLECTION_TYPE_NAMES = setOf(
+            "Array",
+            "Collection",
+            "Iterable",
+            "List",
+            "MutableCollection",
+            "MutableIterable",
+            "MutableList",
+            "MutableSet",
+            "Set",
+        )
     }
 }

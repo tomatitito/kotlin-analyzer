@@ -39,6 +39,26 @@ class PebbleTemplateIndexTest {
     }
 
     @Test
+    fun `parser captures pebvariable hints, for-loop aliases, and method-call segments`() {
+        val parser = PebbleTemplateParser()
+        val facts = parser.parse(
+            uri = "file:///workspace/src/main/resources/templates/outfits/carousel.peb",
+            text = """
+                {# @pebvariable name="farbartikel" type="fixture.Farbartikel" #}
+                {% for outfit in outfits %}
+                {{ outfit.path }}
+                {{ farbartikel.marke() }}
+                {% endfor %}
+            """.trimIndent(),
+        )
+
+        assertEquals(listOf(PebbleVariableHint("farbartikel", "fixture.Farbartikel")), facts.variableHints)
+        assertEquals(listOf(PebbleForLoopAlias("outfit", listOf("outfits"))), facts.forLoopAliases)
+        assertEquals(listOf("outfit", "path"), facts.variableReferences[0].segments)
+        assertEquals(listOf("farbartikel", "marke"), facts.variableReferences[1].segments)
+    }
+
+    @Test
     fun `index resolves template definition using template aliases`() {
         val index = PebbleTemplateIndex()
         val baseUri = "file:///workspace/src/main/resources/templates/layouts/base.peb"

@@ -402,14 +402,14 @@ class CompilerBridge {
             location.addProperty("column", 0)
             locationsArray.add(location)
         } else {
-            val producer = pebbleSpringIndex.definitionForPebbleVariableRoot(uri, line, character)
-            if (producer != null) {
+            val symbolLocation = pebbleSpringIndex.definitionForPebbleSymbol(uri, line, character)
+            if (symbolLocation != null) {
                 val location = JsonObject()
-                location.addProperty("uri", producer.producerLocation.uri)
-                location.addProperty("line", producer.producerLocation.line)
-                location.addProperty("column", producer.producerLocation.column)
-                if (producer.producerType != null) {
-                    location.addProperty("type", producer.producerType)
+                location.addProperty("uri", symbolLocation.uri)
+                location.addProperty("line", symbolLocation.line)
+                location.addProperty("column", symbolLocation.column)
+                pebbleSpringIndex.producerTypeForPebbleVariableRoot(uri, line, character)?.let {
+                    location.addProperty("type", it)
                 }
                 locationsArray.add(location)
             }
@@ -1177,29 +1177,33 @@ class CompilerBridge {
         }
 
         try {
+            ensurePebbleSpringIndexCurrent()
+
             // Step 1: Find the target declaration in the current file and extract its identity
             var targetName: String? = null
             var targetFilePath: String? = null
             var targetOffset: Int? = null
+            var targetDeclaration: PsiElement? = null
 
             analyze(ktFile) {
                 val offset = lineColToOffset(ktFile, line, character) ?: return@analyze
                 val element = ktFile.findElementAt(offset) ?: return@analyze
-                val targetDeclaration = findTargetDeclaration(element) ?: return@analyze
+                targetDeclaration = findTargetDeclaration(element) ?: return@analyze
 
                 // Extract identity: the declaration's name, containing file, and offset
                 targetName = (targetDeclaration as? KtNamedDeclaration)?.name
-                    ?: targetDeclaration.text?.take(50)
-                val containingFile = targetDeclaration.containingFile as? KtFile
+                    ?: targetDeclaration?.text?.take(50)
+                val containingFile = targetDeclaration?.containingFile as? KtFile
                 targetFilePath = containingFile?.virtualFile?.path
-                targetOffset = targetDeclaration.textOffset
+                targetOffset = targetDeclaration?.textOffset
 
                 // Also add the declaration itself as a reference location
+                val resolvedDeclaration = targetDeclaration ?: return@analyze
                 val declDocument = containingFile?.viewProvider?.document
                 if (declDocument != null) {
-                    val declLine = declDocument.getLineNumber(targetDeclaration.textOffset) + 1
-                    val declLineStart = declDocument.getLineStartOffset(declDocument.getLineNumber(targetDeclaration.textOffset))
-                    val declCol = targetDeclaration.textOffset - declLineStart
+                    val declLine = declDocument.getLineNumber(resolvedDeclaration.textOffset) + 1
+                    val declLineStart = declDocument.getLineStartOffset(declDocument.getLineNumber(resolvedDeclaration.textOffset))
+                    val declCol = resolvedDeclaration.textOffset - declLineStart
                     val declLoc = JsonObject()
                     declLoc.addProperty("uri", "file://${containingFile.virtualFile.path}")
                     declLoc.addProperty("line", declLine)
@@ -1263,6 +1267,26 @@ class CompilerBridge {
                     }
                 } catch (_: Exception) {
                     // Skip files that fail to analyze
+                }
+            }
+
+            targetDeclaration?.let { declaration ->
+                val declarationKtFile = declaration.containingFile as? KtFile
+                val declarationUri = declarationKtFile?.virtualFile?.path?.let { "file://$it" } ?: uri
+                for (usage in pebbleSpringIndex.pebbleUsagesForDeclaration(declaration, declarationUri)) {
+                    val isDup = (0 until locationsArray.size()).any { i ->
+                        val existing = locationsArray[i].asJsonObject
+                        existing.get("uri")?.asString == usage.uri &&
+                            existing.get("line")?.asInt == usage.line &&
+                            existing.get("column")?.asInt == usage.column
+                    }
+                    if (!isDup) {
+                        val loc = JsonObject()
+                        loc.addProperty("uri", usage.uri)
+                        loc.addProperty("line", usage.line)
+                        loc.addProperty("column", usage.column)
+                        locationsArray.add(loc)
+                    }
                 }
             }
         } catch (e: Throwable) {

@@ -41,10 +41,22 @@ internal data class PebbleVariableReference(
     val range: PebbleRange,
 )
 
+internal data class PebbleVariableHint(
+    val name: String,
+    val type: String,
+)
+
+internal data class PebbleForLoopAlias(
+    val alias: String,
+    val sourceSegments: List<String>,
+)
+
 internal data class PebbleTemplateFacts(
     val uri: String,
     val templateReferences: List<PebbleTemplateReference>,
     val variableReferences: List<PebbleVariableReference>,
+    val variableHints: List<PebbleVariableHint>,
+    val forLoopAliases: List<PebbleForLoopAlias>,
 )
 
 internal class PebbleLineIndex(text: String) {
@@ -91,7 +103,16 @@ internal class PebbleTemplateParser {
     private val templateDirectivePattern =
         Regex("""\{%\s*(include|extends|import)\s+(['"])([^'"]+)\2""")
     private val expressionBlockPattern = Regex("""\{\{.*?}}""", setOf(RegexOption.DOT_MATCHES_ALL))
-    private val variableChainPattern = Regex("""\b([A-Za-z_][A-Za-z0-9_]*)(\.[A-Za-z_][A-Za-z0-9_]*)*\b""")
+    private val variableChainPattern = Regex(
+        """\b([A-Za-z_][A-Za-z0-9_]*)(\.(?:[A-Za-z_][A-Za-z0-9_]*)(?:\(\))?)*\b(?:\(\))?"""
+    )
+    private val pebVariablePattern = Regex("""\{#\s*@pebvariable\b(.*?)#}""", setOf(RegexOption.DOT_MATCHES_ALL))
+    private val pebVariableAttributePattern = Regex(
+        """\b(name|type)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s#}]+))"""
+    )
+    private val forLoopPattern = Regex(
+        """\{%\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*(?:\(\))?)*)\s*%}"""
+    )
 
     fun parse(uri: String, text: String): PebbleTemplateFacts {
         val lines = PebbleLineIndex(text)
@@ -113,7 +134,10 @@ internal class PebbleTemplateParser {
 
         val variableReferences = expressionBlockPattern.findAll(text).flatMap { block ->
             variableChainPattern.findAll(block.value).mapNotNull { chain ->
-                val segments = chain.value.split('.')
+                val segments = chain.value
+                    .split('.')
+                    .map { it.removeSuffix("()").trim() }
+                    .filter { it.isNotEmpty() }
                 val root = segments.firstOrNull() ?: return@mapNotNull null
                 if (root in RESERVED_WORDS) return@mapNotNull null
                 val start = block.range.first + chain.range.first
@@ -126,10 +150,36 @@ internal class PebbleTemplateParser {
             }
         }.toList()
 
+        val variableHints = pebVariablePattern.findAll(text).mapNotNull { match ->
+            val attributes = linkedMapOf<String, String>()
+            for (attributeMatch in pebVariableAttributePattern.findAll(match.groupValues[1])) {
+                val value = attributeMatch.groups[2]?.value
+                    ?: attributeMatch.groups[3]?.value
+                    ?: attributeMatch.groups[4]?.value
+                    ?: continue
+                attributes[attributeMatch.groupValues[1]] = value
+            }
+            val name = attributes["name"] ?: return@mapNotNull null
+            val type = attributes["type"] ?: return@mapNotNull null
+            PebbleVariableHint(name = name, type = type)
+        }.toList()
+
+        val forLoopAliases = forLoopPattern.findAll(text).mapNotNull { match ->
+            val alias = match.groupValues[1].trim()
+            val sourceSegments = match.groupValues[2]
+                .split('.')
+                .map { it.removeSuffix("()").trim() }
+                .filter { it.isNotEmpty() }
+            if (alias.isEmpty() || sourceSegments.isEmpty()) return@mapNotNull null
+            PebbleForLoopAlias(alias = alias, sourceSegments = sourceSegments)
+        }.toList()
+
         return PebbleTemplateFacts(
             uri = uri,
             templateReferences = templateReferences,
             variableReferences = variableReferences,
+            variableHints = variableHints,
+            forLoopAliases = forLoopAliases,
         )
     }
 
@@ -227,6 +277,8 @@ internal class PebbleTemplateIndex(
             ?.firstOrNull { it.range.contains(line, character) }
 
     fun facts(uri: String): PebbleTemplateFacts? = factsByUri[uri]
+
+    fun allFacts(): Map<String, PebbleTemplateFacts> = factsByUri.toMap()
 
     fun resolveTemplateName(sourceUri: String, targetTemplate: String): String? =
         resolveTemplate(sourceUri, targetTemplate)

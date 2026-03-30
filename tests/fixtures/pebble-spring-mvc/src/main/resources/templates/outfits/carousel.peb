@@ -1,0 +1,6 @@
+{# @pebvariable name="farbartikel" type="fixture.Farbartikel" #}
+{% for outfit in outfits %}
+{{ outfit.path }}
+{{ outfit.relativePath }}
+{% endfor %}
+{{ farbartikel.marke() }}

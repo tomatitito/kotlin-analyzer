@@ -9,6 +9,11 @@ class ModelAndView(val viewName: String) {
 }
 
 data class User(val name: String)
+data class Outfit(val path: String, val relativePath: String)
+
+data class Farbartikel(val brand: String) {
+    fun marke(): String = brand
+}
 
 class UsersController {
     fun detail(model: Model): String {
@@ -28,5 +33,13 @@ class UsersController {
         val user = User("Eve")
         model.addAttribute("user", user)
         return "users/$suffix"
+    }
+
+    fun outfits(model: Model): String {
+        val outfits: List<Outfit> = listOf(
+            Outfit("/hero.jpg", "hero.jpg"),
+        )
+        model.addAttribute("outfits", outfits)
+        return "outfits/carousel"
     }
 }
