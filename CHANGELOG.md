@@ -4,6 +4,18 @@ All notable changes to kotlin-analyzer will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-03-30
+
+### Added
+
+- Sidecar `PebbleSpringIndex` for conservative Spring MVC view-to-template and model-attribute indexing.
+- Fixture-backed tests for Kotlin `return "..."`, `ModelAndView("...")`, and Pebble root-variable definition resolution.
+
+### Fixed
+
+- Kotlin Spring view names now resolve to Pebble templates stored under conventional roots and frontend-specific roots such as `src/frontend/templates` and `build/frontend/templates`.
+- Pebble `Go to Definition` on root variables like `user` now navigates to indexed Kotlin producers from `model.addAttribute(...)` and `ModelAndView.addObject(...)`.
+
 ## [0.4.0] - 2026-03-29
 
 ### Added

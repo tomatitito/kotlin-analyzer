@@ -50,7 +50,9 @@ class CompilerBridge {
     private val virtualFiles = mutableMapOf<String, String>() // uri -> content
     private val pebbleDocuments = PebbleDocumentStore()
     private val pebbleIndex = PebbleTemplateIndex()
+    private val pebbleSpringIndex = PebbleSpringIndex(pebbleIndex)
     private val symbolIndex = SymbolIndex()
+    private var pebbleSpringIndexDirty = true
 
     // Temp directory for virtual files so FIR can discover them as source root files
     private var virtualFileTempDir: Path? = null
@@ -289,6 +291,8 @@ class CompilerBridge {
         // Build the symbol index from all discovered files
         symbolIndex.rebuildFromSession(session!!)
         System.err.println("CompilerBridge: symbol index built with ${symbolIndex.size()} declarations")
+
+        pebbleSpringIndexDirty = true
     }
 
     /**
@@ -297,6 +301,7 @@ class CompilerBridge {
     fun updateFile(uri: String, text: String) {
         virtualFiles[uri] = text
         updateFileInSession(uri, text)
+        pebbleSpringIndexDirty = true
 
         // Detect on-disk file edits: the session's FIR caches are baked in at creation
         // time, so when an on-disk file's content changes, the session must be rebuilt
@@ -361,6 +366,7 @@ class CompilerBridge {
     fun removeFile(uri: String) {
         virtualFiles.remove(uri)
         symbolIndex.removeFile(uri)
+        pebbleSpringIndexDirty = true
         if (uri in dirtyOnDiskFiles) {
             dirtyOnDiskFiles.remove(uri)
             sessionDirty = true
@@ -374,14 +380,18 @@ class CompilerBridge {
     fun updatePebbleFile(uri: String, text: String) {
         pebbleDocuments.put(uri, text)
         pebbleIndex.update(uri, text)
+        pebbleSpringIndexDirty = true
     }
 
     fun removePebbleFile(uri: String) {
         pebbleDocuments.remove(uri)
         pebbleIndex.remove(uri)
+        pebbleSpringIndexDirty = true
     }
 
     fun pebbleDefinition(uri: String, line: Int, character: Int): JsonObject {
+        ensurePebbleSpringIndexCurrent()
+
         val result = JsonObject()
         val locationsArray = JsonArray()
         val targetUri = pebbleIndex.definition(uri, line, character)
@@ -391,6 +401,18 @@ class CompilerBridge {
             location.addProperty("line", 1)
             location.addProperty("column", 0)
             locationsArray.add(location)
+        } else {
+            val producer = pebbleSpringIndex.definitionForPebbleVariableRoot(uri, line, character)
+            if (producer != null) {
+                val location = JsonObject()
+                location.addProperty("uri", producer.producerLocation.uri)
+                location.addProperty("line", producer.producerLocation.line)
+                location.addProperty("column", producer.producerLocation.column)
+                if (producer.producerType != null) {
+                    location.addProperty("type", producer.producerType)
+                }
+                locationsArray.add(location)
+            }
         }
         result.add("locations", locationsArray)
         return result
@@ -418,6 +440,28 @@ class CompilerBridge {
         if (!sessionDirty || session == null) return
         System.err.println("CompilerBridge: session dirty, rebuilding to pick up virtual file changes")
         initialize(initProjectRoot, initClasspath, initCompilerFlags, initJdkHome, initSourceRoots)
+    }
+
+    private fun ensurePebbleSpringIndexCurrent() {
+        if (!pebbleSpringIndexDirty) return
+        ensureSessionCurrent()
+        val currentSession = session ?: return
+        val kotlinFiles = linkedMapOf<String, KtFile>()
+        for ((_, files) in currentSession.modulesWithFiles) {
+            for (ktFile in files.filterIsInstance<KtFile>()) {
+                kotlinFiles["file://${ktFile.virtualFile.path}"] = ktFile
+            }
+        }
+        for ((uri, text) in virtualFiles) {
+            try {
+                val psiFactory = KtPsiFactory(currentSession.project)
+                kotlinFiles[uri] = psiFactory.createFile(uriToPath(uri).substringAfterLast('/'), text)
+            } catch (e: Exception) {
+                System.err.println("CompilerBridge: failed to create PSI for spring index file $uri: ${e.message}")
+            }
+        }
+        pebbleSpringIndex.rebuild(kotlinFiles)
+        pebbleSpringIndexDirty = false
     }
 
     /**
@@ -856,9 +900,21 @@ class CompilerBridge {
      */
     fun definition(uri: String, line: Int, character: Int): JsonObject {
         ensureSessionCurrent()
+        ensurePebbleSpringIndexCurrent()
         val result = JsonObject()
         val locationsArray = JsonArray()
         val perfStart = System.currentTimeMillis()
+
+        val springTemplateUri = pebbleSpringIndex.definitionForKotlinView(uri, line, character)
+        if (springTemplateUri != null) {
+            val location = JsonObject()
+            location.addProperty("uri", springTemplateUri)
+            location.addProperty("line", 1)
+            location.addProperty("column", 0)
+            locationsArray.add(location)
+            result.add("locations", locationsArray)
+            return result
+        }
 
         val currentSession = session ?: run {
             result.add("locations", locationsArray)
@@ -3179,6 +3235,7 @@ class CompilerBridge {
      * Shuts down the Analysis API session.
      */
     fun shutdown() {
+        pebbleSpringIndexDirty = true
         session = null
         Disposer.dispose(disposable)
         // Clean up virtual file temp directory

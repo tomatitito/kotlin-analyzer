@@ -118,6 +118,27 @@ class PebbleTemplateIndexTest {
     }
 
     @Test
+    fun `definition resolves spring view names against src frontend templates root`() {
+        val tempDir = Files.createTempDirectory("pebble-index-frontend-root-test")
+        val projectDir = tempDir.resolve("project")
+        val sourceDir = projectDir.resolve("src/main/kotlin")
+        val templatesDir = projectDir.resolve("src/frontend/templates/outfits")
+        Files.createDirectories(sourceDir)
+        Files.createDirectories(templatesDir)
+
+        val kotlinPath = sourceDir.resolve("RenderOutfitController.kt")
+        val templatePath = templatesDir.resolve("carousel.peb")
+        kotlinPath.writeText("class RenderOutfitController")
+        templatePath.writeText("template")
+
+        val index = PebbleTemplateIndex()
+        assertEquals(
+            templatePath.toUri().toString(),
+            index.resolveTemplateName(kotlinPath.toUri().toString(), "outfits/carousel")
+        )
+    }
+
+    @Test
     fun `compiler bridge exposes pebble definition and references as json locations`() {
         val bridge = CompilerBridge()
         val baseUri = "file:///workspace/src/main/resources/templates/layouts/base.peb"

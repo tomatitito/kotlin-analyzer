@@ -228,6 +228,9 @@ internal class PebbleTemplateIndex(
 
     fun facts(uri: String): PebbleTemplateFacts? = factsByUri[uri]
 
+    fun resolveTemplateName(sourceUri: String, targetTemplate: String): String? =
+        resolveTemplate(sourceUri, targetTemplate)
+
     private fun rebuild() {
         factsByUri.clear()
         aliasesToUris.clear()
@@ -296,7 +299,19 @@ internal class PebbleTemplateIndex(
                 roots.add(normalized.root?.resolve(normalized.subpath(0, index + 1)) ?: normalized.subpath(0, index + 1))
             }
         }
-        return roots.toList()
+
+        var current = normalized.parent
+        while (current != null) {
+            roots.add(current.resolve("src/main/resources/templates"))
+            roots.add(current.resolve("src/main/resources/views"))
+            roots.add(current.resolve("src/frontend/templates"))
+            roots.add(current.resolve("build/frontend/templates"))
+            roots.add(current.resolve("templates"))
+            roots.add(current.resolve("views"))
+            current = current.parent
+        }
+
+        return roots.filter { Files.isDirectory(it) }
     }
 
     private fun uriToPath(uri: String): Path? = try {

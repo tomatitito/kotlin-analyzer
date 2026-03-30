@@ -1,6 +1,6 @@
 id = "kotlin-analyzer"
 name = "Kotlin Analyzer"
-version = "0.4.1"
+version = "0.4.2"
 schema_version = 1
 authors = ["Jens Kouros <jens.kouros@posteo.de>"]
 description = "Kotlin language support with Analysis API-backed language server."
