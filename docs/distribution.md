@@ -155,17 +155,20 @@ The extension is published as a Git repository to the Zed extension registry. Ze
 
 ## 5. CI/CD Pipeline
 
-### GitHub Actions Workflow
+### GitHub Actions Workflows
 
-A single workflow handles both continuous integration and releases.
+Release automation is split across two workflows:
+
+- `ci.yml` runs on pull requests and pushes to `main`.
+- `release.yml` runs on pushes to `main` and automatically publishes a release when `VERSION` refers to an unreleased version.
 
 #### Triggers
 
-| Trigger | Action |
-|---------|--------|
-| Push to `main` | Build + test all platforms, no release |
-| Pull request | Build + test all platforms, no release |
-| Tag push (`v*`) | Build + test + create GitHub release with archives |
+| Workflow | Trigger | Action |
+|---------|---------|--------|
+| `ci.yml` | Push to `main` | Build, test, and verify version sync on all platforms |
+| `ci.yml` | Pull request | Build, test, and verify version sync on all platforms |
+| `release.yml` | Push to `main` | Detect unreleased `VERSION`, create tag `v<VERSION>`, build archives, and publish a GitHub release |
 
 #### Build Matrix
 
@@ -179,15 +182,24 @@ strategy:
         os: ubuntu-latest
 ```
 
-#### Build Steps
+#### CI Build Steps
 
 1. **Checkout** repository
-2. **Install Rust** toolchain with target triple
-3. **Build Rust binary** (`cargo build --release --target $TARGET`)
-4. **Build sidecar runtimes** (`./gradlew :sidecar:assembleRuntimePayloads`) — once, on any runner
-5. **Run tests** (`cargo test`, `./gradlew :sidecar:test`)
-6. **Package archive** — combine Rust binary + `sidecar-runtimes/` into `.tar.gz`
-7. **Upload artifact** — attach to GitHub Actions run (for CI) or GitHub release (for tags)
+2. **Verify version sync** (`./scripts/check-version-sync.sh`)
+3. **Install Rust** toolchain with target triple
+4. **Build and test extension/server** (`cargo build`, `cargo test --manifest-path server/Cargo.toml`)
+5. **Build sidecar runtimes** (`cd sidecar && ./gradlew assembleRuntimePayloads`)
+6. **Run sidecar tests** (`cd sidecar && ./gradlew test`)
+7. **Verify generated runtime manifests** (`./scripts/check-version-sync.sh --include-generated-runtime-manifests`)
+
+#### Release Build Steps
+
+On each push to `main`, the release workflow reads `VERSION` and checks whether tag `v<VERSION>` already exists.
+
+- If the tag already exists, the workflow exits successfully without publishing anything.
+- If the tag does not exist, the workflow creates and pushes `v<VERSION>` automatically, builds release archives, and publishes a GitHub release.
+
+Each release archive contains the server binary plus the full `sidecar-runtimes/` directory produced by `assembleRuntimePayloads`. The old `sidecar-all.jar` release layout is no longer shipped.
 
 The packaged `sidecar-runtimes/` directory remains the primary bundled source. The local runtime cache is populated lazily on user machines and is not packaged into release archives.
 
@@ -224,12 +236,53 @@ The `LICENSE` file in the repository root contains the full Apache 2.0 text. Eac
 
 ## 7. Version Management
 
-The Rust binary and sidecar runtimes share a single version number. This version is the source of truth and appears in:
+`VERSION` in the repository root is the single source of truth for the release version.
 
-- `Cargo.toml` (`version = "0.1.0"`)
-- `sidecar/build.gradle.kts` (`version = "0.1.0"`)
-- `extension.toml` (`version = "0.1.0"`)
-- GitHub release tag (`v0.1.0`)
-- Release archive filenames (`kotlin-analyzer-0.1.0-aarch64-apple-darwin.tar.gz`)
+### Synced files
 
-Each bundled sidecar runtime declares its Kotlin compiler version in its runtime manifest and in `sidecar/build.gradle.kts`. Adding or changing a bundled Kotlin line is a deliberate act that requires validation before the manifest marks that line as eligible for same-minor fallback.
+The release version is copied from `VERSION` into these derived files:
+
+- `Cargo.toml`
+- `server/Cargo.toml`
+- `sidecar/build.gradle.kts`
+- `extension.toml`
+- `sidecar/src/main/kotlin/dev/kouros/sidecar/Main.kt`
+- release tag (`v<VERSION>`)
+- release archive filenames (`kotlin-analyzer-<VERSION>-<target>.tar.gz`)
+- generated sidecar runtime manifests (`analyzerVersion`)
+
+### Local version bump
+
+To update the project version locally, run:
+
+```bash
+./scripts/set-version.sh 0.5.0
+```
+
+That command updates `VERSION` and all tracked derived metadata in one step.
+
+The shell wrapper delegates to the Rust helper at `tools/version-sync/`, so version sync logic lives in Rust rather than Python or Perl.
+
+### CI verification
+
+CI enforces version consistency with:
+
+```bash
+./scripts/check-version-sync.sh
+./scripts/check-version-sync.sh --include-generated-runtime-manifests
+```
+
+The second form is used after `cd sidecar && ./gradlew assembleRuntimePayloads` so the generated runtime manifests are also verified. This wrapper also delegates to `tools/version-sync/`.
+
+### Automatic releases from `main`
+
+Releases are no longer created by manually pushing a `v*` tag. Instead:
+
+1. bump `VERSION` with `scripts/set-version.sh`
+2. commit and merge the version change to `main`
+3. `release.yml` checks whether `v<VERSION>` already exists
+4. if not, the workflow creates the tag automatically and publishes the matching GitHub release
+
+This keeps the tag, archives, extension version, Rust crate version, and sidecar runtime metadata aligned to the same source version.
+
+Each bundled sidecar runtime still declares its Kotlin compiler version in its runtime manifest and in `sidecar/build.gradle.kts`. Adding or changing a bundled Kotlin line is a deliberate act that requires validation before the manifest marks that line as eligible for same-minor fallback.

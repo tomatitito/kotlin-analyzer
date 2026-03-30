@@ -1,0 +1,153 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare-release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_release: ${{ steps.release_check.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: git fetch --force --tags origin
+
+      - name: Verify version sync
+        run: ./scripts/check-version-sync.sh
+
+      - name: Read VERSION
+        id: version
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether release tag already exists
+        id: release_check
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "tag ${TAG} already exists; skipping release"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag ${TAG} does not exist; creating release"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push tag
+        if: steps.release_check.outputs.should_release == 'true'
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${TAG}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${TAG}"
+
+  build-release:
+    name: Build release (${{ matrix.target }})
+    needs: prepare-release
+    if: needs.prepare-release.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify version sync
+        run: ./scripts/check-version-sync.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Build sidecar runtime payloads
+        run: cd sidecar && ./gradlew assembleRuntimePayloads
+
+      - name: Verify generated runtime manifest versions
+        run: ./scripts/check-version-sync.sh --include-generated-runtime-manifests
+
+      - name: Build server binary (release)
+        run: cargo build --release --target ${{ matrix.target }} --manifest-path server/Cargo.toml
+
+      - name: Package release archive
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+          ARCHIVE_DIR="kotlin-analyzer-${VERSION}-${{ matrix.target }}"
+          mkdir -p "${ARCHIVE_DIR}/sidecar-runtimes"
+          cp "server/target/${{ matrix.target }}/release/kotlin-analyzer" "${ARCHIVE_DIR}/kotlin-analyzer"
+          cp -R sidecar/build/runtime/. "${ARCHIVE_DIR}/sidecar-runtimes/"
+          test -f "${ARCHIVE_DIR}/sidecar-runtimes/2.2.0-RC2/manifest.json"
+          tar -czf "${ARCHIVE_DIR}.tar.gz" "${ARCHIVE_DIR}"
+
+      - name: Verify archive naming
+        run: test -f "kotlin-analyzer-${{ needs.prepare-release.outputs.version }}-${{ matrix.target }}.tar.gz"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: kotlin-analyzer-${{ needs.prepare-release.outputs.version }}-${{ matrix.target }}.tar.gz
+
+  publish-release:
+    name: Publish GitHub release
+    needs: [prepare-release, build-release]
+    if: needs.prepare-release.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Download all release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Verify release assets exist
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+          test -f "kotlin-analyzer-${VERSION}-aarch64-apple-darwin.tar.gz"
+          test -f "kotlin-analyzer-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.prepare-release.outputs.tag }}" \
+            --title "${{ needs.prepare-release.outputs.tag }}" \
+            --generate-notes \
+            kotlin-analyzer-${{ needs.prepare-release.outputs.version }}-*.tar.gz

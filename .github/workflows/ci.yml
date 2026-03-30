@@ -3,7 +3,6 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -12,7 +11,7 @@ env:
 
 jobs:
   check:
-    name: Check & Test
+    name: Check & Test (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -23,6 +22,9 @@ jobs:
             os: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify version sync
+        run: ./scripts/check-version-sync.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -57,7 +59,6 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('sidecar/**/*.gradle.kts', 'sidecar/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: ${{ runner.os }}-gradle-
 
-      # Extension (WASM cdylib)
       - name: Check extension formatting
         run: cargo fmt --check
 
@@ -67,7 +68,6 @@ jobs:
       - name: Build extension
         run: cargo build
 
-      # LSP Server (native binary)
       - name: Check server formatting
         run: cargo fmt --check --manifest-path server/Cargo.toml
 
@@ -81,82 +81,11 @@ jobs:
       - name: Run server tests
         run: cargo test --manifest-path server/Cargo.toml
 
-      # JVM Sidecar
-      - name: Build sidecar JAR
-        run: cd sidecar && ./gradlew shadowJar
+      - name: Build sidecar runtime payloads
+        run: cd sidecar && ./gradlew assembleRuntimePayloads
 
       - name: Run sidecar tests
         run: cd sidecar && ./gradlew test
 
-  build-release:
-    name: Build Release (${{ matrix.target }})
-    needs: check
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Build sidecar fat JAR
-        run: cd sidecar && ./gradlew shadowJar
-
-      - name: Build server binary (release)
-        run: cargo build --release --target ${{ matrix.target }} --manifest-path server/Cargo.toml
-
-      - name: Package release archive
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          ARCHIVE_DIR="kotlin-analyzer-${VERSION}-${{ matrix.target }}"
-          mkdir -p "${ARCHIVE_DIR}"
-          cp "server/target/${{ matrix.target }}/release/kotlin-analyzer" "${ARCHIVE_DIR}/"
-          cp "sidecar/build/libs/sidecar-all.jar" "${ARCHIVE_DIR}/sidecar.jar"
-          tar -czf "${ARCHIVE_DIR}.tar.gz" "${ARCHIVE_DIR}"
-
-      - name: Upload release archive
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ matrix.target }}
-          path: "*.tar.gz"
-
-  release:
-    name: Create GitHub Release
-    needs: build-release
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all release archives
-        uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          merge-multiple: true
-
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --generate-notes \
-            *.tar.gz
+      - name: Verify generated runtime manifest versions
+        run: ./scripts/check-version-sync.sh --include-generated-runtime-manifests

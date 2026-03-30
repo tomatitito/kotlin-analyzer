@@ -7,7 +7,7 @@ package dev.kouros.sidecar
  * and writes JSON-RPC responses to stdout. All logging goes to stderr.
  */
 fun main(args: Array<String>) {
-    System.err.println("kotlin-analyzer sidecar v0.1.0 starting (Kotlin ${SidecarRuntime.kotlinVersion})")
+    System.err.println("kotlin-analyzer sidecar v0.4.0 starting (Kotlin ${SidecarRuntime.kotlinVersion})")
 
     val transport = JsonRpcTransport(
         input = System.`in`,

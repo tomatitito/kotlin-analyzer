@@ -129,6 +129,16 @@ tree-sitter highlight tests/fixtures/kotlin/correct/BasicConstructs.kt
 cargo build && (cd sidecar && ./gradlew assembleRuntimePayloads) && cargo test
 ```
 
+### Release/version sync
+
+```bash
+./scripts/set-version.sh 0.5.0
+./scripts/check-version-sync.sh
+./scripts/check-version-sync.sh --include-generated-runtime-manifests
+```
+
+These shell entrypoints delegate to the Rust helper under `tools/version-sync/`. `VERSION` is the single source of truth for release versioning.
+
 ## Zed CLI
 
 `zed` can be invoked from the command line to open files, directories, and diffs.
