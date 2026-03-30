@@ -13,6 +13,10 @@ The project also includes a Zed extension (Rust/WASM) that registers Kotlin lang
 | [LSP Protocol](lsp-protocol.md) | LSP framework choice, feature phases, bridge protocol schema, backpressure, cancellation, document sync, configuration |
 | [Distribution](distribution.md) | Cross-platform builds, JVM requirement, JAR bundling, Zed extension packaging, CI/CD pipeline |
 | [Testing](testing.md) | Unit, integration, end-to-end, and conformance testing strategy, test fixtures, CI pipeline |
+| [Development Commands](development-commands.md) | Build, test, smoke-test, release-sync, and local Zed extension setup commands |
+| [GitHub CLI](github-cli.md) | Preferred `gh` commands for PRs, issues, releases, CI, and repository automation |
+| [Zed CLI](zed-cli.md) | `zed` and `my-zed` command-line usage for local editor and language server debugging |
+| [Common Workflows](common-workflows.md) | Peekaboo-driven macOS UI automation flows for validating the Zed extension |
 | [Competitive Landscape](competitive-landscape.md) | JetBrains kotlin-lsp, fwcd LSP, positioning, differentiators, exit strategy |
 | [Risks](risks.md) | Risk register with likelihood, impact, mitigations, and milestone-based review schedule |
 

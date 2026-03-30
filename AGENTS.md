@@ -12,6 +12,10 @@ Read `docs/INDEX.md` for the full documentation index. Key references:
 | [docs/lsp-protocol.md](docs/lsp-protocol.md) | LSP framework choice, bridge protocol, request handling |
 | [docs/testing.md](docs/testing.md) | Test strategy, fixture format, CI pipeline |
 | [docs/distribution.md](docs/distribution.md) | Cross-platform builds, packaging, release process |
+| [docs/development-commands.md](docs/development-commands.md) | Build, test, smoke-test, release-sync, and local Zed extension setup commands |
+| [docs/github-cli.md](docs/github-cli.md) | Preferred `gh` commands for PRs, issues, releases, CI, and repository automation |
+| [docs/zed-cli.md](docs/zed-cli.md) | `zed`/`my-zed` command-line usage for editor and LS debugging |
+| [docs/common-workflows.md](docs/common-workflows.md) | Peekaboo-driven UI verification workflows |
 | [plans/active/v1-roadmap.md](plans/active/v1-roadmap.md) | Current roadmap with task checklists |
 
 ## Git
@@ -47,160 +51,16 @@ No module may depend on a module above it. In particular, `bridge` must not depe
 
 ## GitHub CLI (`gh`)
 
-Use `gh` for all interactions with the remote GitHub repository. Do not use raw `git push`, `curl` to the GitHub API, or the web UI for operations that `gh` supports.
-
-### Common operations
-
-```bash
-gh pr create --title "..." --body "..."    # open a pull request
-gh pr list                                 # list open PRs
-gh pr view 42                              # view PR details
-gh pr merge 42                             # merge a PR
-
-gh release create v0.1.0 *.tar.gz          # create a release with assets
-gh release list                            # list releases
-gh release view v0.1.0                     # view release details
-
-gh issue create --title "..." --body "..."  # file an issue
-gh issue list                              # list open issues
-gh issue view 17                           # view issue details
-
-gh run list                                # list CI workflow runs
-gh run view <run-id>                       # view a specific run
-gh run watch <run-id>                      # live-tail a running workflow
-
-gh repo view                               # show repo metadata
-gh api repos/{owner}/{repo}/...            # arbitrary GitHub API calls
-```
-
-### When to use
-
-- Creating and managing pull requests, issues, and releases
-- Checking CI status and workflow run logs
-- Uploading release artifacts
-- Any GitHub API interaction (prefer `gh api` over raw `curl`)
+Use `gh` for all remote GitHub interactions. See [docs/github-cli.md](docs/github-cli.md) for the command reference and usage guidance.
 
 ## Verification Commands
 
-### Rust LSP binary
-
-```bash
-cargo build                                # compile
-cargo test                                 # unit tests
-cargo test --features integration          # real sidecar integration tests
-cargo run -- --log-level debug             # run the server on stdin/stdout
-```
-
-### JVM sidecar
-
-```bash
-cd sidecar && ./gradlew assembleRuntimePayloads   # build launcher + versioned runtime payloads
-cd sidecar && ./gradlew test               # unit tests
-```
-
-### Zed extension
-
-```bash
-bash scripts/build-extension.sh            # build WASM component (wasip2) and copy to extension.wasm
-
-# symlink the extension into Zed's local extensions directory (macOS)
-ln -sfn "$(pwd)" ~/Library/Application\ Support/Zed/extensions/installed/kotlin-analyzer
-
-# symlink the server binary so the extension can find the built sidecar runtimes
-ln -sf "$(pwd)/server/target/debug/kotlin-analyzer" ~/.local/bin/kotlin-analyzer
-```
-
-After symlinking, rebuild and restart Zed to pick up changes. The symlinks only need to be created once.
-
-**Important**: The binary at `~/.local/bin/kotlin-analyzer` must be a symlink (not a copy) so that the server can resolve its path back to the source tree and find the versioned sidecar runtimes under `sidecar/build/runtime/`.
-
-**Trust**: This dev build of Zed (`my-zed`) requires worktree trust before starting language servers. If the LS doesn't start automatically, use `Cmd+Shift+P` → "Restart Language Server" to trigger it manually.
-
-### Tree-sitter queries
-
-```bash
-tree-sitter test                           # run query tests
-tree-sitter highlight tests/fixtures/kotlin/correct/BasicConstructs.kt
-```
-
-### Full smoke test
-
-```bash
-cargo build && (cd sidecar && ./gradlew assembleRuntimePayloads) && cargo test
-```
-
-### Release/version sync
-
-```bash
-./scripts/set-version.sh 0.5.0
-./scripts/check-version-sync.sh
-./scripts/check-version-sync.sh --include-generated-runtime-manifests
-```
-
-These shell entrypoints delegate to the Rust helper under `tools/version-sync/`. `VERSION` is the single source of truth for release versioning.
+See [docs/development-commands.md](docs/development-commands.md) for build, test, smoke-test, release-sync, and local Zed extension setup commands.
 
 ## Zed CLI
 
-`zed` can be invoked from the command line to open files, directories, and diffs.
+See [docs/zed-cli.md](docs/zed-cli.md) for `zed`/`my-zed` command-line usage.
 
-```
-zed [OPTIONS] [PATHS]...
-```
+## Common Workflows
 
-| Flag | Description |
-|------|-------------|
-| `-w, --wait` | Wait for all opened files to be closed before the CLI exits |
-| `-n, --new` | Open paths in a new workspace window |
-| `-a, --add` | Add paths to the currently focused workspace |
-| `-r, --reuse` | Reuse an existing window, replacing its current workspace |
-| `--diff <OLD> <NEW>` | Open a diff view comparing two files |
-| `--foreground` | Run Zed in the foreground, keeping the terminal attached |
-
-Files can be opened at a specific position with `zed file.txt:line:column`. Pass `-` as the path to read from stdin.
-
-### `my-zed` — Development Build
-
-For kotlin-analyzer development, use `my-zed` instead of `zed`. This is a custom Zed build that prints language server logs and JSON-RPC messages to the console, making it much easier to debug LSP interactions with the sidecar.
-
-```bash
-my-zed /path/to/kotlin/project    # opens project and streams LSP logs to the terminal
-```
-
-Always prefer `my-zed` when:
-- Debugging diagnostics, completions, hover, or go-to-definition behavior
-- Verifying end-to-end LSP communication (initialize, textDocument/*, shutdown)
-- Investigating sidecar startup, crash recovery, or classpath issues
-- Performing the visual verification tasks in the v1 roadmap
-
-## Peekaboo (macOS UI Automation)
-
-`peekaboo` is a CLI tool for controlling macOS applications. Use it to launch Zed, interact with its UI, and verify that the kotlin-analyzer extension behaves correctly during development.
-
-### Common workflows
-
-```bash
-# Launch Zed and open a Kotlin project
-peekaboo app --action launch --name Zed
-peekaboo open /path/to/kotlin/project
-
-# Capture a screenshot to inspect current UI state
-peekaboo see --app Zed --annotate
-
-# Interact with UI elements (use element IDs from `see` output)
-peekaboo click --on <element-id>
-peekaboo type "some text"
-peekaboo hotkey cmd+shift+p          # open command palette
-
-# List windows and check app state
-peekaboo list
-```
-
-### When to use
-
-- Verify LSP features (diagnostics, completions, hover) render correctly in Zed after building and installing the extension.
-- Debug UI-level issues by capturing annotated screenshots with `peekaboo see --annotate`.
-- Automate repetitive editor interactions during testing (open files, trigger completions, navigate diagnostics).
-
-### Reference
-
-Run `peekaboo --help` for all commands or `peekaboo learn` for the full AI agent guide.
+See [docs/common-workflows.md](docs/common-workflows.md) for Peekaboo-based Zed verification flows.
