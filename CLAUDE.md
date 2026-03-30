@@ -30,6 +30,8 @@ gpg.format=ssh
 commit.gpgsign=true
 ```
 
+Use normal Git commands for branch sync and commit transport, including `git push`, `git fetch`, and `git pull`.
+
 ## Architecture Constraints
 
 ### Dependency direction
@@ -51,7 +53,7 @@ No module may depend on a module above it. In particular, `bridge` must not depe
 
 ## GitHub CLI (`gh`)
 
-Use `gh` for all remote GitHub interactions. See [docs/github-cli.md](docs/github-cli.md) for the command reference and usage guidance.
+Use `gh` for GitHub platform operations like PRs, issues, releases, workflow runs, and repo metadata. Use `git push` for pushing commits and branches. See [docs/github-cli.md](docs/github-cli.md) for the command reference and usage guidance.
 
 ## Verification Commands
 

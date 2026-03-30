@@ -1,6 +1,6 @@
 # GitHub CLI (`gh`)
 
-Use `gh` for all interactions with the remote GitHub repository. Do not use raw `git push`, `curl` to the GitHub API, or the web UI for operations that `gh` supports.
+Use `gh` for GitHub platform operations such as pull requests, issues, releases, workflow runs, and repository metadata. Use normal `git push` / `git fetch` / `git pull` for Git branch and commit transport. Prefer `gh api` over raw `curl` when you need to call the GitHub API directly.
 
 ## Common operations
 
@@ -31,4 +31,9 @@ gh api repos/{owner}/{repo}/...            # arbitrary GitHub API calls
 - Creating and managing pull requests, issues, and releases
 - Checking CI status and workflow run logs
 - Uploading release artifacts
-- Any GitHub API interaction (prefer `gh api` over raw `curl`)
+- Querying repository metadata or calling the GitHub API
+
+## When not to use
+
+- Do not use `gh api` as a substitute for `git push`
+- Use normal Git commands for branch sync: `git push`, `git fetch`, `git pull`, `git rebase`, `git merge`
