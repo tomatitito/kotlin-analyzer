@@ -241,10 +241,7 @@ impl LspTestClient {
         self.initialize_with_root("file:///tmp/test-project")
     }
 
-    fn initialize_with_root(
-        &mut self,
-        root_uri: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn initialize_with_root(&mut self, root_uri: &str) -> Result<(), Box<dyn std::error::Error>> {
         let params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
@@ -501,9 +498,7 @@ fn test_sidecar_stays_alive() {
 #[test]
 fn test_pebble_template_definition_routes_through_pebble_bridge() {
     let workspace = tempdir().expect("failed to create temporary workspace");
-    let templates_dir = workspace
-        .path()
-        .join("src/main/resources/templates");
+    let templates_dir = workspace.path().join("src/main/resources/templates");
     std::fs::create_dir_all(templates_dir.join("layouts")).expect("failed to create layouts dir");
     std::fs::create_dir_all(templates_dir.join("macros")).expect("failed to create macros dir");
     std::fs::create_dir_all(templates_dir.join("partials")).expect("failed to create partials dir");
@@ -514,8 +509,13 @@ fn test_pebble_template_definition_routes_through_pebble_bridge() {
     let include_path = templates_dir.join("partials/details.peb");
     let page_path = templates_dir.join("users/detail.peb");
 
-    std::fs::write(&extends_path, "{% block content %}{% endblock %}\n").expect("failed to write base template");
-    std::fs::write(&import_path, "{% macro input(name, value) %}{{ value }}{% endmacro %}\n").expect("failed to write macro template");
+    std::fs::write(&extends_path, "{% block content %}{% endblock %}\n")
+        .expect("failed to write base template");
+    std::fs::write(
+        &import_path,
+        "{% macro input(name, value) %}{{ value }}{% endmacro %}\n",
+    )
+    .expect("failed to write macro template");
     std::fs::write(&include_path, "<p>details</p>\n").expect("failed to write partial template");
 
     let page_text = r#"{% extends "layouts/base.peb" %}
