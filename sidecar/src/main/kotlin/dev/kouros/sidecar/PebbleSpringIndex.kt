@@ -271,38 +271,70 @@ internal class PebbleSpringIndex(
         else -> null
     }
 
-    private fun resolveVariableForRoot(uri: String, rootName: String): PebbleResolvedVariable? {
-        modelFactsByTemplateAndName[uri to rootName]
-            ?.sortedWith(compareBy<SpringModelAttributeFact>({ it.producerLocation.uri }, { it.producerLocation.line }, { it.producerLocation.column }))
-            ?.firstOrNull()
-            ?.let { return PebbleResolvedVariable(it.producerLocation, it.producerType) }
+    private fun resolveVariableForRoot(
+        uri: String,
+        rootName: String,
+        visited: MutableSet<Pair<String, String>> = linkedSetOf(),
+    ): PebbleResolvedVariable? {
+        val key = uri to rootName
+        if (!visited.add(key)) return null
+        try {
+            modelFactsByTemplateAndName[uri to rootName]
+                ?.sortedWith(compareBy<SpringModelAttributeFact>({ it.producerLocation.uri }, { it.producerLocation.line }, { it.producerLocation.column }))
+                ?.firstOrNull()
+                ?.let { return PebbleResolvedVariable(it.producerLocation, it.producerType) }
 
-        templateIndex.facts(uri)
-            ?.variableHints
-            ?.firstOrNull { it.name == rootName }
-            ?.let { return PebbleResolvedVariable(producerLocation = null, producerType = it.type) }
+            templateIndex.facts(uri)
+                ?.variableHints
+                ?.firstOrNull { it.name == rootName }
+                ?.let { return PebbleResolvedVariable(producerLocation = null, producerType = it.type) }
 
-        val alias = templateIndex.facts(uri)
-            ?.forLoopAliases
-            ?.firstOrNull { it.alias == rootName }
-            ?: return null
-        val sourceResolved = resolveVariableType(uri, alias.sourceSegments) ?: return null
-        val elementType = collectionElementType(sourceResolved) ?: return null
-        val sourceRoot = resolveVariableForRoot(uri, alias.sourceSegments.first())
-        return PebbleResolvedVariable(
-            producerLocation = sourceRoot?.producerLocation,
-            producerType = elementType,
-        )
-    }
+            templateIndex.facts(uri)
+                ?.forLoopAliases
+                ?.firstOrNull { it.alias == rootName }
+                ?.let { alias ->
+                    val sourceResolved = resolveVariableForSegments(uri, alias.sourceSegments, visited) ?: return@let null
+                    val elementType = collectionElementType(sourceResolved.producerType ?: return@let null) ?: return@let null
+                    return PebbleResolvedVariable(
+                        producerLocation = sourceResolved.producerLocation,
+                        producerType = elementType,
+                    )
+                }
 
-    private fun resolveVariableType(uri: String, segments: List<String>): String? {
-        if (segments.isEmpty()) return null
-        var currentType = resolveVariableForRoot(uri, segments.first())?.producerType ?: return null
-        for (segment in segments.drop(1)) {
-            currentType = resolveMemberType(currentType, segment) ?: return null
+            templateIndex.incomingIncludeBindings(uri)
+                .asSequence()
+                .filter { it.targetVariableName == rootName }
+                .mapNotNull { binding -> resolveVariableForSegments(binding.sourceTemplateUri, binding.sourceSegments, visited) }
+                .firstOrNull()
+                ?.let { return it }
+
+            return null
+        } finally {
+            visited.remove(key)
         }
-        return currentType
     }
+
+    private fun resolveVariableForSegments(
+        uri: String,
+        segments: List<String>,
+        visited: MutableSet<Pair<String, String>> = linkedSetOf(),
+    ): PebbleResolvedVariable? {
+        if (segments.isEmpty()) return null
+        var resolved = resolveVariableForRoot(uri, segments.first(), visited) ?: return null
+        for (segment in segments.drop(1)) {
+            val ownerType = resolved.producerType ?: return null
+            val memberType = resolveMemberType(ownerType, segment) ?: return null
+            val memberLocation = resolveMemberLocation(ownerType, segment)
+            resolved = PebbleResolvedVariable(
+                producerLocation = memberLocation ?: resolved.producerLocation,
+                producerType = memberType,
+            )
+        }
+        return resolved
+    }
+
+    private fun resolveVariableType(uri: String, segments: List<String>): String? =
+        resolveVariableForSegments(uri, segments)?.producerType
 
     private fun collectionElementType(typeName: String): String? {
         val normalized = typeName.removeSuffix("?").trim()

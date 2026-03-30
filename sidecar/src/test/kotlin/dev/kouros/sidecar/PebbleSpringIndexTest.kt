@@ -14,6 +14,10 @@ class PebbleSpringIndexTest {
     private lateinit var detailTemplateUri: String
     private lateinit var summaryTemplateUri: String
     private lateinit var carouselTemplateUri: String
+    private lateinit var includeParentTemplateUri: String
+    private lateinit var includeChildTemplateUri: String
+    private lateinit var includeUnsupportedParentTemplateUri: String
+    private lateinit var includeUnsupportedChildTemplateUri: String
 
     @BeforeEach
     fun setUp() {
@@ -31,10 +35,24 @@ class PebbleSpringIndexTest {
         detailTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/users/detail.peb").absolutePath}"
         summaryTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/users/summary.peb").absolutePath}"
         carouselTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/outfits/carousel.peb").absolutePath}"
+        includeParentTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/users/include-parent.peb").absolutePath}"
+        includeChildTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/users/include-child.peb").absolutePath}"
+        includeUnsupportedParentTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/users/include-unsupported-parent.peb").absolutePath}"
+        includeUnsupportedChildTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/users/include-unsupported-child.peb").absolutePath}"
 
         bridge.updatePebbleFile(detailTemplateUri, fixtureRoot.resolve("src/main/resources/templates/users/detail.peb").readText())
         bridge.updatePebbleFile(summaryTemplateUri, fixtureRoot.resolve("src/main/resources/templates/users/summary.peb").readText())
         bridge.updatePebbleFile(carouselTemplateUri, fixtureRoot.resolve("src/main/resources/templates/outfits/carousel.peb").readText())
+        bridge.updatePebbleFile(includeParentTemplateUri, fixtureRoot.resolve("src/main/resources/templates/users/include-parent.peb").readText())
+        bridge.updatePebbleFile(includeChildTemplateUri, fixtureRoot.resolve("src/main/resources/templates/users/include-child.peb").readText())
+        bridge.updatePebbleFile(
+            includeUnsupportedParentTemplateUri,
+            fixtureRoot.resolve("src/main/resources/templates/users/include-unsupported-parent.peb").readText(),
+        )
+        bridge.updatePebbleFile(
+            includeUnsupportedChildTemplateUri,
+            fixtureRoot.resolve("src/main/resources/templates/users/include-unsupported-child.peb").readText(),
+        )
     }
 
     @AfterEach
@@ -165,6 +183,86 @@ class PebbleSpringIndexTest {
                 location.get("line").asInt == 6 &&
                 location.get("column").asInt == 15
         })
+    }
+
+    @Test
+    fun `include-with forwarded variables navigate back to parent kotlin producers`() {
+        val forwardedUserDefinition = bridge.pebbleDefinition(includeChildTemplateUri, line = 1, character = 4)
+        val forwardedUserLocations = forwardedUserDefinition.getAsJsonArray("locations")
+
+        assertEquals(1, forwardedUserLocations.size())
+        val forwardedUserLocation = forwardedUserLocations[0].asJsonObject
+        assertEquals(kotlinUri, forwardedUserLocation.get("uri").asString)
+        assertEquals(47, forwardedUserLocation.get("line").asInt)
+        assertEquals(8, forwardedUserLocation.get("column").asInt)
+        assertEquals("User", forwardedUserLocation.get("type").asString)
+
+        val forwardedPropertyDefinition = bridge.pebbleDefinition(includeChildTemplateUri, line = 1, character = 18)
+        val forwardedPropertyLocations = forwardedPropertyDefinition.getAsJsonArray("locations")
+
+        assertEquals(1, forwardedPropertyLocations.size())
+        val forwardedPropertyLocation = forwardedPropertyLocations[0].asJsonObject
+        assertEquals(kotlinUri, forwardedPropertyLocation.get("uri").asString)
+        assertEquals(11, forwardedPropertyLocation.get("line").asInt)
+        assertEquals(16, forwardedPropertyLocation.get("column").asInt)
+
+        val nestedForwardedDefinition = bridge.pebbleDefinition(includeChildTemplateUri, line = 2, character = 4)
+        val nestedForwardedLocations = nestedForwardedDefinition.getAsJsonArray("locations")
+
+        assertEquals(1, nestedForwardedLocations.size())
+        val nestedForwardedLocation = nestedForwardedLocations[0].asJsonObject
+        assertEquals(kotlinUri, nestedForwardedLocation.get("uri").asString)
+        assertEquals(11, nestedForwardedLocation.get("line").asInt)
+        assertEquals(16, nestedForwardedLocation.get("column").asInt)
+        assertEquals("String", nestedForwardedLocation.get("type").asString)
+    }
+
+    @Test
+    fun `kotlin references include usages from include-with child templates`() {
+        val userProducerReferences = bridge.references(kotlinUri, line = 47, character = 12)
+        val userProducerLocations = userProducerReferences.getAsJsonArray("locations")
+        assertTrue((0 until userProducerLocations.size()).any { index ->
+            val location = userProducerLocations[index].asJsonObject
+            location.get("uri").asString == includeChildTemplateUri &&
+                location.get("line").asInt == 1 &&
+                location.get("column").asInt == 3
+        })
+
+        val userNameReferences = bridge.references(kotlinUri, line = 11, character = 20)
+        val userNameLocations = userNameReferences.getAsJsonArray("locations")
+        assertTrue((0 until userNameLocations.size()).any { index ->
+            val location = userNameLocations[index].asJsonObject
+            location.get("uri").asString == includeChildTemplateUri &&
+                location.get("line").asInt == 2 &&
+                location.get("column").asInt == 3
+        })
+    }
+
+    @Test
+    fun `spring model attribute calls jump to pebble usages`() {
+        val definition = bridge.definition(kotlinUri, line = 48, character = 15)
+        val definitionLocations = definition.getAsJsonArray("locations")
+        assertTrue((0 until definitionLocations.size()).any { index ->
+            val location = definitionLocations[index].asJsonObject
+            location.get("uri").asString == includeChildTemplateUri &&
+                location.get("line").asInt == 1 &&
+                location.get("column").asInt == 3
+        })
+
+        val references = bridge.references(kotlinUri, line = 48, character = 15)
+        val referenceLocations = references.getAsJsonArray("locations")
+        assertTrue((0 until referenceLocations.size()).any { index ->
+            val location = referenceLocations[index].asJsonObject
+            location.get("uri").asString == includeChildTemplateUri &&
+                location.get("line").asInt == 1 &&
+                location.get("column").asInt == 3
+        })
+    }
+
+    @Test
+    fun `unsupported include-with expressions fail conservatively`() {
+        val result = bridge.pebbleDefinition(includeUnsupportedChildTemplateUri, line = 1, character = 4)
+        assertTrue(result.getAsJsonArray("locations").isEmpty)
     }
 
     @Test

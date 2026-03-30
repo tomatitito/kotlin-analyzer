@@ -42,4 +42,16 @@ class UsersController {
         model.addAttribute("outfits", outfits)
         return "outfits/carousel"
     }
+
+    fun includeForwarding(model: Model): String {
+        val user = User("Cara")
+        model.addAttribute("user", user)
+        return "users/include-parent"
+    }
+
+    fun unsupportedIncludeForwarding(model: Model): String {
+        val user = User("Dana")
+        model.addAttribute("user", user)
+        return "users/include-unsupported-parent"
+    }
 }

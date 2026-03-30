@@ -51,12 +51,26 @@ internal data class PebbleForLoopAlias(
     val sourceSegments: List<String>,
 )
 
+internal data class PebbleIncludeVariableBinding(
+    val targetTemplate: String,
+    val targetVariableName: String,
+    val sourceSegments: List<String>,
+)
+
 internal data class PebbleTemplateFacts(
     val uri: String,
     val templateReferences: List<PebbleTemplateReference>,
     val variableReferences: List<PebbleVariableReference>,
     val variableHints: List<PebbleVariableHint>,
     val forLoopAliases: List<PebbleForLoopAlias>,
+    val includeVariableBindings: List<PebbleIncludeVariableBinding>,
+)
+
+internal data class ResolvedIncludeBinding(
+    val sourceTemplateUri: String,
+    val targetTemplateUri: String,
+    val targetVariableName: String,
+    val sourceSegments: List<String>,
 )
 
 internal class PebbleLineIndex(text: String) {
@@ -113,6 +127,14 @@ internal class PebbleTemplateParser {
     private val forLoopPattern = Regex(
         """\{%\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*(?:\(\))?)*)\s*%}"""
     )
+    private val includeWithPattern = Regex(
+        """\{%\s*include\s+(['"])([^'"]+)\1\s+with\s*\{(.*?)}\s*%}""",
+        setOf(RegexOption.DOT_MATCHES_ALL),
+    )
+    private val includeWithEntryPattern = Regex("""^\s*(["'])([^"']+)\1\s*:\s*(.*?)\s*$""")
+    private val simpleVariableChainPattern = Regex(
+        """^[A-Za-z_][A-Za-z0-9_]*(?:\.(?:[A-Za-z_][A-Za-z0-9_]*)(?:\(\))?)*$"""
+    )
 
     fun parse(uri: String, text: String): PebbleTemplateFacts {
         val lines = PebbleLineIndex(text)
@@ -166,12 +188,26 @@ internal class PebbleTemplateParser {
 
         val forLoopAliases = forLoopPattern.findAll(text).mapNotNull { match ->
             val alias = match.groupValues[1].trim()
-            val sourceSegments = match.groupValues[2]
-                .split('.')
-                .map { it.removeSuffix("()").trim() }
-                .filter { it.isNotEmpty() }
+            val sourceSegments = parseVariableSegments(match.groupValues[2]) ?: return@mapNotNull null
             if (alias.isEmpty() || sourceSegments.isEmpty()) return@mapNotNull null
             PebbleForLoopAlias(alias = alias, sourceSegments = sourceSegments)
+        }.toList()
+
+        val includeVariableBindings = includeWithPattern.findAll(text).flatMap { match ->
+            val targetTemplate = match.groupValues[2].trim()
+            match.groupValues[3]
+                .split(',')
+                .asSequence()
+                .mapNotNull { entry ->
+                    val parsedEntry = includeWithEntryPattern.matchEntire(entry) ?: return@mapNotNull null
+                    val targetVariableName = parsedEntry.groupValues[2].trim()
+                    val sourceSegments = parseVariableSegments(parsedEntry.groupValues[3]) ?: return@mapNotNull null
+                    PebbleIncludeVariableBinding(
+                        targetTemplate = targetTemplate,
+                        targetVariableName = targetVariableName,
+                        sourceSegments = sourceSegments,
+                    )
+                }
         }.toList()
 
         return PebbleTemplateFacts(
@@ -180,7 +216,20 @@ internal class PebbleTemplateParser {
             variableReferences = variableReferences,
             variableHints = variableHints,
             forLoopAliases = forLoopAliases,
+            includeVariableBindings = includeVariableBindings,
         )
+    }
+
+    private fun parseVariableSegments(expression: String): List<String>? {
+        val normalizedExpression = expression.trim()
+        if (!simpleVariableChainPattern.matches(normalizedExpression)) return null
+        val segments = normalizedExpression
+            .split('.')
+            .map { it.removeSuffix("()").trim() }
+            .filter { it.isNotEmpty() }
+        val root = segments.firstOrNull() ?: return null
+        if (root in RESERVED_WORDS) return null
+        return segments
     }
 
     private companion object {
@@ -241,6 +290,7 @@ internal class PebbleTemplateIndex(
     private val factsByUri = linkedMapOf<String, PebbleTemplateFacts>()
     private val aliasesToUris = linkedMapOf<String, MutableSet<String>>()
     private val referencesByResolvedTarget = linkedMapOf<String, MutableList<PebbleTemplateReference>>()
+    private val includeBindingsByResolvedTarget = linkedMapOf<String, MutableList<ResolvedIncludeBinding>>()
 
     fun update(uri: String, text: String) {
         documents[uri] = text
@@ -280,6 +330,11 @@ internal class PebbleTemplateIndex(
 
     fun allFacts(): Map<String, PebbleTemplateFacts> = factsByUri.toMap()
 
+    fun incomingIncludeBindings(targetTemplateUri: String): List<ResolvedIncludeBinding> =
+        includeBindingsByResolvedTarget[targetTemplateUri].orEmpty().sortedWith(
+            compareBy<ResolvedIncludeBinding>({ it.sourceTemplateUri }, { it.targetVariableName }, { it.sourceSegments.joinToString(".") })
+        )
+
     fun resolveTemplateName(sourceUri: String, targetTemplate: String): String? =
         resolveTemplate(sourceUri, targetTemplate)
 
@@ -287,6 +342,7 @@ internal class PebbleTemplateIndex(
         factsByUri.clear()
         aliasesToUris.clear()
         referencesByResolvedTarget.clear()
+        includeBindingsByResolvedTarget.clear()
 
         for ((uri, text) in documents.toSortedMap()) {
             factsByUri[uri] = parser.parse(uri, text)
@@ -299,6 +355,17 @@ internal class PebbleTemplateIndex(
             for (reference in facts.templateReferences) {
                 val targetUri = resolveTemplate(reference.sourceUri, reference.targetTemplate) ?: continue
                 referencesByResolvedTarget.getOrPut(targetUri) { mutableListOf() }.add(reference)
+            }
+            for (binding in facts.includeVariableBindings) {
+                val targetUri = resolveTemplate(facts.uri, binding.targetTemplate) ?: continue
+                includeBindingsByResolvedTarget.getOrPut(targetUri) { mutableListOf() }.add(
+                    ResolvedIncludeBinding(
+                        sourceTemplateUri = facts.uri,
+                        targetTemplateUri = targetUri,
+                        targetVariableName = binding.targetVariableName,
+                        sourceSegments = binding.sourceSegments,
+                    )
+                )
             }
         }
     }

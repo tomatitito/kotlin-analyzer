@@ -32,6 +32,7 @@ import org.jetbrains.kotlin.idea.references.KtReference
 import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.platform.jvm.JvmPlatforms
 import org.jetbrains.kotlin.psi.*
+import org.jetbrains.kotlin.psi.psiUtil.parents
 import org.jetbrains.kotlin.types.Variance
 import java.io.File
 import java.nio.file.Files
@@ -934,6 +935,19 @@ class CompilerBridge {
 
                 val element = ktFile.findElementAt(offset)
                 if (element != null) {
+                    val springProducer = findSpringModelProducerDeclaration(element)
+                    if (springProducer != null) {
+                        val declarationUri = ((springProducer.containingFile as? KtFile)?.virtualFile?.path)?.let { "file://$it" } ?: uri
+                        for (usage in pebbleSpringIndex.pebbleUsagesForDeclaration(springProducer, declarationUri)) {
+                            val location = JsonObject()
+                            location.addProperty("uri", usage.uri)
+                            location.addProperty("line", usage.line)
+                            location.addProperty("column", usage.column)
+                            locationsArray.add(location)
+                        }
+                        return@analyze
+                    }
+
                     // Find the reference element
                     var current: PsiElement? = element
                     while (current != null) {
@@ -1188,7 +1202,13 @@ class CompilerBridge {
             analyze(ktFile) {
                 val offset = lineColToOffset(ktFile, line, character) ?: return@analyze
                 val element = ktFile.findElementAt(offset) ?: return@analyze
-                targetDeclaration = findTargetDeclaration(element) ?: return@analyze
+
+                val springProducer = findSpringModelProducerDeclaration(element)
+                if (springProducer != null) {
+                    targetDeclaration = springProducer
+                } else {
+                    targetDeclaration = findTargetDeclaration(element) ?: return@analyze
+                }
 
                 // Extract identity: the declaration's name, containing file, and offset
                 targetName = (targetDeclaration as? KtNamedDeclaration)?.name
@@ -4337,6 +4357,53 @@ class CompilerBridge {
             current = current.parent
         }
         return null
+    }
+
+    private fun findSpringModelProducerDeclaration(element: PsiElement): PsiElement? {
+        val call = PsiTreeUtil.getParentOfType(element, KtCallExpression::class.java, false) ?: return null
+        val calleeName = call.calleeExpression?.text ?: return null
+        if (calleeName != "addAttribute" && calleeName != "addObject") return null
+
+        val args = call.valueArguments
+        if (args.size < 2) return null
+        if (staticStringValue(args[0].getArgumentExpression()) == null) return null
+
+        val valueExpression = args[1].getArgumentExpression() ?: return null
+        val function = PsiTreeUtil.getParentOfType(call, KtNamedFunction::class.java, true) ?: return null
+        return resolveSpringProducerElement(function, valueExpression)
+    }
+
+    private fun staticStringValue(expression: KtExpression?): String? {
+        val stringTemplate = expression as? KtStringTemplateExpression ?: return null
+        if (stringTemplate.hasInterpolation()) return null
+        return stringTemplate.entries.joinToString(separator = "") { it.text }
+    }
+
+    private fun resolveSpringProducerElement(function: KtNamedFunction, expression: KtExpression): PsiElement? {
+        val nameExpression = expression as? KtNameReferenceExpression ?: return expression
+        val targetName = nameExpression.getReferencedName()
+
+        val parameter = function.valueParameters.firstOrNull { it.name == targetName }
+        if (parameter != null) return parameter
+
+        val localProperty = PsiTreeUtil.collectElementsOfType(function, KtProperty::class.java)
+            .filter { it.name == targetName && it.textOffset <= nameExpression.textOffset }
+            .maxByOrNull { it.textOffset }
+        if (localProperty != null) return localProperty
+
+        val classBody = function.parents.filterIsInstance<KtClassBody>().firstOrNull()
+        val classProperty = classBody
+            ?.declarations
+            ?.filterIsInstance<KtProperty>()
+            ?.firstOrNull { it.name == targetName }
+        if (classProperty != null) return classProperty
+
+        val fileProperty = function.containingKtFile.declarations
+            .filterIsInstance<KtProperty>()
+            .firstOrNull { it.name == targetName }
+        if (fileProperty != null) return fileProperty
+
+        return expression
     }
 
     // --- Private helpers: code actions ---

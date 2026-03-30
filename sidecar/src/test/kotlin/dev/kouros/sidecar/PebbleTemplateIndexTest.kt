@@ -59,6 +59,41 @@ class PebbleTemplateIndexTest {
     }
 
     @Test
+    fun `parser captures include-with variable bindings`() {
+        val parser = PebbleTemplateParser()
+        val facts = parser.parse(
+            uri = "file:///workspace/src/main/resources/templates/users/detail.peb",
+            text = """
+                {% include "./child" with { "outfitPath": outfitPath, "items": bestandteil.empfehlungen(), "broken": helper(user) } %}
+            """.trimIndent(),
+        )
+
+        assertEquals(
+            listOf(
+                PebbleIncludeVariableBinding("./child", "outfitPath", listOf("outfitPath")),
+                PebbleIncludeVariableBinding("./child", "items", listOf("bestandteil", "empfehlungen")),
+            ),
+            facts.includeVariableBindings,
+        )
+    }
+
+    @Test
+    fun `parser skips unsupported include-with entries conservatively`() {
+        val parser = PebbleTemplateParser()
+        val facts = parser.parse(
+            uri = "file:///workspace/src/main/resources/templates/users/detail.peb",
+            text = """
+                {% include "./child" with { dynamicKey: outfitPath, "broken": helper(user), "ok": user.name } %}
+            """.trimIndent(),
+        )
+
+        assertEquals(
+            listOf(PebbleIncludeVariableBinding("./child", "ok", listOf("user", "name"))),
+            facts.includeVariableBindings,
+        )
+    }
+
+    @Test
     fun `index resolves template definition using template aliases`() {
         val index = PebbleTemplateIndex()
         val baseUri = "file:///workspace/src/main/resources/templates/layouts/base.peb"
@@ -73,6 +108,28 @@ class PebbleTemplateIndexTest {
         assertEquals(1, refs.size)
         assertEquals(pageUri, refs.single().sourceUri)
         assertEquals(PebbleReferenceKind.EXTENDS, refs.single().kind)
+    }
+
+    @Test
+    fun `index resolves incoming include bindings for child templates`() {
+        val index = PebbleTemplateIndex()
+        val parentUri = "file:///workspace/src/main/resources/templates/users/parent.peb"
+        val childUri = "file:///workspace/src/main/resources/templates/users/child.peb"
+
+        index.update(childUri, "{{ forwardedUser }}")
+        index.update(parentUri, """{% include "./child" with { "forwardedUser": user, "ignored": helper(user) } %}""")
+
+        assertEquals(
+            listOf(
+                ResolvedIncludeBinding(
+                    sourceTemplateUri = parentUri,
+                    targetTemplateUri = childUri,
+                    targetVariableName = "forwardedUser",
+                    sourceSegments = listOf("user"),
+                )
+            ),
+            index.incomingIncludeBindings(childUri),
+        )
     }
 
     @Test
