@@ -10,7 +10,7 @@ plugins {
 }
 
 group = "dev.kouros"
-version = "0.4.0"
+version = "0.4.1"
 
 repositories {
     mavenCentral()
