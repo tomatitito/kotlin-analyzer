@@ -11,6 +11,7 @@ The project also includes a Zed extension (Rust/WASM) that registers Kotlin lang
 | [Architecture](architecture.md) | Rust + JVM sidecar design, process lifecycle, state machine, shutdown/restart, error handling, logging |
 | [Compiler Integration](compiler-integration.md) | Analysis API (K2/FIR), compiler flag extraction, incremental analysis, Compose/KAPT/KSP, Java interop, memory estimates |
 | [LSP Protocol](lsp-protocol.md) | LSP framework choice, feature phases, bridge protocol schema, backpressure, cancellation, document sync, configuration |
+| [Command Code Actions](command-code-actions.md) | Analyzer-owned command contract for command-bearing code actions |
 | [Distribution](distribution.md) | Cross-platform builds, JVM requirement, JAR bundling, Zed extension packaging, CI/CD pipeline |
 | [Testing](testing.md) | Unit, integration, end-to-end, and conformance testing strategy, test fixtures, CI pipeline |
 | [Development Commands](development-commands.md) | Build, test, smoke-test, release-sync, and local Zed extension setup commands |

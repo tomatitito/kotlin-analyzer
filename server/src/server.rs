@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use lsp_types::*;
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -17,6 +19,256 @@ use crate::config::{Config, FormattingTool};
 use crate::project;
 use crate::runtime;
 use crate::state::{DocumentKind, DocumentStore};
+
+const ANALYZER_COMMAND_CONTRACT_JSON: &str = include_str!("../../protocol/analyzer-commands.json");
+
+#[derive(Debug, Deserialize)]
+struct AnalyzerCommandContract {
+    commands: AnalyzerCommandEntries,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalyzerCommandEntries {
+    open_test_target: AnalyzerCommandDefinition,
+    create_and_open_test_target: AnalyzerCommandDefinition,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnalyzerCommandDefinition {
+    id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CommandSelection {
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+}
+
+impl CommandSelection {
+    fn into_range(self) -> Range {
+        Range {
+            start: Position::new(self.start_line, self.start_character),
+            end: Position::new(self.end_line, self.end_character),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct OpenTestTargetArgs {
+    target_uri: String,
+    selection: Option<CommandSelection>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CreateAndOpenTestTargetArgs {
+    target_uri: String,
+    target_path: String,
+    initial_contents: String,
+    selection: Option<CommandSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnalyzerCommandRequest {
+    OpenTestTarget(OpenTestTargetArgs),
+    CreateAndOpenTestTarget(CreateAndOpenTestTargetArgs),
+}
+
+fn analyzer_command_contract() -> &'static AnalyzerCommandContract {
+    static CONTRACT: OnceLock<AnalyzerCommandContract> = OnceLock::new();
+    CONTRACT.get_or_init(|| {
+        serde_json::from_str(ANALYZER_COMMAND_CONTRACT_JSON)
+            .expect("protocol/analyzer-commands.json must be valid")
+    })
+}
+
+fn supported_analyzer_command_ids() -> Vec<String> {
+    let contract = analyzer_command_contract();
+    vec![
+        contract.commands.open_test_target.id.clone(),
+        contract.commands.create_and_open_test_target.id.clone(),
+    ]
+}
+
+fn invalid_params_error<M: Into<String>>(message: M) -> JsonRpcError {
+    JsonRpcError {
+        code: ErrorCode::InvalidParams,
+        message: message.into().into(),
+        data: None,
+    }
+}
+
+fn request_failed_error<M: Into<String>>(message: M) -> JsonRpcError {
+    JsonRpcError {
+        code: ErrorCode::ServerError(-32001),
+        message: message.into().into(),
+        data: None,
+    }
+}
+
+fn parse_command_payload<T>(arguments: Vec<Value>, command_id: &str) -> Result<T, JsonRpcError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if arguments.len() != 1 {
+        return Err(invalid_params_error(format!(
+            "{command_id} requires exactly one argument object"
+        )));
+    }
+
+    serde_json::from_value(arguments.into_iter().next().expect("checked len == 1"))
+        .map_err(|e| invalid_params_error(format!("invalid arguments for {command_id}: {e}")))
+}
+
+fn parse_analyzer_command_request(
+    params: ExecuteCommandParams,
+) -> Result<AnalyzerCommandRequest, JsonRpcError> {
+    let command_id = params.command;
+    let arguments = params.arguments;
+    let contract = analyzer_command_contract();
+
+    if command_id == contract.commands.open_test_target.id {
+        let payload = parse_command_payload(arguments, &command_id)?;
+        return Ok(AnalyzerCommandRequest::OpenTestTarget(payload));
+    }
+
+    if command_id == contract.commands.create_and_open_test_target.id {
+        let payload = parse_command_payload(arguments, &command_id)?;
+        return Ok(AnalyzerCommandRequest::CreateAndOpenTestTarget(payload));
+    }
+
+    Err(invalid_params_error(format!(
+        "unsupported analyzer command: {command_id}"
+    )))
+}
+
+fn parse_workspace_edits(result: &Value) -> HashMap<Url, Vec<TextEdit>> {
+    let edits_array = match result.get("edits").and_then(|e| e.as_array()) {
+        Some(arr) => arr,
+        None => return HashMap::new(),
+    };
+
+    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+    for edit in edits_array {
+        let uri_str = match edit.get("uri").and_then(|u| u.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let uri = match Url::parse(uri_str) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+
+        let range = match edit.get("range") {
+            Some(r) => r,
+            None => continue,
+        };
+
+        let start_line = range
+            .get("startLine")
+            .and_then(|l| l.as_u64())
+            .map(|l| l.saturating_sub(1) as u32)
+            .unwrap_or(0);
+        let start_col = range
+            .get("startColumn")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0) as u32;
+        let end_line = range
+            .get("endLine")
+            .and_then(|l| l.as_u64())
+            .map(|l| l.saturating_sub(1) as u32)
+            .unwrap_or(start_line);
+        let end_col = range.get("endColumn").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
+
+        let new_text = match edit.get("newText").and_then(|t| t.as_str()) {
+            Some(t) => t.to_string(),
+            None => continue,
+        };
+
+        changes.entry(uri).or_default().push(TextEdit {
+            range: Range {
+                start: Position::new(start_line, start_col),
+                end: Position::new(end_line, end_col),
+            },
+            new_text,
+        });
+    }
+
+    changes
+}
+
+fn parse_code_action_command(action: &Value) -> Option<lsp_types::Command> {
+    let command = action.get("command")?.clone();
+    match serde_json::from_value::<lsp_types::Command>(command) {
+        Ok(command) => Some(command),
+        Err(error) => {
+            tracing::warn!("ignoring malformed code action command: {}", error);
+            None
+        }
+    }
+}
+
+fn parse_code_actions_result(result: &Value) -> CodeActionResponse {
+    let actions_array = match result.get("actions").and_then(|a| a.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    actions_array
+        .iter()
+        .filter_map(|action| {
+            let title = action.get("title")?.as_str()?.to_string();
+            let kind = action
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .map(|k| CodeActionKind::from(k.to_string()));
+
+            let edits = parse_workspace_edits(action);
+            let edit = if edits.is_empty() {
+                None
+            } else {
+                Some(WorkspaceEdit {
+                    changes: Some(edits),
+                    document_changes: None,
+                    change_annotations: None,
+                })
+            };
+
+            Some(CodeActionOrCommand::CodeAction(CodeAction {
+                title,
+                kind,
+                diagnostics: None,
+                edit,
+                command: parse_code_action_command(action),
+                is_preferred: None,
+                disabled: None,
+                data: None,
+            }))
+        })
+        .collect()
+}
+
+fn temporary_target_path(target_path: &Path) -> PathBuf {
+    let file_name = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("kotlin-analyzer-target");
+    let unique_suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+
+    target_path.with_file_name(format!(
+        ".{file_name}.kotlin-analyzer.tmp-{}-{unique_suffix}",
+        std::process::id()
+    ))
+}
 
 /// The main language server implementation.
 pub struct KotlinLanguageServer {
@@ -154,6 +406,105 @@ impl KotlinLanguageServer {
             Err(e) => {
                 tracing::warn!("analyze_document: analysis failed for {}: {}", uri, e);
             }
+        }
+    }
+
+    async fn execute_analyzer_command(&self, request: AnalyzerCommandRequest) -> LspResult<Value> {
+        match request {
+            AnalyzerCommandRequest::OpenTestTarget(args) => {
+                let target_uri = Url::parse(&args.target_uri).map_err(|error| {
+                    invalid_params_error(format!("invalid targetUri for openTestTarget: {error}"))
+                })?;
+
+                self.show_document(target_uri, args.selection).await?;
+                Ok(serde_json::json!({ "shown": true }))
+            }
+            AnalyzerCommandRequest::CreateAndOpenTestTarget(args) => {
+                let target_uri = Url::parse(&args.target_uri).map_err(|error| {
+                    invalid_params_error(format!(
+                        "invalid targetUri for createAndOpenTestTarget: {error}"
+                    ))
+                })?;
+
+                let target_path = PathBuf::from(&args.target_path);
+                let created = !target_path.exists();
+                self.create_target_file_if_missing(&target_path, &args.initial_contents)
+                    .await?;
+                self.show_document(target_uri, args.selection).await?;
+
+                Ok(serde_json::json!({
+                    "created": created,
+                    "shown": true
+                }))
+            }
+        }
+    }
+
+    async fn create_target_file_if_missing(
+        &self,
+        target_path: &Path,
+        initial_contents: &str,
+    ) -> LspResult<()> {
+        if target_path.exists() {
+            return Ok(());
+        }
+
+        if let Some(parent) = target_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                request_failed_error(format!(
+                    "failed to create directories for {}: {}",
+                    target_path.display(),
+                    error
+                ))
+            })?;
+        }
+
+        let temp_path = temporary_target_path(target_path);
+        let write_result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .await?;
+            file.write_all(initial_contents.as_bytes()).await?;
+            file.flush().await?;
+            tokio::fs::rename(&temp_path, target_path).await
+        }
+        .await;
+
+        match write_result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                Err(request_failed_error(format!(
+                    "failed to create {}: {}",
+                    target_path.display(),
+                    error
+                )))
+            }
+        }
+    }
+
+    async fn show_document(&self, uri: Url, selection: Option<CommandSelection>) -> LspResult<()> {
+        let shown = self
+            .client
+            .show_document(ShowDocumentParams {
+                uri,
+                external: Some(false),
+                take_focus: Some(true),
+                selection: selection.map(CommandSelection::into_range),
+            })
+            .await
+            .map_err(|error| {
+                request_failed_error(format!("window/showDocument failed: {error}"))
+            })?;
+
+        if shown {
+            Ok(())
+        } else {
+            Err(request_failed_error(
+                "window/showDocument was not acknowledged",
+            ))
         }
     }
 
@@ -454,6 +805,12 @@ impl LanguageServer for KotlinLanguageServer {
                 workspace: Some(WorkspaceServerCapabilities {
                     workspace_folders: None,
                     file_operations: None,
+                }),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: supported_analyzer_command_ids(),
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(false),
+                    },
                 }),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
@@ -1626,7 +1983,7 @@ impl LanguageServer for KotlinLanguageServer {
             .await
         {
             Ok(result) => {
-                let edits = self.parse_workspace_edits(&result);
+                let edits = parse_workspace_edits(&result);
                 if edits.is_empty() {
                     Ok(None)
                 } else {
@@ -1674,7 +2031,7 @@ impl LanguageServer for KotlinLanguageServer {
         {
             Ok(result) => {
                 tracing::debug!("code_action: raw sidecar response for {}: {}", uri, result);
-                let actions = self.parse_code_actions(&result);
+                let actions = parse_code_actions_result(&result);
                 tracing::debug!(
                     "code_action: parsed {} action(s) for {} at L{}:{}",
                     actions.len(),
@@ -1693,6 +2050,11 @@ impl LanguageServer for KotlinLanguageServer {
                 Ok(None)
             }
         }
+    }
+
+    async fn execute_command(&self, params: ExecuteCommandParams) -> LspResult<Option<Value>> {
+        let request = parse_analyzer_command_request(params)?;
+        self.execute_analyzer_command(request).await.map(Some)
     }
 
     async fn symbol(
@@ -2206,97 +2568,6 @@ impl KotlinLanguageServer {
             .collect()
     }
 
-    fn parse_workspace_edits(&self, result: &Value) -> HashMap<Url, Vec<TextEdit>> {
-        let edits_array = match result.get("edits").and_then(|e| e.as_array()) {
-            Some(arr) => arr,
-            None => return HashMap::new(),
-        };
-
-        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-
-        for edit in edits_array {
-            let uri_str = match edit.get("uri").and_then(|u| u.as_str()) {
-                Some(s) => s,
-                None => continue,
-            };
-            let uri = match Url::parse(uri_str) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-
-            let range = match edit.get("range") {
-                Some(r) => r,
-                None => continue,
-            };
-
-            let start_line = range
-                .get("startLine")
-                .and_then(|l| l.as_u64())
-                .map(|l| l.saturating_sub(1) as u32)
-                .unwrap_or(0);
-            let start_col = range
-                .get("startColumn")
-                .and_then(|c| c.as_u64())
-                .unwrap_or(0) as u32;
-            let end_line = range
-                .get("endLine")
-                .and_then(|l| l.as_u64())
-                .map(|l| l.saturating_sub(1) as u32)
-                .unwrap_or(start_line);
-            let end_col = range.get("endColumn").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
-
-            let new_text = match edit.get("newText").and_then(|t| t.as_str()) {
-                Some(t) => t.to_string(),
-                None => continue,
-            };
-
-            changes.entry(uri).or_default().push(TextEdit {
-                range: Range {
-                    start: Position::new(start_line, start_col),
-                    end: Position::new(end_line, end_col),
-                },
-                new_text,
-            });
-        }
-
-        changes
-    }
-
-    fn parse_code_actions(&self, result: &Value) -> CodeActionResponse {
-        let actions_array = match result.get("actions").and_then(|a| a.as_array()) {
-            Some(arr) => arr,
-            None => return Vec::new(),
-        };
-
-        actions_array
-            .iter()
-            .filter_map(|action| {
-                let title = action.get("title")?.as_str()?.to_string();
-                let kind = action
-                    .get("kind")
-                    .and_then(|k| k.as_str())
-                    .map(|k| CodeActionKind::from(k.to_string()));
-
-                let edits = self.parse_workspace_edits(action);
-
-                Some(CodeActionOrCommand::CodeAction(CodeAction {
-                    title,
-                    kind,
-                    diagnostics: None,
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(edits),
-                        document_changes: None,
-                        change_annotations: None,
-                    }),
-                    command: None,
-                    is_preferred: None,
-                    disabled: None,
-                    data: None,
-                }))
-            })
-            .collect()
-    }
-
     fn parse_workspace_symbols(&self, result: &Value) -> Vec<SymbolInformation> {
         let symbols_array = match result.get("symbols").and_then(|s| s.as_array()) {
             Some(arr) => arr,
@@ -2650,5 +2921,143 @@ impl KotlinLanguageServer {
             "object" => SymbolKind::OBJECT,
             _ => SymbolKind::VARIABLE,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_code_actions_preserves_command_payloads() {
+        let result = json!({
+            "actions": [
+                {
+                    "title": "Open existing test",
+                    "kind": "quickfix",
+                    "command": {
+                        "title": "Open existing test",
+                        "command": "kotlin-analyzer.openTestTarget",
+                        "arguments": [
+                            {
+                                "targetUri": "file:///tmp/Test.kt",
+                                "selection": {
+                                    "startLine": 3,
+                                    "startCharacter": 1,
+                                    "endLine": 3,
+                                    "endCharacter": 5
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let actions = parse_code_actions_result(&result);
+        assert_eq!(actions.len(), 1);
+
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected code action");
+        };
+
+        let command = action
+            .command
+            .as_ref()
+            .expect("command should be preserved");
+        assert_eq!(command.command, "kotlin-analyzer.openTestTarget");
+        assert_eq!(
+            command
+                .arguments
+                .as_ref()
+                .and_then(|args| args.first())
+                .cloned(),
+            Some(json!({
+                "targetUri": "file:///tmp/Test.kt",
+                "selection": {
+                    "startLine": 3,
+                    "startCharacter": 1,
+                    "endLine": 3,
+                    "endCharacter": 5
+                }
+            }))
+        );
+        assert!(
+            action.edit.is_none(),
+            "command-only actions should not gain empty edits"
+        );
+    }
+
+    #[test]
+    fn parse_code_actions_keeps_edit_only_actions_compatible() {
+        let result = json!({
+            "actions": [
+                {
+                    "title": "Add import",
+                    "kind": "quickfix",
+                    "edits": [
+                        {
+                            "uri": "file:///tmp/Test.kt",
+                            "range": {
+                                "startLine": 1,
+                                "startColumn": 0,
+                                "endLine": 1,
+                                "endColumn": 0
+                            },
+                            "newText": "import kotlin.collections.List\n"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let actions = parse_code_actions_result(&result);
+        assert_eq!(actions.len(), 1);
+
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected code action");
+        };
+
+        let edit = action.edit.as_ref().expect("edit should be preserved");
+        let changes = edit.changes.as_ref().expect("changes should exist");
+        assert_eq!(changes.len(), 1);
+        assert!(
+            action.command.is_none(),
+            "edit-only action should remain command-free"
+        );
+    }
+
+    #[test]
+    fn parse_analyzer_command_rejects_unknown_command_ids() {
+        let error = parse_analyzer_command_request(ExecuteCommandParams {
+            command: "kotlin-analyzer.unsupported".to_string(),
+            arguments: vec![json!({})],
+            work_done_progress_params: Default::default(),
+        })
+        .expect_err("unsupported command should fail");
+
+        assert_eq!(error.code, ErrorCode::InvalidParams);
+        assert!(error.message.contains("unsupported analyzer command"));
+    }
+
+    #[test]
+    fn parse_analyzer_command_validates_required_payload() {
+        let error = parse_analyzer_command_request(ExecuteCommandParams {
+            command: analyzer_command_contract()
+                .commands
+                .create_and_open_test_target
+                .id
+                .clone(),
+            arguments: vec![json!({
+                "targetUri": "file:///tmp/Test.kt",
+                "targetPath": "/tmp/Test.kt"
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .expect_err("missing initialContents should fail");
+
+        assert_eq!(error.code, ErrorCode::InvalidParams);
+        assert!(error.message.contains("invalid arguments"));
     }
 }

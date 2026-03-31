@@ -109,7 +109,18 @@ impl LspTestClient {
         method: &str,
         params: Value,
     ) -> Result<Value, Box<dyn std::error::Error>> {
+        self.send_request_and_capture_requests(method, params, None)
+            .map(|(response, _)| response)
+    }
+
+    fn send_request_and_capture_requests(
+        &mut self,
+        method: &str,
+        params: Value,
+        watched_method: Option<&str>,
+    ) -> Result<(Value, Vec<Value>), Box<dyn std::error::Error>> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let mut captured_requests = Vec::new();
 
         let request = json!({
             "jsonrpc": "2.0",
@@ -144,17 +155,31 @@ impl LspTestClient {
 
             // Is this a response to our request?
             if let Some(msg_id) = msg.get("id") {
-                if msg_id.as_i64() == Some(id) {
-                    return Ok(msg);
+                if msg_id.as_i64() == Some(id) && msg.get("method").is_none() {
+                    if let Some(expected_method) = watched_method {
+                        self.capture_server_requests(
+                            expected_method,
+                            &mut captured_requests,
+                            Duration::from_millis(250),
+                        );
+                    }
+                    return Ok((msg, captured_requests));
                 }
 
                 // It's a server→client request (has method + id). Reply with
-                // an empty success so the server doesn't time out.
+                // a method-specific success so the server doesn't time out.
                 if msg.get("method").is_some() {
+                    if let Some(expected_method) = watched_method {
+                        if msg.get("method").and_then(|m| m.as_str()) == Some(expected_method) {
+                            captured_requests.push(msg.clone());
+                        }
+                    }
+
+                    let result = server_request_result(&msg);
                     let reply = json!({
                         "jsonrpc": "2.0",
                         "id": msg_id,
-                        "result": null
+                        "result": result
                     });
                     self.write_message(&reply)?;
                 }
@@ -190,15 +215,50 @@ impl LspTestClient {
                 Ok(msg) => {
                     // Answer server requests
                     if let (Some(id), Some(_method)) = (msg.get("id"), msg.get("method")) {
+                        let result = server_request_result(&msg);
                         let reply = json!({
                             "jsonrpc": "2.0",
                             "id": id,
-                            "result": null
+                            "result": result
                         });
                         let _ = self.write_message(&reply);
                     }
                 }
                 Err(_) => break,
+            }
+        }
+    }
+
+    fn capture_server_requests(
+        &mut self,
+        watched_method: &str,
+        captured_requests: &mut Vec<Value>,
+        timeout: Duration,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            let msg = match self.rx.recv_timeout(remaining) {
+                Ok(msg) => msg,
+                Err(_) => break,
+            };
+
+            if msg.get("method").and_then(|m| m.as_str()) == Some(watched_method) {
+                captured_requests.push(msg.clone());
+            }
+
+            if let (Some(id), Some(_method)) = (msg.get("id"), msg.get("method")) {
+                let result = server_request_result(&msg);
+                let reply = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result
+                });
+                let _ = self.write_message(&reply);
             }
         }
     }
@@ -217,10 +277,11 @@ impl LspTestClient {
                 Ok(msg) => {
                     // Answer server requests
                     if let (Some(id), Some(_)) = (msg.get("id"), msg.get("method")) {
+                        let result = server_request_result(&msg);
                         let reply = json!({
                             "jsonrpc": "2.0",
                             "id": id,
-                            "result": null
+                            "result": result
                         });
                         let _ = self.write_message(&reply);
                     }
@@ -377,6 +438,13 @@ impl LspTestClient {
     }
 }
 
+fn server_request_result(msg: &Value) -> Value {
+    match msg.get("method").and_then(|method| method.as_str()) {
+        Some("window/showDocument") => json!({ "success": true }),
+        _ => Value::Null,
+    }
+}
+
 impl Drop for LspTestClient {
     fn drop(&mut self) {
         // Send a shutdown request so the server can gracefully terminate
@@ -493,6 +561,196 @@ fn test_sidecar_stays_alive() {
         "Sidecar appears to have died - hover request failed: {:?}",
         result.err()
     );
+}
+
+#[test]
+fn test_initialize_advertises_execute_command_provider() {
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+
+    let response = client
+        .send_request(
+            "initialize",
+            json!({
+                "processId": std::process::id(),
+                "rootUri": "file:///tmp/test-project",
+                "capabilities": {}
+            }),
+        )
+        .expect("initialize request failed");
+
+    let commands = response["result"]["capabilities"]["executeCommandProvider"]["commands"]
+        .as_array()
+        .expect("executeCommandProvider.commands should be present");
+    let commands: Vec<&str> = commands
+        .iter()
+        .filter_map(|command| command.as_str())
+        .collect();
+
+    assert!(
+        commands.contains(&"kotlin-analyzer.openTestTarget"),
+        "openTestTarget should be advertised"
+    );
+    assert!(
+        commands.contains(&"kotlin-analyzer.createAndOpenTestTarget"),
+        "createAndOpenTestTarget should be advertised"
+    );
+}
+
+#[test]
+fn test_execute_command_open_test_target_emits_show_document() {
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize()
+        .expect("Failed to initialize LSP server");
+
+    let (response, requests) = client
+        .send_request_and_capture_requests(
+            "workspace/executeCommand",
+            json!({
+                "command": "kotlin-analyzer.openTestTarget",
+                "arguments": [
+                    {
+                        "targetUri": "file:///tmp/existing-test.kt",
+                        "selection": {
+                            "startLine": 4,
+                            "startCharacter": 2,
+                            "endLine": 4,
+                            "endCharacter": 8
+                        }
+                    }
+                ]
+            }),
+            Some("window/showDocument"),
+        )
+        .expect("executeCommand should succeed");
+
+    assert_eq!(requests.len(), 1, "expected a single showDocument request");
+    assert_eq!(
+        requests[0]["params"]["uri"].as_str(),
+        Some("file:///tmp/existing-test.kt")
+    );
+    assert_eq!(
+        requests[0]["params"]["selection"],
+        json!({
+            "start": { "line": 4, "character": 2 },
+            "end": { "line": 4, "character": 8 }
+        })
+    );
+    assert_eq!(response["result"]["shown"], json!(true));
+}
+
+#[test]
+fn test_execute_command_create_and_open_writes_file_then_shows_document() {
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize()
+        .expect("Failed to initialize LSP server");
+
+    let workspace = tempdir().expect("failed to create tempdir");
+    let target_path = workspace.path().join("src/test/kotlin/ExampleTest.kt");
+    let target_uri = format!("file://{}", target_path.display());
+
+    let (response, requests) = client
+        .send_request_and_capture_requests(
+            "workspace/executeCommand",
+            json!({
+                "command": "kotlin-analyzer.createAndOpenTestTarget",
+                "arguments": [
+                    {
+                        "targetUri": target_uri,
+                        "targetPath": target_path,
+                        "initialContents": "class ExampleTest\n",
+                        "selection": {
+                            "startLine": 0,
+                            "startCharacter": 6,
+                            "endLine": 0,
+                            "endCharacter": 13
+                        }
+                    }
+                ]
+            }),
+            Some("window/showDocument"),
+        )
+        .expect("createAndOpen executeCommand should succeed");
+
+    assert_eq!(
+        std::fs::read_to_string(&target_path).expect("target file should be written"),
+        "class ExampleTest\n"
+    );
+    assert_eq!(requests.len(), 1, "expected a single showDocument request");
+    assert_eq!(
+        requests[0]["params"]["uri"].as_str(),
+        Some(target_uri.as_str())
+    );
+    assert_eq!(response["result"]["shown"], json!(true));
+    assert_eq!(response["result"]["created"], json!(true));
+}
+
+#[test]
+fn test_execute_command_rejects_invalid_payload_without_creating_file() {
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize()
+        .expect("Failed to initialize LSP server");
+
+    let workspace = tempdir().expect("failed to create tempdir");
+    let target_path = workspace.path().join("src/test/kotlin/Missing.kt");
+
+    let (response, requests) = client
+        .send_request_and_capture_requests(
+            "workspace/executeCommand",
+            json!({
+                "command": "kotlin-analyzer.createAndOpenTestTarget",
+                "arguments": [
+                    {
+                        "targetPath": target_path,
+                        "initialContents": "class Missing\n"
+                    }
+                ]
+            }),
+            Some("window/showDocument"),
+        )
+        .expect("server should return an LSP error response");
+
+    assert!(
+        response.get("error").is_some(),
+        "invalid payload should return an error response"
+    );
+    assert!(
+        !target_path.exists(),
+        "invalid payload should not create the target file"
+    );
+    assert!(
+        requests.is_empty(),
+        "invalid payload should not trigger showDocument"
+    );
+}
+
+#[test]
+fn test_execute_command_rejects_unsupported_command_ids() {
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize()
+        .expect("Failed to initialize LSP server");
+
+    let response = client
+        .send_request(
+            "workspace/executeCommand",
+            json!({
+                "command": "kotlin-analyzer.notSupported",
+                "arguments": [{}]
+            }),
+        )
+        .expect("server should respond with an error payload");
+
+    let error = response
+        .get("error")
+        .expect("unsupported command should be rejected");
+    assert_eq!(error["code"], json!(-32602));
+    assert!(error["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("unsupported analyzer command"));
 }
 
 #[test]

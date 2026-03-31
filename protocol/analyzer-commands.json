@@ -1,0 +1,50 @@
+{
+  "commands": {
+    "openTestTarget": {
+      "id": "kotlin-analyzer.openTestTarget",
+      "arguments": {
+        "targetUri": {
+          "type": "string",
+          "required": true
+        },
+        "selection": {
+          "type": "object",
+          "required": false,
+          "properties": {
+            "startLine": { "type": "integer", "required": true },
+            "startCharacter": { "type": "integer", "required": true },
+            "endLine": { "type": "integer", "required": true },
+            "endCharacter": { "type": "integer", "required": true }
+          }
+        }
+      }
+    },
+    "createAndOpenTestTarget": {
+      "id": "kotlin-analyzer.createAndOpenTestTarget",
+      "arguments": {
+        "targetUri": {
+          "type": "string",
+          "required": true
+        },
+        "targetPath": {
+          "type": "string",
+          "required": true
+        },
+        "initialContents": {
+          "type": "string",
+          "required": true
+        },
+        "selection": {
+          "type": "object",
+          "required": false,
+          "properties": {
+            "startLine": { "type": "integer", "required": true },
+            "startCharacter": { "type": "integer", "required": true },
+            "endLine": { "type": "integer", "required": true },
+            "endCharacter": { "type": "integer", "required": true }
+          }
+        }
+      }
+    }
+  }
+}
