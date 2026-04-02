@@ -169,8 +169,9 @@ class AnalysisServer(
             transport.sendError(request.id, -32602, "Missing uri param")
             return
         }
+        val version = params.get("version")?.takeUnless { it.isJsonNull }?.asInt
 
-        val result = bridge.analyze(uri)
+        val result = bridge.analyze(uri, version)
         transport.sendResult(request.id, result)
     }
 
@@ -212,8 +213,9 @@ class AnalysisServer(
             return
         }
         val character = params.get("character")?.asInt ?: 0
+        val triggerCharacter = params.get("triggerCharacter")?.takeUnless { it.isJsonNull }?.asString
 
-        val result = bridge.completion(uri, line, character)
+        val result = bridge.completion(uri, line, character, triggerCharacter)
         transport.sendResult(request.id, result)
     }
 

@@ -80,6 +80,136 @@ class CompilerBridgeIntegrationTest {
         assertEquals(0, errors.size, "clean file should have no error diagnostics, got: $errors")
     }
 
+    @Test
+    fun `analyze - unique property type candidate returns auto import edit`() {
+        val uri = "file://$testSourceDir/AutoImportPropertyType.kt"
+        val content = """
+            package scratch
+
+            class UsesType {
+                val service: PersonService = PersonService()
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.analyze(uri, version = 7)
+        val edits = result.getAsJsonArray("edits")
+
+        assertNotNull(edits, "edits array should be present")
+        assertEquals(1, edits.size(), "should return exactly one auto-import edit")
+        assertEquals(7, result.get("version")?.asInt, "analyze should echo the analyzed version")
+
+        val newText = edits[0].asJsonObject.get("newText")?.asString ?: ""
+        assertEquals("import service.PersonService\n\n", newText)
+    }
+
+    @Test
+    fun `analyze - unique function return type candidate returns auto import edit`() {
+        val uri = "file://$testSourceDir/AutoImportReturnType.kt"
+        val content = """
+            package scratch
+
+            fun load(): Person? = null
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.analyze(uri)
+        val edits = result.getAsJsonArray("edits")
+
+        assertNotNull(edits, "edits array should be present")
+        assertEquals(1, edits.size(), "should auto-import the unique return type candidate")
+
+        val newText = edits[0].asJsonObject.get("newText")?.asString ?: ""
+        assertEquals("import model.Person\n\n", newText)
+    }
+
+    @Test
+    fun `analyze - already imported type does not return auto import edit`() {
+        val uri = "file://$testSourceDir/AlreadyImportedType.kt"
+        val content = """
+            package scratch
+
+            import model.Person
+
+            fun load(): Person? = null
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.analyze(uri)
+        val edits = result.getAsJsonArray("edits")
+
+        assertNotNull(edits, "edits array should be present")
+        assertEquals(0, edits.size(), "already imported types should not produce duplicate edits")
+    }
+
+    @Test
+    fun `analyze - same package type does not return auto import edit`() {
+        val uri = "file://$testSourceDir/model/SamePackageUsage.kt"
+        val content = """
+            package model
+
+            fun load(): Person? = null
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.analyze(uri)
+        val edits = result.getAsJsonArray("edits")
+
+        assertNotNull(edits, "edits array should be present")
+        assertEquals(0, edits.size(), "same-package symbols should not produce imports")
+    }
+
+    @Test
+    fun `codeActions - ambiguous type import produces one action per candidate`() {
+        bridge.updateFile(
+            "file://$testSourceDir/alpha/UserService.kt",
+            """
+                package alpha
+
+                class UserService
+            """.trimIndent(),
+        )
+        bridge.updateFile(
+            "file://$testSourceDir/beta/UserService.kt",
+            """
+                package beta
+
+                class UserService
+            """.trimIndent(),
+        )
+
+        val uri = "file://$testSourceDir/AmbiguousTypeImport.kt"
+        val content = """
+            package scratch
+
+            val service: UserService? = null
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 3, character = 14)
+        val actions = result.getAsJsonArray("actions")
+
+        assertNotNull(actions, "actions array should be present")
+
+        val titles = actions.map { it.asJsonObject.get("title")?.asString ?: "" }
+        assertTrue(
+            titles.contains("Import 'UserService' from alpha.UserService"),
+            "should offer alpha import candidate, got: $titles"
+        )
+        assertTrue(
+            titles.contains("Import 'UserService' from beta.UserService"),
+            "should offer beta import candidate, got: $titles"
+        )
+
+        val ambiguousImports = titles.filter { it.startsWith("Import 'UserService' from ") }
+        assertEquals(2, ambiguousImports.size, "should emit one action per ambiguous candidate")
+
+        val analyzeResult = bridge.analyze(uri)
+        val edits = analyzeResult.getAsJsonArray("edits")
+        assertNotNull(edits, "edits array should be present")
+        assertEquals(0, edits.size(), "ambiguous candidates must not auto-import")
+    }
+
     // --- Hover ---
 
     @Test

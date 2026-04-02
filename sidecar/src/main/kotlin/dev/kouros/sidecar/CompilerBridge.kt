@@ -468,11 +468,12 @@ class CompilerBridge {
     /**
      * Analyzes a file and returns diagnostics.
      */
-    fun analyze(uri: String): JsonObject {
+    fun analyze(uri: String, version: Int? = null): JsonObject {
         ensureSessionCurrent()
 
         val result = JsonObject()
         val diagnosticsArray = JsonArray()
+        val editsArray = JsonArray()
 
         // Skip diagnostics for decompiled library stub files
         val tempDir = virtualFileTempDir
@@ -480,6 +481,7 @@ class CompilerBridge {
             val filePath = uriToPath(uri)
             if (filePath.startsWith(tempDir.resolve("decompiled").toString())) {
                 result.add("diagnostics", diagnosticsArray)
+                result.add("edits", editsArray)
                 return result
             }
         }
@@ -488,6 +490,7 @@ class CompilerBridge {
         if (currentSession == null) {
             System.err.println("CompilerBridge: analyze($uri) — session is NULL, returning empty diagnostics")
             result.add("diagnostics", diagnosticsArray)
+            result.add("edits", editsArray)
             return result
         }
 
@@ -495,6 +498,7 @@ class CompilerBridge {
         if (ktFile == null) {
             System.err.println("CompilerBridge: analyze($uri) — file not found anywhere")
             result.add("diagnostics", diagnosticsArray)
+            result.add("edits", editsArray)
             return result
         }
 
@@ -518,6 +522,7 @@ class CompilerBridge {
         try {
             analyze(ktFile) {
                 val analysisStart = System.currentTimeMillis()
+                val document = ktFile.viewProvider.document
                 val diagnostics = ktFile.collectDiagnostics(
                     KaDiagnosticCheckerFilter.EXTENDED_AND_COMMON_CHECKERS
                 )
@@ -527,7 +532,7 @@ class CompilerBridge {
                 for (d in diagnostics) {
                     System.err.println("  [${d.severity}] ${d.factoryName}: ${d.defaultMessage} at ${d.textRanges.firstOrNull()}")
                 }
-
+                val plannedFqns = linkedSetOf<String>()
                 for (diagnostic in diagnostics) {
                     // Filter false UNRESOLVED_REFERENCE for virtual files: if the unresolved
                     // name is declared in the same file, it's a false positive caused by the
@@ -558,7 +563,6 @@ class CompilerBridge {
                     val textRange = diagnostic.textRanges.firstOrNull()
                     if (textRange != null) {
                         try {
-                            val document = ktFile.viewProvider.document
                             if (document != null) {
                                 val startLine = document.getLineNumber(textRange.startOffset) + 1
                                 val startLineOffset = document.getLineStartOffset(
@@ -583,6 +587,20 @@ class CompilerBridge {
                     }
 
                     diagnosticsArray.add(diagObj)
+                    if (diagnostic.factoryName == "UNRESOLVED_REFERENCE" && textRange != null && document != null) {
+                        val plan = planTypeImportAssist(
+                            ktFile = ktFile,
+                            factoryName = diagnostic.factoryName,
+                            startOffset = textRange.startOffset,
+                            endOffset = textRange.endOffset,
+                        )
+                        if (plan != null && plan.candidates.size == 1) {
+                            val candidate = plan.candidates.single()
+                            if (plannedFqns.add(candidate.fqn)) {
+                                buildImportEdit(uri, ktFile, document, candidate.fqn)?.let(editsArray::add)
+                            }
+                        }
+                    }
                 }
             }
         } catch (e: Throwable) {
@@ -591,6 +609,10 @@ class CompilerBridge {
         }
 
         result.add("diagnostics", diagnosticsArray)
+        result.add("edits", editsArray)
+        if (version != null) {
+            result.addProperty("version", version)
+        }
         return result
     }
 
@@ -721,9 +743,54 @@ class CompilerBridge {
      * Returns type/signature information with KDoc documentation when available.
      */
     fun hover(uri: String, line: Int, character: Int): JsonObject {
-        ensureSessionCurrent()
-        val result = JsonObject()
         val perfStart = System.currentTimeMillis()
+        var result = hoverOnce(uri, line, character)
+
+        if (!result.has("contents") && sessionDirty) {
+            val currentReason = result.get("reason")?.asString ?: "no explicit reason"
+            System.err.println("CompilerBridge: hover($uri) — retrying after rebuild (reason=$currentReason)")
+            try {
+                ensureSessionCurrent()
+                result = hoverOnce(uri, line, character)
+            } catch (e: Throwable) {
+                val retryFailure = JsonObject()
+                retryFailure.addProperty("reason", "hover retry failed: ${e.javaClass.name}: ${e.message}")
+                result = retryFailure
+            }
+        }
+
+        System.err.println("[PERF] method=hover uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
+        return result
+    }
+
+    /**
+     * Provides completion items at the given position.
+     * Supports both scope-based completions and dot-member completions.
+     */
+    fun completion(uri: String, line: Int, character: Int, triggerCharacter: String? = null): JsonObject {
+        val perfStart = System.currentTimeMillis()
+        var result = completionOnce(uri, line, character, triggerCharacter)
+
+        if (result.getAsJsonArray("items")?.size() == 0 && sessionDirty) {
+            val currentReason = result.get("reason")?.asString ?: "no explicit reason"
+            System.err.println("CompilerBridge: completion($uri) — retrying after rebuild (reason=$currentReason)")
+            try {
+                ensureSessionCurrent()
+                result = completionOnce(uri, line, character, triggerCharacter)
+            } catch (e: Throwable) {
+                val retryFailure = JsonObject()
+                retryFailure.addProperty("reason", "completion retry failed: ${e.javaClass.name}: ${e.message}")
+                retryFailure.add("items", JsonArray())
+                result = retryFailure
+            }
+        }
+
+        System.err.println("[PERF] method=completion uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
+        return result
+    }
+
+    private fun hoverOnce(uri: String, line: Int, character: Int): JsonObject {
+        val result = JsonObject()
         var resolvedOffset: Int? = null
         val setFailureReason = { reason: String ->
             if (!result.has("reason")) {
@@ -751,7 +818,7 @@ class CompilerBridge {
                 }
                 resolvedOffset = offset
 
-                val element = ktFile.findElementAt(offset) ?: ktFile.findElementAt(maxOf(0, offset - 1))
+                val element = findHoverElement(ktFile, line, offset)
                 if (element == null) {
                     val reason = "findElementAt=null (offset=$offset, textLen=${ktFile.text.length})"
                     setFailureReason(reason)
@@ -834,25 +901,29 @@ class CompilerBridge {
             System.err.println("CompilerBridge: $reason")
         }
 
-        System.err.println("[PERF] method=hover uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
         return result
     }
 
-    /**
-     * Provides completion items at the given position.
-     * Supports both scope-based completions and dot-member completions.
-     */
-    fun completion(uri: String, line: Int, character: Int): JsonObject {
-        ensureSessionCurrent()
+    private fun completionOnce(uri: String, line: Int, character: Int, triggerCharacter: String?): JsonObject {
         val result = JsonObject()
         val itemsArray = JsonArray()
-        val perfStart = System.currentTimeMillis()
+        val setFailureReason = { reason: String ->
+            if (!result.has("reason")) {
+                result.addProperty("reason", reason)
+            }
+        }
+
+        if (sessionDirty) {
+            System.err.println("CompilerBridge: completion($uri) — serving from existing session while rebuild is pending")
+        }
 
         val currentSession = session ?: run {
+            setFailureReason("no-active-session")
             result.add("items", itemsArray)
             return result
         }
         val ktFile = findKtFile(currentSession, uri) ?: run {
+            setFailureReason("file-not-found")
             result.add("items", itemsArray)
             return result
         }
@@ -860,6 +931,7 @@ class CompilerBridge {
         try {
             analyze(ktFile) {
                 val offset = lineColToOffset(ktFile, line, character) ?: run {
+                    setFailureReason("line-col-offset-null (line=$line, char=$character)")
                     result.add("items", itemsArray)
                     return@analyze
                 }
@@ -868,12 +940,19 @@ class CompilerBridge {
                     ?: ktFile.findElementAt(maxOf(0, offset - 1))
 
                 if (element == null) {
+                    setFailureReason("findElementAt=null (offset=$offset)")
                     result.add("items", itemsArray)
                     return@analyze
                 }
 
                 // Check if we are in a dot-qualified expression (member completion)
                 val dotCompletion = findDotCompletionReceiver(element, offset)
+                    ?: if (triggerCharacter == ".") {
+                        findDotCompletionReceiverAtOffset(ktFile, offset)
+                            ?: findReceiverExpressionEndingAtOffset(ktFile, offset)
+                    } else {
+                        null
+                    }
                 if (dotCompletion != null) {
                     collectMemberCompletions(dotCompletion, itemsArray)
                 } else {
@@ -886,12 +965,19 @@ class CompilerBridge {
                         appendUnimportedCompletions(ktFile, prefix, itemsArray)
                     }
                 }
+
+                if (itemsArray.size() == 0) {
+                    setFailureReason("no-completion-items")
+                } else {
+                    result.remove("reason")
+                }
             }
         } catch (e: Throwable) {
-            System.err.println("CompilerBridge: completion failed: ${e.javaClass.name}: ${e.message}")
+            val reason = "completion failed: ${e.javaClass.name}: ${e.message}"
+            setFailureReason(reason)
+            System.err.println("CompilerBridge: $reason")
         }
 
-        System.err.println("[PERF] method=completion uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
         result.add("items", itemsArray)
         return result
     }
@@ -1654,58 +1740,16 @@ class CompilerBridge {
                             actionsArray.add(action)
                         }
 
-                        // Add import action for unresolved references
                         if (factoryName == "UNRESOLVED_REFERENCE") {
-                            val unresolvedText = ktFile.text.substring(
-                                textRange.startOffset,
-                                minOf(textRange.endOffset, ktFile.text.length)
+                            addTypeImportCodeActions(
+                                uri = fileUri,
+                                ktFile = ktFile,
+                                document = document,
+                                factoryName = factoryName,
+                                startOffset = textRange.startOffset,
+                                endOffset = textRange.endOffset,
+                                actionsArray = actionsArray,
                             )
-
-                            val importCandidates = findImportCandidates(unresolvedText)
-                            val importInsertLine = findImportInsertLine(ktFile, document)
-
-                            if (importCandidates.isNotEmpty()) {
-                                for (fqn in importCandidates) {
-                                    val action = JsonObject()
-                                    action.addProperty("title", "Import '$fqn'")
-                                    action.addProperty("kind", "quickfix")
-
-                                    val actionEdits = JsonArray()
-                                    val importEdit = JsonObject()
-                                    importEdit.addProperty("uri", fileUri)
-                                    val importRange = JsonObject()
-                                    importRange.addProperty("startLine", importInsertLine)
-                                    importRange.addProperty("startColumn", 0)
-                                    importRange.addProperty("endLine", importInsertLine)
-                                    importRange.addProperty("endColumn", 0)
-                                    importEdit.add("range", importRange)
-                                    importEdit.addProperty("newText", "import $fqn\n")
-                                    actionEdits.add(importEdit)
-
-                                    action.add("edits", actionEdits)
-                                    actionsArray.add(action)
-                                }
-                            } else {
-                                // Fallback: offer the short name import
-                                val action = JsonObject()
-                                action.addProperty("title", "Add import for '$unresolvedText'")
-                                action.addProperty("kind", "quickfix")
-
-                                val actionEdits = JsonArray()
-                                val importEdit = JsonObject()
-                                importEdit.addProperty("uri", fileUri)
-                                val importRange = JsonObject()
-                                importRange.addProperty("startLine", importInsertLine)
-                                importRange.addProperty("startColumn", 0)
-                                importRange.addProperty("endLine", importInsertLine)
-                                importRange.addProperty("endColumn", 0)
-                                importEdit.add("range", importRange)
-                                importEdit.addProperty("newText", "import $unresolvedText\n")
-                                actionEdits.add(importEdit)
-
-                                action.add("edits", actionEdits)
-                                actionsArray.add(action)
-                            }
                         }
                     }
                 } catch (e: Exception) {
@@ -1715,6 +1759,8 @@ class CompilerBridge {
                 // 2. Context-aware refactoring actions
                 val element = ktFile.findElementAt(offset)
                 if (element != null) {
+                    addOpenOrCreateUnitTestAction(element, fileUri, actionsArray)
+
                     // Add explicit type annotation for properties without one
                     addExplicitTypeAction(element, document, fileUri, actionsArray)
 
@@ -1745,6 +1791,98 @@ class CompilerBridge {
         System.err.println("[PERF] method=codeActions uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
         result.add("actions", actionsArray)
         return result
+    }
+
+    private fun addOpenOrCreateUnitTestAction(
+        element: PsiElement,
+        fileUri: String,
+        actionsArray: JsonArray,
+    ) {
+        val targetClass = findUnitTestActionClass(element) ?: return
+        val className = targetClass.name ?: return
+        val packageName = targetClass.containingKtFile.packageFqName.asString()
+        val sourcePath = Path.of(uriToPath(fileUri))
+        val plan = KotlinUnitTestPlanner.plan(sourcePath, packageName, className)
+        if (plan is KotlinUnitTestPlan.Unavailable) {
+            return
+        }
+
+        val action = JsonObject().apply {
+            addProperty("title", "Open or Create Unit Test")
+            addProperty("kind", "refactor")
+            add("command", buildUnitTestCommand(plan))
+        }
+        actionsArray.add(action)
+    }
+
+    private fun findUnitTestActionClass(element: PsiElement): KtClass? {
+        val target = when (element) {
+            is PsiWhiteSpace, is PsiComment -> element.prevSibling ?: element.parent
+            else -> element
+        } ?: return null
+
+        val ktClass = PsiTreeUtil.getParentOfType(target, KtClass::class.java, false) ?: return null
+        val nameIdentifier = ktClass.nameIdentifier
+        val interestingElement = sequenceOf(target, target.parent)
+            .filterNotNull()
+            .firstOrNull { candidate ->
+                candidate == nameIdentifier || candidate.node?.elementType == KtTokens.CLASS_KEYWORD
+            }
+
+        return if (interestingElement != null) ktClass else null
+    }
+
+    private fun buildUnitTestCommand(plan: KotlinUnitTestPlan): JsonObject {
+        return when (plan) {
+            is KotlinUnitTestPlan.Existing -> JsonObject().apply {
+                addProperty("title", "Open or Create Unit Test")
+                addProperty("command", AnalyzerCommands.OPEN_TEST_TARGET)
+                add(
+                    "arguments",
+                    JsonArray().also { arguments ->
+                        arguments.add(
+                            JsonObject().apply {
+                                addProperty(AnalyzerCommands.ARG_TARGET_URI, plan.targetUri)
+                                add(
+                                    AnalyzerCommands.ARG_SELECTION,
+                                    plan.selection.toJson(),
+                                )
+                            }
+                        )
+                    },
+                )
+            }
+            is KotlinUnitTestPlan.Create -> JsonObject().apply {
+                addProperty("title", "Open or Create Unit Test")
+                addProperty("command", AnalyzerCommands.CREATE_AND_OPEN_TEST_TARGET)
+                add(
+                    "arguments",
+                    JsonArray().also { arguments ->
+                        arguments.add(
+                            JsonObject().apply {
+                                addProperty(AnalyzerCommands.ARG_TARGET_URI, plan.targetUri)
+                                addProperty(AnalyzerCommands.ARG_TARGET_PATH, plan.targetPath.toString())
+                                addProperty(AnalyzerCommands.ARG_INITIAL_CONTENTS, plan.initialContents)
+                                add(
+                                    AnalyzerCommands.ARG_SELECTION,
+                                    plan.selection.toJson(),
+                                )
+                            }
+                        )
+                    },
+                )
+            }
+            is KotlinUnitTestPlan.Unavailable -> error("unavailable plan should not be converted to a command")
+        }
+    }
+
+    private fun TestTargetSelection.toJson(): JsonObject {
+        return JsonObject().apply {
+            addProperty(AnalyzerCommands.ARG_START_LINE, startLine)
+            addProperty(AnalyzerCommands.ARG_START_CHARACTER, startCharacter)
+            addProperty(AnalyzerCommands.ARG_END_LINE, endLine)
+            addProperty(AnalyzerCommands.ARG_END_CHARACTER, endCharacter)
+        }
     }
 
     /**
@@ -1964,6 +2102,11 @@ class CompilerBridge {
      * Result of analyzing a declaration body for references to members of its containing class.
      */
     private data class BodyAnalysis(val referencesThis: Boolean, val accessesPrivateMembers: Boolean)
+    private data class ImportCandidate(val shortName: String, val fqn: String)
+    private data class TypeImportAssistPlan(
+        val shortName: String,
+        val candidates: List<ImportCandidate>,
+    )
 
     /**
      * Analyzes a declaration body in a single pass for both `this` references and private member access.
@@ -2052,6 +2195,149 @@ class CompilerBridge {
         edit.add("range", range)
         edit.addProperty("newText", newText)
         return edit
+    }
+
+    private fun addTypeImportCodeActions(
+        uri: String,
+        ktFile: KtFile,
+        document: com.intellij.openapi.editor.Document,
+        factoryName: String?,
+        startOffset: Int,
+        endOffset: Int,
+        actionsArray: JsonArray,
+    ) {
+        val plan = planTypeImportAssist(ktFile, factoryName, startOffset, endOffset) ?: return
+        if (plan.candidates.size <= 1) return
+
+        for (candidate in plan.candidates) {
+            val importEdit = buildImportEdit(uri, ktFile, document, candidate.fqn) ?: continue
+            val action = JsonObject()
+            action.addProperty("title", "Import '${plan.shortName}' from ${candidate.fqn}")
+            action.addProperty("kind", "quickfix")
+
+            val actionEdits = JsonArray()
+            actionEdits.add(importEdit)
+            action.add("edits", actionEdits)
+            actionsArray.add(action)
+        }
+    }
+
+    private fun planTypeImportAssist(
+        ktFile: KtFile,
+        factoryName: String?,
+        startOffset: Int,
+        endOffset: Int,
+    ): TypeImportAssistPlan? {
+        if (factoryName != "UNRESOLVED_REFERENCE") return null
+        if (startOffset >= endOffset) return null
+
+        val unresolvedElement = ktFile.findElementAt(startOffset) ?: return null
+        val userType = PsiTreeUtil.getParentOfType(
+            unresolvedElement,
+            KtUserType::class.java,
+            false,
+        ) ?: return null
+        if (userType.qualifier != null) return null
+
+        val simpleName = userType.referenceExpression ?: return null
+        val unresolvedText = ktFile.text.substring(startOffset, minOf(endOffset, ktFile.text.length))
+        if (simpleName.getReferencedName() != unresolvedText) return null
+
+        val typeReference = PsiTreeUtil.getParentOfType(userType, KtTypeReference::class.java, false) ?: return null
+        val owner = typeReference.parent
+        val supported = when (owner) {
+            is KtProperty -> owner.typeReference == typeReference
+            is KtNamedFunction -> owner.typeReference == typeReference
+            else -> false
+        }
+        if (!supported) return null
+
+        val shortName = simpleName.getReferencedName()
+        if (!shortName.matches(Regex("[A-Za-z_][A-Za-z0-9_]*"))) return null
+
+        val candidates = findImportCandidates(ktFile, shortName)
+        if (candidates.isEmpty()) return null
+
+        return TypeImportAssistPlan(shortName = shortName, candidates = candidates)
+    }
+
+    private fun findImportCandidates(ktFile: KtFile, shortName: String): List<ImportCandidate> {
+        val currentPackage = ktFile.packageFqName.asString()
+        val existingImports = ktFile.importDirectives
+            .mapNotNull { it.importedFqName?.asString() }
+            .toSet()
+
+        return symbolIndex.findByShortName(shortName)
+            .mapNotNull { declaration ->
+                val fqn = declaration.fqn ?: return@mapNotNull null
+                if (fqn == shortName) return@mapNotNull null
+
+                val packageName = fqn.substringBeforeLast('.', "")
+                if (packageName == currentPackage) return@mapNotNull null
+                if (fqn in existingImports) return@mapNotNull null
+
+                ImportCandidate(shortName = shortName, fqn = fqn)
+            }
+            .distinctBy { it.fqn }
+            .sortedBy { it.fqn }
+    }
+
+    private fun buildImportEdit(
+        uri: String,
+        ktFile: KtFile,
+        document: com.intellij.openapi.editor.Document,
+        fqn: String,
+    ): JsonObject? {
+        if ('.' !in fqn) return null
+
+        val currentPackage = ktFile.packageFqName.asString()
+        val packageName = fqn.substringBeforeLast('.', "")
+        if (packageName == currentPackage) return null
+
+        val existingImports = ktFile.importDirectives
+            .mapNotNull { it.importedFqName?.asString() }
+            .toSet()
+        if (fqn in existingImports) return null
+
+        val (insertLine, newText) = computeImportInsertion(ktFile, document, fqn)
+        return makeEdit(uri, insertLine, 0, insertLine, 0, newText)
+    }
+
+    private fun computeImportInsertion(
+        ktFile: KtFile,
+        document: com.intellij.openapi.editor.Document,
+        fqn: String,
+    ): Pair<Int, String> {
+        val importList = ktFile.importList
+        if (importList != null && importList.imports.isNotEmpty()) {
+            val lastImport = importList.imports.last()
+            val insertLine = document.getLineNumber(lastImport.textRange.endOffset) + 2
+            val needsBlankLine = lineNeedsBlankLineBeforeDeclarations(document, insertLine)
+            val newText = if (needsBlankLine) "import $fqn\n\n" else "import $fqn\n"
+            return Pair(insertLine, newText)
+        }
+
+        val packageDirective = ktFile.packageDirective
+        if (packageDirective != null && packageDirective.text.isNotBlank()) {
+            return Pair(
+                document.getLineNumber(packageDirective.textRange.endOffset) + 2,
+                "import $fqn\n\n",
+            )
+        }
+
+        return Pair(1, "import $fqn\n\n")
+    }
+
+    private fun lineNeedsBlankLineBeforeDeclarations(
+        document: com.intellij.openapi.editor.Document,
+        line: Int,
+    ): Boolean {
+        val zeroBasedLine = line - 1
+        if (zeroBasedLine < 0 || zeroBasedLine >= document.lineCount) return true
+
+        val startOffset = document.getLineStartOffset(zeroBasedLine)
+        val endOffset = document.getLineEndOffset(zeroBasedLine)
+        return document.charsSequence.subSequence(startOffset, endOffset).toString().isNotBlank()
     }
 
     /**
@@ -3935,21 +4221,43 @@ class CompilerBridge {
 
         // Also check if the previous character is a dot
         val file = element.containingFile ?: return null
-        val document = file.viewProvider.document ?: return null
-        val checkOffset = maxOf(0, offset - 1)
-        if (checkOffset < document.textLength) {
-            val charBefore = document.charsSequence[checkOffset]
-            if (charBefore == '.') {
-                // Find the expression just before the dot
-                val beforeDot = file.findElementAt(maxOf(0, checkOffset - 1)) ?: return null
-                var expr: PsiElement? = beforeDot
-                while (expr != null && expr !is KtFile) {
-                    if (expr is KtExpression && expr.textRange.endOffset == checkOffset) {
-                        return expr
-                    }
-                    expr = expr.parent
-                }
+        return findDotCompletionReceiverAtOffset(file, offset)
+    }
+
+    private fun findDotCompletionReceiverAtOffset(file: PsiElement, offset: Int): KtExpression? {
+        val containingFile = file.containingFile ?: return null
+        val fileText = containingFile.text
+        if (fileText.isEmpty()) return null
+
+        val checkOffset = (offset - 1).coerceAtLeast(0)
+        if (checkOffset >= fileText.length || fileText[checkOffset] != '.') {
+            return null
+        }
+
+        // Find the expression just before the dot using PSI from the raw file text.
+        val beforeDot = containingFile.findElementAt((checkOffset - 1).coerceAtLeast(0)) ?: return null
+        var expr: PsiElement? = beforeDot
+        while (expr != null && expr !is KtFile) {
+            if (expr is KtExpression && expr.textRange.endOffset == checkOffset) {
+                return expr
             }
+            expr = expr.parent
+        }
+
+        return null
+    }
+
+    private fun findReceiverExpressionEndingAtOffset(file: KtFile, offset: Int): KtExpression? {
+        if (offset <= 0) return null
+
+        val probeOffset = minOf(offset - 1, file.text.length - 1)
+        val leaf = file.findElementAt(probeOffset) ?: return null
+        var current: PsiElement? = leaf
+        while (current != null && current !is KtFile) {
+            if (current is KtExpression && current.textRange.endOffset == offset) {
+                return current
+            }
+            current = current.parent
         }
 
         return null
@@ -4199,7 +4507,6 @@ class CompilerBridge {
         if (candidates.isEmpty()) return
 
         val document = ktFile.viewProvider.document ?: return
-        val importLine = findImportInsertLine(ktFile, document)
 
         for (decl in candidates) {
             val item = JsonObject()
@@ -4212,7 +4519,8 @@ class CompilerBridge {
             // additionalTextEdits: insert the import statement
             val editsArray = JsonArray()
             val edit = JsonObject()
-            edit.addProperty("newText", "import ${decl.fqn}\n")
+            val (importLine, newText) = computeImportInsertion(ktFile, document, decl.fqn!!)
+            edit.addProperty("newText", newText)
             edit.addProperty("line", importLine)
             edit.addProperty("column", 0)
             edit.addProperty("endLine", importLine)
@@ -4431,21 +4739,7 @@ class CompilerBridge {
         ktFile: KtFile,
         document: com.intellij.openapi.editor.Document,
     ): Int {
-        // If there are existing imports, insert after the last one
-        val importList = ktFile.importList
-        if (importList != null && importList.imports.isNotEmpty()) {
-            val lastImport = importList.imports.last()
-            return document.getLineNumber(lastImport.textRange.endOffset) + 2 // 1-based, next line
-        }
-
-        // If there's a package statement, insert after it (with a blank line)
-        val packageDirective = ktFile.packageDirective
-        if (packageDirective != null && packageDirective.text.isNotBlank()) {
-            return document.getLineNumber(packageDirective.textRange.endOffset) + 3 // 1-based, skip blank line
-        }
-
-        // Otherwise insert at the top
-        return 1
+        return computeImportInsertion(ktFile, document, "placeholder.Foo").first
     }
 
     // --- Private helpers: code lens ---
@@ -4482,14 +4776,6 @@ class CompilerBridge {
      * Searches all files in the session for top-level declarations matching the given short name.
      * Returns a list of fully-qualified names that could be imported.
      */
-    private fun findImportCandidates(shortName: String): List<String> {
-        return symbolIndex.findByShortName(shortName)
-            .mapNotNull { it.fqn }
-            .filter { it != shortName }
-            .distinct()
-            .sorted()
-    }
-
     // --- Private helpers: semantic tokens ---
 
     /**

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use lsp_types::request::Request as LspRequest;
 use lsp_types::*;
 use serde::Deserialize;
 use serde_json::Value;
@@ -77,6 +78,14 @@ struct CreateAndOpenTestTargetArgs {
 enum AnalyzerCommandRequest {
     OpenTestTarget(OpenTestTargetArgs),
     CreateAndOpenTestTarget(CreateAndOpenTestTargetArgs),
+}
+
+enum CompatibleShowDocument {}
+
+impl LspRequest for CompatibleShowDocument {
+    type Params = ShowDocumentParams;
+    type Result = Option<ShowDocumentResult>;
+    const METHOD: &'static str = "window/showDocument";
 }
 
 fn analyzer_command_contract() -> &'static AnalyzerCommandContract {
@@ -201,6 +210,22 @@ fn parse_workspace_edits(result: &Value) -> HashMap<Url, Vec<TextEdit>> {
     }
 
     changes
+}
+
+fn response_version(result: &Value) -> Option<i32> {
+    result
+        .get("version")
+        .and_then(|value| value.as_i64())
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn analyze_edits_are_current(
+    expected_version: i32,
+    current_version: Option<i32>,
+    result: &Value,
+) -> bool {
+    let response_version = response_version(result).unwrap_or(expected_version);
+    response_version == expected_version && current_version == Some(expected_version)
 }
 
 fn parse_code_action_command(action: &Value) -> Option<lsp_types::Command> {
@@ -369,6 +394,7 @@ impl KotlinLanguageServer {
                 "analyze",
                 Some(serde_json::json!({
                     "uri": uri.as_str(),
+                    "version": version,
                 })),
             )
             .await
@@ -399,6 +425,7 @@ impl KotlinLanguageServer {
                     let mut documents = self.documents.lock().await;
                     documents.set_diagnostics(uri.clone(), diagnostics.clone());
                 }
+                self.apply_analyzed_edits(uri, &result).await;
                 self.client
                     .publish_diagnostics(uri.clone(), diagnostics, None)
                     .await;
@@ -488,7 +515,7 @@ impl KotlinLanguageServer {
     async fn show_document(&self, uri: Url, selection: Option<CommandSelection>) -> LspResult<()> {
         let shown = self
             .client
-            .show_document(ShowDocumentParams {
+            .send_request::<CompatibleShowDocument>(ShowDocumentParams {
                 uri,
                 external: Some(false),
                 take_focus: Some(true),
@@ -499,7 +526,7 @@ impl KotlinLanguageServer {
                 request_failed_error(format!("window/showDocument failed: {error}"))
             })?;
 
-        if shown {
+        if show_document_acknowledged(shown) {
             Ok(())
         } else {
             Err(request_failed_error(
@@ -557,6 +584,60 @@ impl KotlinLanguageServer {
             .collect()
     }
 
+    fn parse_result_version(result: &Value) -> Option<i32> {
+        result
+            .get("version")
+            .and_then(|value| value.as_i64())
+            .and_then(|value| i32::try_from(value).ok())
+    }
+
+    async fn apply_analyzed_edits(&self, uri: &Url, result: &Value) {
+        let planned_version = match Self::parse_result_version(result) {
+            Some(version) => version,
+            None => return,
+        };
+
+        let current_version = {
+            let documents = self.documents.lock().await;
+            documents.get(uri).map(|doc| doc.version)
+        };
+        if !analyze_edits_are_current(planned_version, current_version, result) {
+            tracing::debug!(
+                "skipping analyzer edit for {} because version changed (planned={}, current={:?}, response={:?})",
+                uri,
+                planned_version,
+                current_version,
+                response_version(result),
+            );
+            return;
+        }
+
+        let edits = parse_workspace_edits(result);
+        if edits.is_empty() {
+            return;
+        }
+
+        let edit = WorkspaceEdit {
+            changes: Some(edits),
+            document_changes: None,
+            change_annotations: None,
+        };
+
+        match self.client.apply_edit(edit).await {
+            Ok(response) if response.applied => {}
+            Ok(response) => {
+                tracing::warn!(
+                    "client rejected analyzer edit for {}: {:?}",
+                    uri,
+                    response.failure_reason,
+                );
+            }
+            Err(error) => {
+                tracing::warn!("failed to apply analyzer edit for {}: {}", uri, error);
+            }
+        }
+    }
+
     /// Starts the debounce loop for document analysis.
     fn start_debounce_loop(&self) -> tokio::sync::mpsc::Sender<Url> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Url>(64);
@@ -591,12 +672,12 @@ impl KotlinLanguageServer {
                             };
                             if let Some(bridge) = bridge_arc {
                                 if bridge.state().await == SidecarState::Ready {
-                                    let documents = documents.lock().await;
-                                    if let Some(doc) = documents.get(&uri) {
+                                    let document_store = documents.lock().await;
+                                    if let Some(doc) = document_store.get(&uri) {
                                         let text = doc.text.clone();
                                         let version = doc.version;
                                         let kind = doc.kind;
-                                        drop(documents);
+                                        drop(document_store);
 
                                         let _ = bridge.notify(kind.did_change_method(), Some(serde_json::json!({
                                             "uri": uri.as_str(),
@@ -610,8 +691,38 @@ impl KotlinLanguageServer {
 
                                         match bridge.request("analyze", Some(serde_json::json!({
                                             "uri": uri.as_str(),
+                                            "version": version,
                                         }))).await {
                                             Ok(result) => {
+                                                if let Some(planned_version) = Self::parse_result_version(&result) {
+                                                    let current_version = {
+                                                        let document_store = documents.lock().await;
+                                                        document_store.get(&uri).map(|doc| doc.version)
+                                                    };
+                                                    if current_version == Some(planned_version) {
+                                                        let edits = parse_workspace_edits(&result);
+                                                        if !edits.is_empty() {
+                                                            let edit = WorkspaceEdit {
+                                                                changes: Some(edits),
+                                                                document_changes: None,
+                                                                change_annotations: None,
+                                                            };
+                                                            match client.apply_edit(edit).await {
+                                                                Ok(response) if response.applied => {}
+                                                                Ok(response) => tracing::warn!(
+                                                                    "client rejected analyzer edit for {}: {:?}",
+                                                                    uri,
+                                                                    response.failure_reason,
+                                                                ),
+                                                                Err(error) => tracing::warn!(
+                                                                    "failed to apply analyzer edit for {}: {}",
+                                                                    uri,
+                                                                    error,
+                                                                ),
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                                 let diagnostics = parse_diagnostics_static(&result);
                                                 client.publish_diagnostics(uri, diagnostics, None).await;
                                             }
@@ -1502,11 +1613,31 @@ impl LanguageServer for KotlinLanguageServer {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
         let version = params.text_document.version;
+        let mut latest_doc = None;
 
         // Full sync mode — take the last content change
         if let Some(change) = params.content_changes.into_iter().last() {
             let mut documents = self.documents.lock().await;
             documents.change(&uri, change.text, version);
+            latest_doc = documents.get(&uri).cloned();
+        }
+
+        // Keep the sidecar's virtual file state in sync immediately so
+        // completion/hover/definition requests see the latest editor buffer
+        // instead of waiting for the debounced diagnostics path.
+        if let Some(doc) = latest_doc {
+            if let Some(bridge) = self.get_bridge().await {
+                let _ = bridge
+                    .notify(
+                        doc.kind.did_change_method(),
+                        Some(serde_json::json!({
+                            "uri": uri.as_str(),
+                            "version": doc.version,
+                            "text": doc.text,
+                        })),
+                    )
+                    .await;
+            }
         }
 
         // Send to debounce loop for analysis
@@ -1572,6 +1703,10 @@ impl LanguageServer for KotlinLanguageServer {
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
+        let trigger_character = params
+            .context
+            .as_ref()
+            .and_then(|context| context.trigger_character.clone());
 
         let bridge = match self.get_bridge().await {
             Some(b) => b,
@@ -1585,12 +1720,26 @@ impl LanguageServer for KotlinLanguageServer {
                     "uri": uri.as_str(),
                     "line": position.line + 1,
                     "character": position.character,
+                    "triggerCharacter": trigger_character,
                 })),
             )
             .await
         {
             Ok(result) => {
                 let items = self.parse_completion_items(&result);
+                if items.is_empty() {
+                    let reason = result
+                        .get("reason")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("no explicit reason");
+                    tracing::warn!(
+                        "completion returned no items for {}:{}:{} (reason={})",
+                        uri,
+                        position.line,
+                        position.character,
+                        reason
+                    );
+                }
                 Ok(Some(CompletionResponse::Array(items)))
             }
             Err(e) => {
@@ -2924,6 +3073,13 @@ impl KotlinLanguageServer {
     }
 }
 
+fn show_document_acknowledged(result: Option<ShowDocumentResult>) -> bool {
+    match result {
+        Some(result) => result.success,
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3059,5 +3215,50 @@ mod tests {
 
         assert_eq!(error.code, ErrorCode::InvalidParams);
         assert!(error.message.contains("invalid arguments"));
+    }
+
+    #[test]
+    fn analyze_edits_are_current_requires_matching_document_and_response_versions() {
+        let result = json!({
+            "version": 7,
+            "edits": [
+                {
+                    "uri": "file:///tmp/Test.kt",
+                    "range": {
+                        "startLine": 1,
+                        "startColumn": 0,
+                        "endLine": 1,
+                        "endColumn": 0
+                    },
+                    "newText": "import model.Person\n"
+                }
+            ]
+        });
+
+        assert!(analyze_edits_are_current(7, Some(7), &result));
+        assert!(!analyze_edits_are_current(7, Some(8), &result));
+        assert!(!analyze_edits_are_current(
+            7,
+            Some(7),
+            &json!({ "version": 8 })
+        ));
+    }
+
+    #[test]
+    fn response_version_handles_absent_and_non_numeric_values() {
+        assert_eq!(response_version(&json!({ "version": 3 })), Some(3));
+        assert_eq!(response_version(&json!({})), None);
+        assert_eq!(response_version(&json!({ "version": "three" })), None);
+    }
+
+    #[test]
+    fn show_document_acknowledged_accepts_null_response_for_zed_compatibility() {
+        assert!(show_document_acknowledged(None));
+        assert!(show_document_acknowledged(Some(ShowDocumentResult {
+            success: true
+        })));
+        assert!(!show_document_acknowledged(Some(ShowDocumentResult {
+            success: false
+        })));
     }
 }
