@@ -275,6 +275,30 @@ class CompilerBridgeIntegrationTest {
         )
     }
 
+    @Test
+    fun `completion - dirty on-disk local member completion retries after rebuild`() {
+        val uri = "file://$testSourceDir/Completion.kt"
+        val content = """
+            class MyClass {
+                fun test() {
+                    val headline = "hello"
+                    headline.
+                }
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.completion(uri, line = 4, character = 17, triggerCharacter = ".")
+
+        val items = result.getAsJsonArray("items")
+        assertNotNull(items, "completion items array should be present")
+        val labels = items.map { it.asJsonObject.get("label")?.asString ?: "" }
+        assertTrue(
+            labels.any { it == "length" || it == "uppercase" || it == "isEmpty" },
+            "dirty on-disk member completion should include String members, got: ${labels.take(20)} (reason=${result.get("reason")?.asString})"
+        )
+    }
+
     // --- Signature Help ---
 
     @Test
@@ -359,6 +383,27 @@ class CompilerBridgeIntegrationTest {
         assertTrue(
             contents.contains("computeSum") || contents.contains("Int"),
             "hover should reflect the injected content, got: $contents"
+        )
+    }
+
+    @Test
+    fun `updateFile - hover on dirty on-disk local reference retries after rebuild`() {
+        val uri = "file://$testSourceDir/Clean.kt"
+        val content = """
+            fun greet() {
+                val headline = "hello"
+                println(headline)
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.hover(uri, line = 3, character = 14)
+
+        val contents = result.get("contents")?.asString
+        assertNotNull(contents, "hover should return contents for dirty on-disk local reference")
+        assertTrue(
+            contents.contains("headline") || contents.contains("String"),
+            "hover should resolve the local reference after retry, got: $contents"
         )
     }
 
