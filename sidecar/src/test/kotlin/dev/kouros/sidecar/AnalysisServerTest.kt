@@ -11,6 +11,32 @@ import kotlin.test.assertTrue
 class AnalysisServerTest {
 
     @Test
+    fun `json rpc transport reads didOpen payloads with multibyte UTF-8 text`() {
+        val text = """
+            package café
+
+            fun greet() = "Grüße 🚀"
+        """.trimIndent()
+        val input = buildString {
+            appendRpcNotification(
+                method = "textDocument/didOpen",
+                params = JsonObject().apply {
+                    addProperty("uri", "file:///workspace/src/main/kotlin/Greeting.kt")
+                    addProperty("text", text)
+                },
+            )
+        }.toByteArray(Charsets.UTF_8)
+
+        val request = JsonRpcTransport(
+            input = ByteArrayInputStream(input),
+            output = ByteArrayOutputStream(),
+        ).readRequest()
+
+        assertEquals("textDocument/didOpen", request?.method)
+        assertEquals(text, request?.params?.get("text")?.asString)
+    }
+
+    @Test
     fun `initialize reports bundled Kotlin version`() {
         val input = buildString {
             appendRpcRequest(
@@ -98,6 +124,49 @@ class AnalysisServerTest {
 
         assertEquals(1, locations.size())
         assertEquals(layoutUri, locations[0].asJsonObject.get("uri").asString)
+    }
+
+    @Test
+    fun `didOpen with non ascii content preserves JSON-RPC framing`() {
+        val uri = "file:///workspace/src/main/kotlin/Unicode.kt"
+        val unicodeText = buildString {
+            append("package demo\n\n")
+            append("val greeting = \"Grüße aus Köln 👋\"\n")
+            append("// ")
+            append("äöüß".repeat(512))
+            append('\n')
+        }
+
+        val input = buildString {
+            appendRpcNotification(
+                method = "textDocument/didOpen",
+                params = JsonObject().apply {
+                    addProperty("uri", uri)
+                    addProperty("text", unicodeText)
+                },
+            )
+            appendRpcRequest(
+                id = 1,
+                method = "shutdown",
+                params = JsonObject(),
+            )
+        }.toByteArray(Charsets.UTF_8)
+
+        val output = ByteArrayOutputStream()
+        val server = AnalysisServer(
+            transport = JsonRpcTransport(
+                input = ByteArrayInputStream(input),
+                output = output,
+            ),
+        )
+
+        server.run()
+
+        val responses = parseResponses(output.toString(Charsets.UTF_8))
+        val shutdownResult = responses.first { it.get("id").asLong == 1L }
+            .getAsJsonObject("result")
+
+        assertTrue(shutdownResult.get("success").asBoolean)
     }
 
     private fun StringBuilder.appendRpcRequest(id: Long, method: String, params: JsonObject) {

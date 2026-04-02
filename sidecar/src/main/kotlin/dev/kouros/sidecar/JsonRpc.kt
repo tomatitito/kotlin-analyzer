@@ -38,8 +38,8 @@ class JsonRpcTransport(
     private val input: InputStream,
     private val output: OutputStream,
 ) {
-    private val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8))
-    private val writer = BufferedWriter(OutputStreamWriter(output, Charsets.UTF_8))
+    private val bufferedInput = BufferedInputStream(input)
+    private val bufferedOutput = BufferedOutputStream(output)
     private val gson = Gson()
 
     /**
@@ -49,15 +49,15 @@ class JsonRpcTransport(
     fun readRequest(): JsonRpcRequest? {
         val contentLength = readContentLength() ?: return null
 
-        val body = CharArray(contentLength)
+        val body = ByteArray(contentLength)
         var read = 0
         while (read < contentLength) {
-            val n = reader.read(body, read, contentLength - read)
+            val n = bufferedInput.read(body, read, contentLength - read)
             if (n == -1) return null
             read += n
         }
 
-        val json = String(body)
+        val json = body.toString(Charsets.UTF_8)
         return try {
             val obj = JsonParser.parseString(json).asJsonObject
             JsonRpcRequest(
@@ -78,12 +78,12 @@ class JsonRpcTransport(
     fun writeResponse(response: JsonRpcResponse) {
         val json = gson.toJson(response)
         val bytes = json.toByteArray(Charsets.UTF_8)
+        val header = "Content-Length: ${bytes.size}\r\n\r\n".toByteArray(Charsets.UTF_8)
 
-        synchronized(writer) {
-            writer.write("Content-Length: ${bytes.size}\r\n")
-            writer.write("\r\n")
-            writer.write(json)
-            writer.flush()
+        synchronized(bufferedOutput) {
+            bufferedOutput.write(header)
+            bufferedOutput.write(bytes)
+            bufferedOutput.flush()
         }
     }
 
@@ -110,7 +110,7 @@ class JsonRpcTransport(
         var contentLength: Int? = null
 
         while (true) {
-            val line = reader.readLine() ?: return null // EOF
+            val line = readAsciiLine() ?: return null // EOF
             val trimmed = line.trim()
 
             if (trimmed.isEmpty()) break // End of headers
@@ -121,5 +121,22 @@ class JsonRpcTransport(
         }
 
         return contentLength
+    }
+
+    private fun readAsciiLine(): String? {
+        val buffer = ByteArrayOutputStream()
+
+        while (true) {
+            val next = bufferedInput.read()
+            if (next == -1) {
+                return if (buffer.size() == 0) null else buffer.toString(Charsets.UTF_8)
+            }
+
+            if (next == '\n'.code) {
+                return buffer.toString(Charsets.UTF_8).removeSuffix("\r")
+            }
+
+            buffer.write(next)
+        }
     }
 }
