@@ -370,6 +370,27 @@ impl LspTestClient {
         Ok(())
     }
 
+    fn change_document(
+        &mut self,
+        uri: &str,
+        version: i32,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let params = json!({
+            "textDocument": {
+                "uri": uri,
+                "version": version
+            },
+            "contentChanges": [
+                {
+                    "text": text
+                }
+            ]
+        });
+
+        self.send_notification("textDocument/didChange", params)
+    }
+
     fn hover(
         &mut self,
         uri: &str,
@@ -898,6 +919,64 @@ fun main() {
     );
 }
 
+#[test]
+fn test_completion_works_immediately_after_did_change_on_disk_file() {
+    let workspace = tempdir().expect("failed to create temporary workspace");
+    let src_dir = workspace.path().join("src/main/kotlin");
+    std::fs::create_dir_all(&src_dir).expect("failed to create source dir");
+
+    let file_path = src_dir.join("CompletionAfterEdit.kt");
+    let initial_text = r#"fun main() {
+    val str = "Hello"
+    str
+}
+"#;
+    let updated_text = r#"fun main() {
+    val str = "Hello"
+    str.
+}
+"#;
+    std::fs::write(&file_path, initial_text).expect("failed to write Kotlin file");
+
+    let root_uri = format!("file://{}", workspace.path().display());
+    let uri = format!("file://{}", file_path.display());
+
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize_with_root(&root_uri)
+        .expect("Failed to initialize LSP server");
+    client
+        .open_document(&uri, initial_text)
+        .expect("Failed to open document");
+    client
+        .change_document(&uri, 2, updated_text)
+        .expect("Failed to send didChange");
+
+    let params = json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": 2, "character": 8 },
+        "context": {
+            "triggerKind": 2,
+            "triggerCharacter": "."
+        }
+    });
+
+    let response = client
+        .send_request("textDocument/completion", params)
+        .expect("Completion request failed");
+
+    let items = response.get("result").and_then(|r| {
+        r.as_array()
+            .or_else(|| r.get("items").and_then(|i| i.as_array()))
+    });
+
+    assert!(
+        items.is_some() && !items.unwrap().is_empty(),
+        "Completion after didChange should return String methods but got none or empty. Response: {:?}",
+        response.get("result")
+    );
+}
+
 // Plan: code-actions-not-showing.md
 // Code actions don't appear in Zed despite being implemented in the sidecar.
 
@@ -959,6 +1038,182 @@ fn test_code_actions_returned_for_expression_body() {
             .filter_map(|a| a.get("title").and_then(|t| t.as_str()))
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn test_unit_test_code_action_opens_existing_target() {
+    let workspace = tempdir().expect("failed to create temporary workspace");
+    let source_dir = workspace.path().join("src/main/kotlin/com/example");
+    let test_dir = workspace.path().join("src/test/kotlin/com/example");
+    std::fs::create_dir_all(&source_dir).expect("failed to create main source dir");
+    std::fs::create_dir_all(&test_dir).expect("failed to create test source dir");
+
+    let source_path = source_dir.join("Foo.kt");
+    let test_path = test_dir.join("FooTest.kt");
+    let source_text = "package com.example\n\nclass Foo {\n    fun value(): Int = 42\n}\n";
+    let test_text = concat!(
+        "package com.example\n\n",
+        "import org.junit.jupiter.api.Test\n\n",
+        "class FooTest {\n",
+        "    @Test\n",
+        "    fun existingWorks() {\n",
+        "    }\n",
+        "}\n"
+    );
+    std::fs::write(&source_path, source_text).expect("failed to write source file");
+    std::fs::write(&test_path, test_text).expect("failed to write existing test file");
+
+    let source_uri = format!("file://{}", source_path.display());
+    let test_uri = format!("file://{}", test_path.display());
+    let root_uri = format!("file://{}", workspace.path().display());
+
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize_with_root(&root_uri)
+        .expect("Failed to initialize LSP server");
+    client
+        .open_document(&source_uri, source_text)
+        .expect("Failed to open source document");
+
+    let code_action_response = client
+        .send_request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": source_uri },
+                "range": {
+                    "start": { "line": 2, "character": 7 },
+                    "end": { "line": 2, "character": 7 }
+                },
+                "context": { "diagnostics": [] }
+            }),
+        )
+        .expect("Code action request failed");
+
+    let action = code_action_response["result"]
+        .as_array()
+        .and_then(|actions| {
+            actions.iter().find(|action| {
+                action.get("title").and_then(|title| title.as_str())
+                    == Some("Open or Create Unit Test")
+            })
+        })
+        .cloned()
+        .expect("expected unit-test code action");
+
+    let command = action["command"].clone();
+    let (response, requests) = client
+        .send_request_and_capture_requests(
+            "workspace/executeCommand",
+            json!({
+                "command": command["command"],
+                "arguments": command["arguments"],
+            }),
+            Some("window/showDocument"),
+        )
+        .expect("executeCommand should succeed");
+
+    assert_eq!(requests.len(), 1, "expected a single showDocument request");
+    assert_eq!(
+        requests[0]["params"]["uri"].as_str(),
+        Some(test_uri.as_str())
+    );
+    assert_eq!(
+        requests[0]["params"]["selection"],
+        json!({
+            "start": { "line": 6, "character": 4 },
+            "end": { "line": 6, "character": 4 }
+        })
+    );
+    assert_eq!(response["result"]["shown"], json!(true));
+    assert_eq!(
+        std::fs::read_to_string(&test_path).expect("existing test file should remain readable"),
+        test_text
+    );
+}
+
+#[test]
+fn test_unit_test_code_action_creates_missing_target() {
+    let workspace = tempdir().expect("failed to create temporary workspace");
+    let source_dir = workspace.path().join("src/main/kotlin/com/example");
+    std::fs::create_dir_all(&source_dir).expect("failed to create main source dir");
+
+    let source_path = source_dir.join("Foo.kt");
+    let source_text = "package com.example\n\nclass Foo {\n    fun value(): Int = 42\n}\n";
+    std::fs::write(&source_path, source_text).expect("failed to write source file");
+
+    let source_uri = format!("file://{}", source_path.display());
+    let root_uri = format!("file://{}", workspace.path().display());
+    let expected_test_path = workspace
+        .path()
+        .join("src/test/kotlin/com/example/FooTest.kt");
+    let expected_test_uri = format!("file://{}", expected_test_path.display());
+
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize_with_root(&root_uri)
+        .expect("Failed to initialize LSP server");
+    client
+        .open_document(&source_uri, source_text)
+        .expect("Failed to open source document");
+
+    let code_action_response = client
+        .send_request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": source_uri },
+                "range": {
+                    "start": { "line": 2, "character": 7 },
+                    "end": { "line": 2, "character": 7 }
+                },
+                "context": { "diagnostics": [] }
+            }),
+        )
+        .expect("Code action request failed");
+
+    let action = code_action_response["result"]
+        .as_array()
+        .and_then(|actions| {
+            actions.iter().find(|action| {
+                action.get("title").and_then(|title| title.as_str())
+                    == Some("Open or Create Unit Test")
+            })
+        })
+        .cloned()
+        .expect("expected unit-test code action");
+
+    let command = action["command"].clone();
+    let (response, requests) = client
+        .send_request_and_capture_requests(
+            "workspace/executeCommand",
+            json!({
+                "command": command["command"],
+                "arguments": command["arguments"],
+            }),
+            Some("window/showDocument"),
+        )
+        .expect("executeCommand should succeed");
+
+    let created_text =
+        std::fs::read_to_string(&expected_test_path).expect("expected test file to be created");
+
+    assert_eq!(requests.len(), 1, "expected a single showDocument request");
+    assert_eq!(
+        requests[0]["params"]["uri"].as_str(),
+        Some(expected_test_uri.as_str())
+    );
+    assert_eq!(
+        requests[0]["params"]["selection"],
+        json!({
+            "start": { "line": 7, "character": 8 },
+            "end": { "line": 7, "character": 8 }
+        })
+    );
+    assert_eq!(response["result"]["shown"], json!(true));
+    assert_eq!(response["result"]["created"], json!(true));
+    assert!(created_text.contains("package com.example"));
+    assert!(created_text.contains("import org.junit.jupiter.api.Test"));
+    assert!(created_text.contains("class FooTest"));
+    assert!(created_text.contains("fun hurz()"));
 }
 
 // --- Regression tests for active plans ---
