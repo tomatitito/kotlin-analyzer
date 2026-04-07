@@ -18,14 +18,22 @@ class AnalyzerCommandsTest {
 
         assertEquals(
             listOf(
+                AnalyzerCommands.OPEN_TARGET,
                 AnalyzerCommands.OPEN_TEST_TARGET,
                 AnalyzerCommands.CREATE_AND_OPEN_TEST_TARGET,
             ),
             listOf(
+                commands.getAsJsonObject("openTarget").get("id").asString,
                 commands.getAsJsonObject("openTestTarget").get("id").asString,
                 commands.getAsJsonObject("createAndOpenTestTarget").get("id").asString,
             ),
         )
+
+        val openTargetArgs = commands
+            .getAsJsonObject("openTarget")
+            .getAsJsonObject("arguments")
+            .keySet()
+        assertEquals(setOf(AnalyzerCommands.ARG_TARGET_URI, AnalyzerCommands.ARG_SELECTION), openTargetArgs)
 
         val openArgs = commands
             .getAsJsonObject("openTestTarget")
@@ -48,7 +56,7 @@ class AnalyzerCommandsTest {
         )
 
         val selection = commands
-            .getAsJsonObject("openTestTarget")
+            .getAsJsonObject("openTarget")
             .getAsJsonObject("arguments")
             .getAsJsonObject(AnalyzerCommands.ARG_SELECTION)
         val properties = selection.getAsJsonObject("properties")

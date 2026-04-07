@@ -956,14 +956,21 @@ class CompilerBridge {
                 if (dotCompletion != null) {
                     collectMemberCompletions(dotCompletion, itemsArray)
                 } else {
-                    // Scope-based completion: gather declarations from enclosing scopes
-                    collectScopeCompletions(ktFile, element, itemsArray)
-
-                    // Append unimported symbols from the index
                     val prefix = extractCompletionPrefix(element, offset)
-                    if (prefix.isNotEmpty()) {
-                        appendUnimportedCompletions(ktFile, prefix, itemsArray)
-                    }
+                    val visibleCandidates = collectScopeCompletionCandidates(ktFile, element)
+                    val keywordCandidates = keywordCompletionCandidates()
+                    val autoImportCandidates = collectUnimportedCompletionCandidates(
+                        ktFile = ktFile,
+                        prefix = prefix,
+                        existingLabels = (visibleCandidates + keywordCandidates)
+                            .map { it.label }
+                            .toSet(),
+                    )
+
+                    rankScopeCompletionCandidates(
+                        prefix = prefix,
+                        candidates = visibleCandidates + keywordCandidates + autoImportCandidates,
+                    ).forEach(itemsArray::add)
                 }
 
                 if (itemsArray.size() == 0) {
@@ -1759,6 +1766,7 @@ class CompilerBridge {
                 // 2. Context-aware refactoring actions
                 val element = ktFile.findElementAt(offset)
                 if (element != null) {
+                    addInterfaceNavigationActions(element, actionsArray)
                     addOpenOrCreateUnitTestAction(element, fileUri, actionsArray)
 
                     // Add explicit type annotation for properties without one
@@ -1791,6 +1799,128 @@ class CompilerBridge {
         System.err.println("[PERF] method=codeActions uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
         result.add("actions", actionsArray)
         return result
+    }
+
+    private data class NavigationTarget(
+        val title: String,
+        val targetUri: String,
+        val selection: JsonObject,
+    )
+
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.addInterfaceNavigationActions(
+        element: PsiElement,
+        actionsArray: JsonArray,
+    ) {
+        val target = when (element) {
+            is PsiWhiteSpace, is PsiComment -> element.prevSibling ?: element.parent
+            else -> element
+        } ?: return
+
+        val classOrObject = PsiTreeUtil.getParentOfType(target, KtClassOrObject::class.java, false) ?: return
+        val nameIdentifier = classOrObject.nameIdentifier ?: return
+        val interestingElement = sequenceOf(target, target.parent)
+            .filterNotNull()
+            .firstOrNull { candidate ->
+                candidate == nameIdentifier ||
+                    candidate.node?.elementType == KtTokens.CLASS_KEYWORD ||
+                    candidate.node?.elementType == KtTokens.OBJECT_KEYWORD ||
+                    candidate.node?.elementType == KtTokens.INTERFACE_KEYWORD
+            } ?: return
+
+        val targets = when {
+            classOrObject is KtClass && classOrObject.isInterface() ->
+                findImplementationNavigationTargets(classOrObject)
+            interestingElement == nameIdentifier ||
+                interestingElement.node?.elementType == KtTokens.CLASS_KEYWORD ||
+                interestingElement.node?.elementType == KtTokens.OBJECT_KEYWORD ->
+                findInterfaceNavigationTargets(classOrObject)
+            else -> emptyList()
+        }
+
+        targets
+            .sortedBy { it.title }
+            .forEach { targetInfo ->
+                actionsArray.add(
+                    JsonObject().apply {
+                        addProperty("title", targetInfo.title)
+                        addProperty("kind", "refactor")
+                        add("command", buildOpenTargetCommand(targetInfo))
+                    }
+                )
+            }
+    }
+
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.findImplementationNavigationTargets(
+        interfaceDeclaration: KtClass,
+    ): List<NavigationTarget> {
+        val interfaceSymbol = interfaceDeclaration.symbol as? KaNamedClassSymbol ?: return emptyList()
+        if (interfaceSymbol.classKind != KaClassKind.INTERFACE) return emptyList()
+        val interfaceClassId = interfaceSymbol.classId ?: return emptyList()
+
+        return allSessionKtFiles()
+            .asSequence()
+            .flatMap { file ->
+                PsiTreeUtil.collectElementsOfType(file, KtClassOrObject::class.java).asSequence()
+            }
+            .filter { candidate -> candidate !== interfaceDeclaration }
+            .filter { candidate -> isConcreteImplementationCandidate(candidate) }
+            .mapNotNull { candidate ->
+                val candidateSymbol = candidate.symbol as? KaNamedClassSymbol ?: return@mapNotNull null
+                val implementsInterface = candidateSymbol.superTypes
+                    .filterIsInstance<KaClassType>()
+                    .any { superType ->
+                        val superSymbol = superType.symbol as? KaNamedClassSymbol
+                        superSymbol?.classKind == KaClassKind.INTERFACE &&
+                            superSymbol.classId == interfaceClassId
+                    }
+                if (!implementsInterface) return@mapNotNull null
+
+                val candidateName = candidate.name ?: return@mapNotNull null
+                navigationTargetFor(candidate, "Go to Implementation: $candidateName")
+            }
+            .distinctBy { it.targetUri to it.title }
+            .toList()
+    }
+
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.findInterfaceNavigationTargets(
+        classOrObject: KtClassOrObject,
+    ): List<NavigationTarget> {
+        val classSymbol = classOrObject.symbol as? KaNamedClassSymbol ?: return emptyList()
+        if (classSymbol.classKind == KaClassKind.INTERFACE) return emptyList()
+
+        return classSymbol.superTypes
+            .filterIsInstance<KaClassType>()
+            .mapNotNull { superType ->
+                val superSymbol = superType.symbol as? KaNamedClassSymbol ?: return@mapNotNull null
+                if (superSymbol.classKind != KaClassKind.INTERFACE) return@mapNotNull null
+                val interfacePsi = superSymbol.psi as? KtClassOrObject ?: return@mapNotNull null
+                val interfaceName = interfacePsi.name ?: return@mapNotNull null
+                navigationTargetFor(interfacePsi, "Go to Interface: $interfaceName")
+            }
+            .distinctBy { it.targetUri to it.title }
+            .toList()
+    }
+
+    private fun isConcreteImplementationCandidate(candidate: KtClassOrObject): Boolean {
+        if (candidate is KtObjectDeclaration && candidate.isCompanion()) return false
+        if (candidate is KtClass && (candidate.isInterface() || candidate.isEnum() || candidate.hasModifier(KtTokens.ABSTRACT_KEYWORD))) {
+            return false
+        }
+        return true
+    }
+
+    private fun navigationTargetFor(
+        declaration: KtClassOrObject,
+        title: String,
+    ): NavigationTarget? {
+        val targetUri = fileUriForKtFile(declaration.containingKtFile) ?: return null
+        val nameIdentifier = declaration.nameIdentifier ?: return null
+        val document = declaration.containingKtFile.viewProvider.document ?: return null
+        return NavigationTarget(
+            title = title,
+            targetUri = targetUri,
+            selection = selectionForOffset(document, nameIdentifier.textOffset, nameIdentifier.textLength),
+        )
     }
 
     private fun addOpenOrCreateUnitTestAction(
@@ -1873,6 +2003,24 @@ class CompilerBridge {
                 )
             }
             is KotlinUnitTestPlan.Unavailable -> error("unavailable plan should not be converted to a command")
+        }
+    }
+
+    private fun buildOpenTargetCommand(target: NavigationTarget): JsonObject {
+        return JsonObject().apply {
+            addProperty("title", target.title)
+            addProperty("command", AnalyzerCommands.OPEN_TARGET)
+            add(
+                "arguments",
+                JsonArray().also { arguments ->
+                    arguments.add(
+                        JsonObject().apply {
+                            addProperty(AnalyzerCommands.ARG_TARGET_URI, target.targetUri)
+                            add(AnalyzerCommands.ARG_SELECTION, target.selection)
+                        }
+                    )
+                },
+            )
         }
     }
 
@@ -2107,6 +2255,22 @@ class CompilerBridge {
         val shortName: String,
         val candidates: List<ImportCandidate>,
     )
+    private data class ScopeCompletionCandidate(
+        val label: String,
+        val source: ScopeCompletionSource,
+        val item: JsonObject,
+    )
+    private data class RankedScopeCompletionCandidate(
+        val candidate: ScopeCompletionCandidate,
+        val sourcePriority: Int,
+        val matchPriority: Int,
+        val originalIndex: Int,
+    )
+    private enum class ScopeCompletionSource {
+        VISIBLE_SCOPE,
+        KEYWORD,
+        AUTO_IMPORT,
+    }
 
     /**
      * Analyzes a declaration body in a single pass for both `this` references and private member access.
@@ -4380,16 +4544,26 @@ class CompilerBridge {
     }
 
     /**
-     * Collects scope-based completions by using the Analysis API scope context.
-     * Gathers declarations visible at the given position including local variables,
-     * parameters, functions, classes, and top-level declarations.
-     * Must be called inside an `analyze` block.
+     * Collects visible non-member scope completion candidates.
+     * Candidate scoring and final ordering happen in a later stage.
      */
-    private fun org.jetbrains.kotlin.analysis.api.KaSession.collectScopeCompletions(
+    private fun org.jetbrains.kotlin.analysis.api.KaSession.collectScopeCompletionCandidates(
         ktFile: KtFile,
         element: PsiElement,
-        itemsArray: JsonArray,
-    ) {
+    ): List<ScopeCompletionCandidate> {
+        val candidates = mutableListOf<ScopeCompletionCandidate>()
+
+        fun addCandidate(item: JsonObject) {
+            val label = item.get("label")?.asString ?: return
+            candidates.add(
+                ScopeCompletionCandidate(
+                    label = label,
+                    source = ScopeCompletionSource.VISIBLE_SCOPE,
+                    item = item,
+                )
+            )
+        }
+
         // Find the nearest KtElement for scope context
         val ktElement = PsiTreeUtil.getParentOfType(element, KtElement::class.java, false)
             ?: element as? KtElement
@@ -4403,74 +4577,72 @@ class CompilerBridge {
 
                 // Collect callables from scope
                 for (callable in compositeScope.callables) {
-                    if (callable is KaNamedSymbol) {
-                        val name = callable.name.asString()
-                        if (name.startsWith("<") || !seen.add(name)) continue
+                    if (callable !is KaNamedSymbol) continue
 
-                        val returnType = try {
-                            callable.returnType.render(
-                                KaTypeRendererForSource.WITH_SHORT_NAMES,
-                                Variance.INVARIANT
-                            )
-                        } catch (_: Exception) { "" }
+                    val name = callable.name.asString()
+                    if (name.startsWith("<") || !seen.add(name)) continue
 
-                        val item = JsonObject()
-                        item.addProperty("label", name)
-                        item.addProperty("kind", symbolToCompletionKind(callable))
-                        item.addProperty("detail", returnType)
+                    val returnType = try {
+                        callable.returnType.render(
+                            KaTypeRendererForSource.WITH_SHORT_NAMES,
+                            Variance.INVARIANT
+                        )
+                    } catch (_: Exception) { "" }
 
-                        if (callable is KaFunctionSymbol) {
-                            val params = callable.valueParameters
-                            if (params.isEmpty()) {
-                                item.addProperty("insertText", "$name()")
-                            } else {
-                                item.addProperty("insertText", "$name(")
-                            }
+                    val item = JsonObject()
+                    item.addProperty("label", name)
+                    item.addProperty("kind", symbolToCompletionKind(callable))
+                    item.addProperty("detail", returnType)
+
+                    if (callable is KaFunctionSymbol) {
+                        val params = callable.valueParameters
+                        if (params.isEmpty()) {
+                            item.addProperty("insertText", "$name()")
                         } else {
-                            item.addProperty("insertText", name)
+                            item.addProperty("insertText", "$name(")
                         }
-
-                        itemsArray.add(item)
+                    } else {
+                        item.addProperty("insertText", name)
                     }
+
+                    addCandidate(item)
                 }
 
                 // Collect classifiers from scope
                 for (classifier in compositeScope.classifiers) {
-                    if (classifier is KaNamedSymbol) {
-                        val name = classifier.name.asString()
-                        if (name.startsWith("<") || !seen.add(name)) continue
+                    if (classifier !is KaNamedSymbol) continue
 
-                        val kind = when (classifier) {
-                            is KaNamedClassSymbol -> when (classifier.classKind) {
-                                KaClassKind.ENUM_CLASS -> "enum"
-                                KaClassKind.INTERFACE -> "interface"
-                                KaClassKind.OBJECT, KaClassKind.COMPANION_OBJECT -> "module"
-                                else -> "class"
-                            }
-                            is KaTypeAliasSymbol -> "class"
-                            is KaTypeParameterSymbol -> "typeParameter"
+                    val name = classifier.name.asString()
+                    if (name.startsWith("<") || !seen.add(name)) continue
+
+                    val kind = when (classifier) {
+                        is KaNamedClassSymbol -> when (classifier.classKind) {
+                            KaClassKind.ENUM_CLASS -> "enum"
+                            KaClassKind.INTERFACE -> "interface"
+                            KaClassKind.OBJECT, KaClassKind.COMPANION_OBJECT -> "module"
                             else -> "class"
                         }
-
-                        val item = JsonObject()
-                        item.addProperty("label", name)
-                        item.addProperty("kind", kind)
-                        item.addProperty("detail", "")
-                        item.addProperty("insertText", name)
-                        itemsArray.add(item)
+                        is KaTypeAliasSymbol -> "class"
+                        is KaTypeParameterSymbol -> "typeParameter"
+                        else -> "class"
                     }
+
+                    val item = JsonObject()
+                    item.addProperty("label", name)
+                    item.addProperty("kind", kind)
+                    item.addProperty("detail", "")
+                    item.addProperty("insertText", name)
+                    addCandidate(item)
                 }
             } catch (e: Exception) {
                 System.err.println("CompilerBridge: scope completion failed, falling back to PSI: ${e.message}")
-                // Fallback to PSI-based completion
-                collectPsiScopeCompletions(element, itemsArray)
+                candidates += collectPsiScopeCompletionCandidates(element)
             }
         } else {
-            collectPsiScopeCompletions(element, itemsArray)
+            candidates += collectPsiScopeCompletionCandidates(element)
         }
 
-        // Always add Kotlin keywords
-        addKeywordCompletions(itemsArray)
+        return candidates
     }
 
     /**
@@ -4489,13 +4661,15 @@ class CompilerBridge {
     }
 
     /**
-     * Appends completion items for unimported symbols that match the prefix.
+     * Collects completion items for unimported symbols that match the prefix.
      * Each item includes additionalTextEdits to auto-insert the import statement.
      */
-    private fun appendUnimportedCompletions(ktFile: KtFile, prefix: String, itemsArray: JsonArray) {
-        val existingLabels = (0 until itemsArray.size())
-            .map { itemsArray[it].asJsonObject.get("label")?.asString ?: "" }
-            .toSet()
+    private fun collectUnimportedCompletionCandidates(
+        ktFile: KtFile,
+        prefix: String,
+        existingLabels: Set<String>,
+    ): List<ScopeCompletionCandidate> {
+        if (prefix.isEmpty()) return emptyList()
 
         val existingImports = ktFile.importDirectives
             .mapNotNull { it.importedFqName?.asString() }
@@ -4504,17 +4678,16 @@ class CompilerBridge {
         val candidates = symbolIndex.searchSymbols(prefix, limit = 20)
             .filter { it.fqn != null && it.fqn !in existingImports && it.shortName !in existingLabels }
 
-        if (candidates.isEmpty()) return
+        if (candidates.isEmpty()) return emptyList()
 
-        val document = ktFile.viewProvider.document ?: return
+        val document = ktFile.viewProvider.document ?: return emptyList()
 
-        for (decl in candidates) {
+        return candidates.map { decl ->
             val item = JsonObject()
             item.addProperty("label", decl.shortName)
             item.addProperty("kind", decl.kind)
             item.addProperty("detail", decl.fqn)
             item.addProperty("insertText", decl.shortName)
-            item.addProperty("sortText", "z_${decl.shortName}") // rank after imported symbols
 
             // additionalTextEdits: insert the import statement
             val editsArray = JsonArray()
@@ -4528,16 +4701,32 @@ class CompilerBridge {
             editsArray.add(edit)
             item.add("additionalTextEdits", editsArray)
 
-            itemsArray.add(item)
+            ScopeCompletionCandidate(
+                label = decl.shortName,
+                source = ScopeCompletionSource.AUTO_IMPORT,
+                item = item,
+            )
         }
     }
 
     /**
      * Fallback: walks up the PSI tree to collect named declarations in enclosing scopes.
      */
-    private fun collectPsiScopeCompletions(element: PsiElement, itemsArray: JsonArray) {
+    private fun collectPsiScopeCompletionCandidates(element: PsiElement): List<ScopeCompletionCandidate> {
+        val candidates = mutableListOf<ScopeCompletionCandidate>()
         val seen = mutableSetOf<String>()
         var current: PsiElement? = element.parent
+
+        fun addCandidate(item: JsonObject) {
+            val label = item.get("label")?.asString ?: return
+            candidates.add(
+                ScopeCompletionCandidate(
+                    label = label,
+                    source = ScopeCompletionSource.VISIBLE_SCOPE,
+                    item = item,
+                )
+            )
+        }
 
         while (current != null && current !is KtFile) {
             if (current is KtBlockExpression || current is KtClassBody || current is KtFunction) {
@@ -4551,7 +4740,7 @@ class CompilerBridge {
                         item.addProperty("kind", psiToCompletionKind(child))
                         item.addProperty("detail", "")
                         item.addProperty("insertText", name)
-                        itemsArray.add(item)
+                        addCandidate(item)
                     }
                 }
             }
@@ -4566,7 +4755,7 @@ class CompilerBridge {
                     item.addProperty("kind", "variable")
                     item.addProperty("detail", param.typeReference?.text ?: "")
                     item.addProperty("insertText", name)
-                    itemsArray.add(item)
+                    addCandidate(item)
                 }
             }
             current = current.parent
@@ -4584,15 +4773,17 @@ class CompilerBridge {
                 item.addProperty("kind", psiToCompletionKind(decl))
                 item.addProperty("detail", "")
                 item.addProperty("insertText", name)
-                itemsArray.add(item)
+                addCandidate(item)
             }
         }
+
+        return candidates
     }
 
     /**
-     * Adds common Kotlin keyword completions.
+     * Builds common Kotlin keyword completion candidates.
      */
-    private fun addKeywordCompletions(itemsArray: JsonArray) {
+    private fun keywordCompletionCandidates(): List<ScopeCompletionCandidate> {
         val keywords = listOf(
             "val", "var", "fun", "class", "interface", "object", "enum",
             "if", "else", "when", "for", "while", "do", "return", "break",
@@ -4605,13 +4796,71 @@ class CompilerBridge {
             "external", "annotation", "const", "lateinit", "by", "lazy",
         )
 
-        for (keyword in keywords) {
+        return keywords.map { keyword ->
             val item = JsonObject()
             item.addProperty("label", keyword)
             item.addProperty("kind", "keyword")
             item.addProperty("detail", "")
             item.addProperty("insertText", keyword)
-            itemsArray.add(item)
+            ScopeCompletionCandidate(
+                label = keyword,
+                source = ScopeCompletionSource.KEYWORD,
+                item = item,
+            )
+        }
+    }
+
+    /**
+     * Orders non-member scope completion candidates by source priority, then match bucket,
+     * leaving room for future fuzzy buckets without changing candidate collection.
+     */
+    private fun rankScopeCompletionCandidates(
+        prefix: String,
+        candidates: List<ScopeCompletionCandidate>,
+    ): List<JsonObject> {
+        val normalizedPrefix = prefix.lowercase()
+
+        return candidates
+            .mapIndexed { index, candidate ->
+                RankedScopeCompletionCandidate(
+                    candidate = candidate,
+                    sourcePriority = sourcePriority(candidate.source),
+                    matchPriority = matchPriority(
+                        label = candidate.label,
+                        prefix = prefix,
+                        normalizedPrefix = normalizedPrefix,
+                    ),
+                    originalIndex = index,
+                )
+            }
+            .sortedWith(
+                compareBy<RankedScopeCompletionCandidate>(
+                    { it.sourcePriority },
+                    { it.matchPriority },
+                    { it.candidate.label.lowercase() },
+                    { it.candidate.label },
+                    { it.originalIndex },
+                )
+            )
+            .map { it.candidate.item }
+    }
+
+    private fun sourcePriority(source: ScopeCompletionSource): Int = when (source) {
+        ScopeCompletionSource.VISIBLE_SCOPE -> 0
+        ScopeCompletionSource.KEYWORD -> 1
+        ScopeCompletionSource.AUTO_IMPORT -> 2
+    }
+
+    private fun matchPriority(label: String, prefix: String, normalizedPrefix: String): Int {
+        if (normalizedPrefix.isEmpty()) return 0
+
+        val normalizedLabel = label.lowercase()
+        return when {
+            label == prefix -> 0
+            normalizedLabel == normalizedPrefix -> 1
+            label.startsWith(prefix) -> 2
+            normalizedLabel.startsWith(normalizedPrefix) -> 3
+            else -> 4
         }
     }
 
@@ -5447,6 +5696,37 @@ class CompilerBridge {
     private fun getVirtualFileContent(uri: String): String? = getVirtualFileEntry(uri)?.second
 
     private fun hasVirtualFile(uri: String): Boolean = getVirtualFileContent(uri) != null
+
+    private fun allSessionKtFiles(): List<KtFile> {
+        val currentSession = session ?: return emptyList()
+        return currentSession.modulesWithFiles.entries
+            .flatMap { (_, files) -> files }
+            .filterIsInstance<KtFile>()
+    }
+
+    private fun fileUriForKtFile(ktFile: KtFile): String? {
+        val path = ktFile.virtualFile?.path ?: return null
+        val originalPath = shadowPathMapping[path] ?: path
+        return virtualFiles.keys.firstOrNull { uriToPath(it) == originalPath } ?: buildFileUri(originalPath)
+    }
+
+    private fun selectionForOffset(
+        document: com.intellij.openapi.editor.Document,
+        offset: Int,
+        length: Int = 0,
+    ): JsonObject {
+        val startLineIndex = document.getLineNumber(offset)
+        val startLineStart = document.getLineStartOffset(startLineIndex)
+        val endOffset = offset + length
+        val endLineIndex = document.getLineNumber(endOffset.coerceAtMost(document.textLength))
+        val endLineStart = document.getLineStartOffset(endLineIndex)
+        return JsonObject().apply {
+            addProperty(AnalyzerCommands.ARG_START_LINE, startLineIndex)
+            addProperty(AnalyzerCommands.ARG_START_CHARACTER, offset - startLineStart)
+            addProperty(AnalyzerCommands.ARG_END_LINE, endLineIndex)
+            addProperty(AnalyzerCommands.ARG_END_CHARACTER, endOffset - endLineStart)
+        }
+    }
 
     private fun lineColToOffset(ktFile: KtFile, line: Int, character: Int): Int? {
         val document = ktFile.viewProvider.document

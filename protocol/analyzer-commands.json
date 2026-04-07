@@ -1,5 +1,24 @@
 {
   "commands": {
+    "openTarget": {
+      "id": "kotlin-analyzer.openTarget",
+      "arguments": {
+        "targetUri": {
+          "type": "string",
+          "required": true
+        },
+        "selection": {
+          "type": "object",
+          "required": false,
+          "properties": {
+            "startLine": { "type": "integer", "required": true },
+            "startCharacter": { "type": "integer", "required": true },
+            "endLine": { "type": "integer", "required": true },
+            "endCharacter": { "type": "integer", "required": true }
+          }
+        }
+      }
+    },
     "openTestTarget": {
       "id": "kotlin-analyzer.openTestTarget",
       "arguments": {

@@ -1,6 +1,7 @@
 package dev.kouros.sidecar
 
 object AnalyzerCommands {
+    const val OPEN_TARGET = "kotlin-analyzer.openTarget"
     const val OPEN_TEST_TARGET = "kotlin-analyzer.openTestTarget"
     const val CREATE_AND_OPEN_TEST_TARGET = "kotlin-analyzer.createAndOpenTestTarget"
 

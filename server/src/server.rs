@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -31,6 +32,7 @@ struct AnalyzerCommandContract {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AnalyzerCommandEntries {
+    open_target: AnalyzerCommandDefinition,
     open_test_target: AnalyzerCommandDefinition,
     create_and_open_test_target: AnalyzerCommandDefinition,
 }
@@ -60,7 +62,7 @@ impl CommandSelection {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct OpenTestTargetArgs {
+struct OpenTargetArgs {
     target_uri: String,
     selection: Option<CommandSelection>,
 }
@@ -76,7 +78,8 @@ struct CreateAndOpenTestTargetArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AnalyzerCommandRequest {
-    OpenTestTarget(OpenTestTargetArgs),
+    OpenTarget(OpenTargetArgs),
+    OpenTestTarget(OpenTargetArgs),
     CreateAndOpenTestTarget(CreateAndOpenTestTargetArgs),
 }
 
@@ -99,6 +102,7 @@ fn analyzer_command_contract() -> &'static AnalyzerCommandContract {
 fn supported_analyzer_command_ids() -> Vec<String> {
     let contract = analyzer_command_contract();
     vec![
+        contract.commands.open_target.id.clone(),
         contract.commands.open_test_target.id.clone(),
         contract.commands.create_and_open_test_target.id.clone(),
     ]
@@ -144,6 +148,11 @@ fn parse_analyzer_command_request(
     if command_id == contract.commands.open_test_target.id {
         let payload = parse_command_payload(arguments, &command_id)?;
         return Ok(AnalyzerCommandRequest::OpenTestTarget(payload));
+    }
+
+    if command_id == contract.commands.open_target.id {
+        let payload = parse_command_payload(arguments, &command_id)?;
+        return Ok(AnalyzerCommandRequest::OpenTarget(payload));
     }
 
     if command_id == contract.commands.create_and_open_test_target.id {
@@ -303,6 +312,7 @@ pub struct KotlinLanguageServer {
     config: Arc<Mutex<Config>>,
     project_root: Arc<Mutex<Option<PathBuf>>>,
     debounce_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Url>>>>,
+    is_zed_client: Arc<Mutex<bool>>,
 }
 
 impl KotlinLanguageServer {
@@ -314,6 +324,7 @@ impl KotlinLanguageServer {
             config: Arc::new(Mutex::new(Config::default())),
             project_root: Arc::new(Mutex::new(None)),
             debounce_tx: Arc::new(Mutex::new(None)),
+            is_zed_client: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -438,6 +449,14 @@ impl KotlinLanguageServer {
 
     async fn execute_analyzer_command(&self, request: AnalyzerCommandRequest) -> LspResult<Value> {
         match request {
+            AnalyzerCommandRequest::OpenTarget(args) => {
+                let target_uri = Url::parse(&args.target_uri).map_err(|error| {
+                    invalid_params_error(format!("invalid targetUri for openTarget: {error}"))
+                })?;
+
+                self.show_document(target_uri, args.selection).await?;
+                Ok(serde_json::json!({ "shown": true }))
+            }
             AnalyzerCommandRequest::OpenTestTarget(args) => {
                 let target_uri = Url::parse(&args.target_uri).map_err(|error| {
                     invalid_params_error(format!("invalid targetUri for openTestTarget: {error}"))
@@ -513,6 +532,10 @@ impl KotlinLanguageServer {
     }
 
     async fn show_document(&self, uri: Url, selection: Option<CommandSelection>) -> LspResult<()> {
+        if *self.is_zed_client.lock().await {
+            return self.open_in_zed_via_cli(uri, selection).await;
+        }
+
         let shown = self
             .client
             .send_request::<CompatibleShowDocument>(ShowDocumentParams {
@@ -532,6 +555,37 @@ impl KotlinLanguageServer {
             Err(request_failed_error(
                 "window/showDocument was not acknowledged",
             ))
+        }
+    }
+
+    async fn open_in_zed_via_cli(
+        &self,
+        uri: Url,
+        selection: Option<CommandSelection>,
+    ) -> LspResult<()> {
+        let target_path = uri.to_file_path().map_err(|_| {
+            request_failed_error(format!("targetUri is not a file URI: {uri}"))
+        })?;
+        let cli_target = zed_cli_target_argument(&target_path, selection.as_ref());
+
+        let candidates = zed_cli_candidates();
+        let mut last_error = None;
+        for candidate in candidates {
+            match Command::new(&candidate).arg(&cli_target).spawn() {
+                Ok(_) => return Ok(()),
+                Err(error) => last_error = Some((candidate, error)),
+            }
+        }
+
+        match last_error {
+            Some((candidate, error)) => Err(request_failed_error(format!(
+                "failed to launch Zed CLI {}: {}",
+                candidate.to_string_lossy(),
+                error
+            ))),
+            None => Err(request_failed_error(
+                "no Zed CLI candidate configured for navigation",
+            )),
         }
     }
 
@@ -809,6 +863,16 @@ fn parse_diagnostics_static(result: &Value) -> Vec<Diagnostic> {
 impl LanguageServer for KotlinLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
         tracing::info!("kotlin-analyzer: initializing");
+
+        {
+            let is_zed = params
+                .client_info
+                .as_ref()
+                .map(|info| info.name.eq_ignore_ascii_case("zed"))
+                .unwrap_or(false);
+            let mut client_flag = self.is_zed_client.lock().await;
+            *client_flag = is_zed;
+        }
 
         // Store project root (project model resolution happens in initialized())
         // Walk up from the rootUri to find the actual project root containing
@@ -3080,6 +3144,27 @@ fn show_document_acknowledged(result: Option<ShowDocumentResult>) -> bool {
     }
 }
 
+fn zed_cli_candidates() -> Vec<OsString> {
+    let mut candidates = Vec::new();
+    if let Some(override_path) = std::env::var_os("KOTLIN_ANALYZER_ZED_CLI") {
+        candidates.push(override_path);
+    }
+    candidates.push(OsString::from("my-zed"));
+    candidates.push(OsString::from("zed"));
+    candidates
+}
+
+fn zed_cli_target_argument(target_path: &Path, selection: Option<&CommandSelection>) -> String {
+    let mut target = target_path.display().to_string();
+    if let Some(selection) = selection {
+        target.push(':');
+        target.push_str(&(selection.start_line + 1).to_string());
+        target.push(':');
+        target.push_str(&(selection.start_character + 1).to_string());
+    }
+    target
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3094,7 +3179,7 @@ mod tests {
                     "kind": "quickfix",
                     "command": {
                         "title": "Open existing test",
-                        "command": "kotlin-analyzer.openTestTarget",
+                        "command": "kotlin-analyzer.openTarget",
                         "arguments": [
                             {
                                 "targetUri": "file:///tmp/Test.kt",
@@ -3122,7 +3207,7 @@ mod tests {
             .command
             .as_ref()
             .expect("command should be preserved");
-        assert_eq!(command.command, "kotlin-analyzer.openTestTarget");
+        assert_eq!(command.command, "kotlin-analyzer.openTarget");
         assert_eq!(
             command
                 .arguments
@@ -3260,5 +3345,20 @@ mod tests {
         assert!(!show_document_acknowledged(Some(ShowDocumentResult {
             success: false
         })));
+    }
+
+    #[test]
+    fn zed_cli_target_argument_converts_selection_to_one_based_suffix() {
+        let target = zed_cli_target_argument(
+            Path::new("/tmp/Example.kt"),
+            Some(&CommandSelection {
+                start_line: 2,
+                start_character: 5,
+                end_line: 2,
+                end_character: 9,
+            }),
+        );
+
+        assert_eq!(target, "/tmp/Example.kt:3:6");
     }
 }

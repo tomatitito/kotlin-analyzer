@@ -6,6 +6,7 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -299,13 +300,22 @@ impl LspTestClient {
     }
 
     fn initialize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.initialize_with_root("file:///tmp/test-project")
+        self.initialize_with_root_and_client("file:///tmp/test-project", None)
     }
 
     fn initialize_with_root(&mut self, root_uri: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.initialize_with_root_and_client(root_uri, None)
+    }
+
+    fn initialize_with_root_and_client(
+        &mut self,
+        root_uri: &str,
+        client_name: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
+            "clientInfo": client_name.map(|name| json!({ "name": name })),
             "capabilities": {
                 "textDocument": {
                     "hover": { "dynamicRegistration": false },
@@ -466,6 +476,11 @@ fn server_request_result(msg: &Value) -> Value {
     }
 }
 
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 impl Drop for LspTestClient {
     fn drop(&mut self) {
         // Send a shutdown request so the server can gracefully terminate
@@ -615,6 +630,87 @@ fn test_initialize_advertises_execute_command_provider() {
         commands.contains(&"kotlin-analyzer.createAndOpenTestTarget"),
         "createAndOpenTestTarget should be advertised"
     );
+}
+
+#[test]
+fn test_execute_command_open_target_emits_show_document() {
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize()
+        .expect("Failed to initialize LSP server");
+
+    let (response, requests) = client
+        .send_request_and_capture_requests(
+            "workspace/executeCommand",
+            json!({
+                "command": "kotlin-analyzer.openTarget",
+                "arguments": [
+                    {
+                        "targetUri": "file:///tmp/impl.kt",
+                        "selection": {
+                            "startLine": 2,
+                            "startCharacter": 6,
+                            "endLine": 2,
+                            "endCharacter": 20
+                        }
+                    }
+                ]
+            }),
+            Some("window/showDocument"),
+        )
+        .expect("executeCommand should succeed");
+
+    assert_eq!(requests.len(), 1, "expected a single showDocument request");
+    assert_eq!(
+        requests[0]["params"]["uri"].as_str(),
+        Some("file:///tmp/impl.kt")
+    );
+    assert_eq!(
+        requests[0]["params"]["selection"],
+        json!({
+            "start": { "line": 2, "character": 6 },
+            "end": { "line": 2, "character": 20 }
+        })
+    );
+    assert_eq!(response["result"]["shown"], json!(true));
+}
+
+#[test]
+fn test_execute_command_open_target_uses_zed_cli_for_zed_clients() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    std::env::set_var("KOTLIN_ANALYZER_ZED_CLI", "/usr/bin/true");
+
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize_with_root_and_client("file:///tmp/test-project", Some("Zed"))
+        .expect("Failed to initialize LSP server");
+
+    let result = client
+        .send_request_and_capture_requests(
+            "workspace/executeCommand",
+            json!({
+                "command": "kotlin-analyzer.openTarget",
+                "arguments": [
+                    {
+                        "targetUri": "file:///tmp/impl.kt",
+                        "selection": {
+                            "startLine": 2,
+                            "startCharacter": 6,
+                            "endLine": 2,
+                            "endCharacter": 20
+                        }
+                    }
+                ]
+            }),
+            Some("window/showDocument"),
+        )
+        .expect("executeCommand should succeed for Zed clients");
+
+    std::env::remove_var("KOTLIN_ANALYZER_ZED_CLI");
+
+    let (response, requests) = result;
+    assert!(requests.is_empty(), "Zed CLI navigation should not emit showDocument");
+    assert_eq!(response["result"]["shown"], json!(true));
 }
 
 #[test]
