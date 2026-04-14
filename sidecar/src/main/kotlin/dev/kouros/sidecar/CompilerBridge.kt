@@ -2413,33 +2413,54 @@ class CompilerBridge {
         if (startOffset >= endOffset) return null
 
         val unresolvedElement = ktFile.findElementAt(startOffset) ?: return null
+        val unresolvedText = ktFile.text.substring(startOffset, minOf(endOffset, ktFile.text.length))
+
+        // Try type-reference path: handles all positions where a type name appears
+        // inside a KtTypeReference (property types, return types, parameter types,
+        // supertypes, type arguments, casts, is-checks, etc.)
         val userType = PsiTreeUtil.getParentOfType(
             unresolvedElement,
             KtUserType::class.java,
             false,
-        ) ?: return null
-        if (userType.qualifier != null) return null
-
-        val simpleName = userType.referenceExpression ?: return null
-        val unresolvedText = ktFile.text.substring(startOffset, minOf(endOffset, ktFile.text.length))
-        if (simpleName.getReferencedName() != unresolvedText) return null
-
-        val typeReference = PsiTreeUtil.getParentOfType(userType, KtTypeReference::class.java, false) ?: return null
-        val owner = typeReference.parent
-        val supported = when (owner) {
-            is KtProperty -> owner.typeReference == typeReference
-            is KtNamedFunction -> owner.typeReference == typeReference
-            else -> false
+        )
+        if (userType != null && userType.qualifier == null) {
+            val simpleName = userType.referenceExpression
+            if (simpleName != null && simpleName.getReferencedName() == unresolvedText) {
+                val typeReference = PsiTreeUtil.getParentOfType(userType, KtTypeReference::class.java, false)
+                if (typeReference != null) {
+                    val shortName = simpleName.getReferencedName()
+                    if (shortName.matches(Regex("[A-Za-z_][A-Za-z0-9_]*"))) {
+                        val candidates = findImportCandidates(ktFile, shortName)
+                        if (candidates.isNotEmpty()) {
+                            return TypeImportAssistPlan(shortName = shortName, candidates = candidates)
+                        }
+                    }
+                }
+            }
         }
-        if (!supported) return null
 
-        val shortName = simpleName.getReferencedName()
-        if (!shortName.matches(Regex("[A-Za-z_][A-Za-z0-9_]*"))) return null
+        // Try expression-reference path: handles constructor calls (MyClass()),
+        // companion object access (MyClass.foo), and other expression-level references
+        val nameRef = PsiTreeUtil.getParentOfType(
+            unresolvedElement,
+            KtNameReferenceExpression::class.java,
+            false,
+        )
+        if (nameRef != null && nameRef.getReferencedName() == unresolvedText) {
+            // Skip if this is inside a type reference (already handled above)
+            val insideTypeRef = PsiTreeUtil.getParentOfType(nameRef, KtTypeReference::class.java, false)
+            if (insideTypeRef == null) {
+                val shortName = nameRef.getReferencedName()
+                if (shortName.matches(Regex("[A-Za-z_][A-Za-z0-9_]*"))) {
+                    val candidates = findImportCandidates(ktFile, shortName)
+                    if (candidates.isNotEmpty()) {
+                        return TypeImportAssistPlan(shortName = shortName, candidates = candidates)
+                    }
+                }
+            }
+        }
 
-        val candidates = findImportCandidates(ktFile, shortName)
-        if (candidates.isEmpty()) return null
-
-        return TypeImportAssistPlan(shortName = shortName, candidates = candidates)
+        return null
     }
 
     private fun findImportCandidates(ktFile: KtFile, shortName: String): List<ImportCandidate> {

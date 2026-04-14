@@ -210,6 +210,193 @@ class CompilerBridgeIntegrationTest {
         assertEquals(0, edits.size(), "ambiguous candidates must not auto-import")
     }
 
+    @Test
+    fun `analyze - constructor call returns auto import edit`() {
+        val uri = "file://$testSourceDir/AutoImportConstructorCall.kt"
+        val content = """
+            package scratch
+
+            fun create(): Any = PersonService()
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.analyze(uri)
+        val edits = result.getAsJsonArray("edits")
+
+        assertNotNull(edits, "edits array should be present")
+        assertEquals(1, edits.size(), "should return exactly one auto-import edit for constructor call")
+
+        val newText = edits[0].asJsonObject.get("newText")?.asString ?: ""
+        assertEquals("import service.PersonService\n\n", newText)
+    }
+
+    @Test
+    fun `analyze - parameter type returns auto import edit`() {
+        val uri = "file://$testSourceDir/AutoImportParameterType.kt"
+        val content = """
+            package scratch
+
+            fun process(service: PersonService) {}
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.analyze(uri)
+        val edits = result.getAsJsonArray("edits")
+
+        assertNotNull(edits, "edits array should be present")
+        assertEquals(1, edits.size(), "should return exactly one auto-import edit for parameter type")
+
+        val newText = edits[0].asJsonObject.get("newText")?.asString ?: ""
+        assertEquals("import service.PersonService\n\n", newText)
+    }
+
+    @Test
+    fun `analyze - supertype returns auto import edit`() {
+        // Create an open class to extend
+        bridge.updateFile(
+            "file://$testSourceDir/base/BaseService.kt",
+            """
+                package base
+
+                open class BaseService
+            """.trimIndent(),
+        )
+
+        val uri = "file://$testSourceDir/AutoImportSupertype.kt"
+        val content = """
+            package scratch
+
+            class MyService : BaseService()
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.analyze(uri)
+        val edits = result.getAsJsonArray("edits")
+
+        assertNotNull(edits, "edits array should be present")
+        assertEquals(1, edits.size(), "should return exactly one auto-import edit for supertype")
+
+        val newText = edits[0].asJsonObject.get("newText")?.asString ?: ""
+        assertEquals("import base.BaseService\n\n", newText)
+    }
+
+    @Test
+    fun `codeActions - constructor call offers import actions`() {
+        // Create ambiguous candidates so code actions are shown (single candidates are auto-imported)
+        bridge.updateFile(
+            "file://$testSourceDir/gamma/Widget.kt",
+            """
+                package gamma
+
+                class Widget
+            """.trimIndent(),
+        )
+        bridge.updateFile(
+            "file://$testSourceDir/delta/Widget.kt",
+            """
+                package delta
+
+                class Widget
+            """.trimIndent(),
+        )
+
+        val uri = "file://$testSourceDir/ImportConstructorCall.kt"
+        val content = """
+            package scratch
+
+            fun create(): Any = Widget()
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 3, character = 21)
+        val actions = result.getAsJsonArray("actions")
+
+        assertNotNull(actions, "actions array should be present")
+
+        val importTitles = actions
+            .map { it.asJsonObject.get("title")?.asString ?: "" }
+            .filter { it.startsWith("Import 'Widget' from ") }
+        assertEquals(2, importTitles.size, "should offer two import candidates for constructor call, got: $importTitles")
+    }
+
+    @Test
+    fun `codeActions - parameter type offers import actions`() {
+        // Create ambiguous candidates
+        bridge.updateFile(
+            "file://$testSourceDir/gamma/Widget.kt",
+            """
+                package gamma
+
+                class Widget
+            """.trimIndent(),
+        )
+        bridge.updateFile(
+            "file://$testSourceDir/delta/Widget.kt",
+            """
+                package delta
+
+                class Widget
+            """.trimIndent(),
+        )
+
+        val uri = "file://$testSourceDir/ImportParameterType.kt"
+        val content = """
+            package scratch
+
+            fun process(w: Widget) {}
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 3, character = 16)
+        val actions = result.getAsJsonArray("actions")
+
+        assertNotNull(actions, "actions array should be present")
+
+        val importTitles = actions
+            .map { it.asJsonObject.get("title")?.asString ?: "" }
+            .filter { it.startsWith("Import 'Widget' from ") }
+        assertEquals(2, importTitles.size, "should offer two import candidates for parameter type, got: $importTitles")
+    }
+
+    @Test
+    fun `codeActions - supertype offers import actions`() {
+        // Create ambiguous candidates
+        bridge.updateFile(
+            "file://$testSourceDir/gamma/Widget.kt",
+            """
+                package gamma
+
+                open class Widget
+            """.trimIndent(),
+        )
+        bridge.updateFile(
+            "file://$testSourceDir/delta/Widget.kt",
+            """
+                package delta
+
+                open class Widget
+            """.trimIndent(),
+        )
+
+        val uri = "file://$testSourceDir/ImportSupertype.kt"
+        val content = """
+            package scratch
+
+            class MyWidget : Widget()
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 3, character = 18)
+        val actions = result.getAsJsonArray("actions")
+
+        assertNotNull(actions, "actions array should be present")
+
+        val importTitles = actions
+            .map { it.asJsonObject.get("title")?.asString ?: "" }
+            .filter { it.startsWith("Import 'Widget' from ") }
+        assertEquals(2, importTitles.size, "should offer two import candidates for supertype, got: $importTitles")
+    }
+
     // --- Hover ---
 
     @Test
