@@ -71,6 +71,20 @@ class SymbolIndex {
         return filtered.sortedBy { it.shortName }.take(limit)
     }
 
+    /**
+     * Searches for declarations whose FQN starts with the given prefix.
+     * Used for import statement completions where the user is typing a qualified path.
+     */
+    fun searchByFqnPrefix(fqnPrefix: String, limit: Int = 100): List<IndexedDeclaration> {
+        val normalizedPrefix = fqnPrefix.lowercase()
+        return index.values.asSequence()
+            .flatten()
+            .filter { it.fqn?.lowercase()?.startsWith(normalizedPrefix) == true }
+            .sortedBy { it.fqn }
+            .take(limit)
+            .toList()
+    }
+
     fun allDeclarationsInFile(uri: String): List<IndexedDeclaration> =
         index[uri] ?: emptyList()
 

@@ -406,6 +406,55 @@ class CompilerBridgeIntegrationTest {
     }
 
     @Test
+    fun `completion - import statement after dot lists sub-packages and classes`() {
+        val uri = "file://$testSourceDir/scratch/ImportCompletion.kt"
+        // Include a newline so the file has proper line structure and the dot is within the text range
+        val content = "import kotlin.collections.\n"
+        bridge.updateFile(uri, content)
+
+        // Cursor right after the dot on line 1: "import kotlin.collections."
+        //                                                                   ^26 (0-based)
+        val result = bridge.completion(uri, line = 1, character = 26, triggerCharacter = ".")
+
+        val items = result.getAsJsonArray("items")
+        assertNotNull(items, "completion items array should be present")
+        val labels = items.map { it.asJsonObject.get("label")?.asString ?: "" }
+        assertTrue(
+            labels.isNotEmpty(),
+            "import completion after dot should return items, got empty (reason=${result.get("reason")?.asString})"
+        )
+        assertTrue(
+            labels.any { it == "AbstractCollection" || it == "ArrayDeque" || it == "CollectionsKt" },
+            "import completion after dot should include classes from kotlin.collections, got: ${labels.take(30)} (reason=${result.get("reason")?.asString})"
+        )
+        // Should also include sub-packages like builders, jdk8
+        val kinds = items.map { it.asJsonObject.get("kind")?.asString ?: "" }
+        assertTrue(
+            kinds.any { it == "module" },
+            "import completion should include sub-packages (kind=module), got kinds: ${kinds.distinct()}"
+        )
+    }
+
+    @Test
+    fun `completion - import statement with partial class name filters to matching`() {
+        val uri = "file://$testSourceDir/scratch/ImportCompletionPartial.kt"
+        val content = "import model.Per"
+        bridge.updateFile(uri, content)
+
+        // Cursor at end of "Per": "import model.Per"
+        //                                          ^16 (0-based)
+        val result = bridge.completion(uri, line = 1, character = 16)
+
+        val items = result.getAsJsonArray("items")
+        assertNotNull(items, "completion items array should be present")
+        val labels = items.map { it.asJsonObject.get("label")?.asString ?: "" }
+        assertTrue(
+            labels.any { it == "Person" },
+            "import completion with partial name should filter to Per* matches from project, got: ${labels.take(20)} (reason=${result.get("reason")?.asString})"
+        )
+    }
+
+    @Test
     fun `completion - dirty on-disk local member completion retries after rebuild`() {
         val uri = "file://$testSourceDir/Completion.kt"
         val content = """

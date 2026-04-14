@@ -53,6 +53,8 @@ class CompilerBridge {
     private val pebbleIndex = PebbleTemplateIndex()
     private val pebbleSpringIndex = PebbleSpringIndex(pebbleIndex)
     private val symbolIndex = SymbolIndex()
+    // Cached set of FQNs discovered from classpath JARs (stdlib + dependencies) for import completion
+    private var classpathFqns = setOf<String>()
     private var pebbleSpringIndexDirty = true
 
     // Temp directory for virtual files so FIR can discover them as source root files
@@ -292,6 +294,10 @@ class CompilerBridge {
         // Build the symbol index from all discovered files
         symbolIndex.rebuildFromSession(session!!)
         System.err.println("CompilerBridge: symbol index built with ${symbolIndex.size()} declarations")
+
+        // Build classpath FQN index for import completion (scans all JARs for class names)
+        classpathFqns = buildClasspathFqnIndex(classpath + stdlibJars.map(Path::toString))
+        System.err.println("CompilerBridge: classpath FQN index built with ${classpathFqns.size} entries")
 
         pebbleSpringIndexDirty = true
     }
@@ -945,32 +951,43 @@ class CompilerBridge {
                     return@analyze
                 }
 
-                // Check if we are in a dot-qualified expression (member completion)
-                val dotCompletion = findDotCompletionReceiver(element, offset)
-                    ?: if (triggerCharacter == ".") {
-                        findDotCompletionReceiverAtOffset(ktFile, offset)
-                            ?: findReceiverExpressionEndingAtOffset(ktFile, offset)
-                    } else {
-                        null
+                // Check if we are inside an import directive — provide package/class completions
+                // Also check the element one position before in case the cursor is right after a dot
+                val importDirective = PsiTreeUtil.getParentOfType(element, KtImportDirective::class.java)
+                    ?: ktFile.findElementAt(maxOf(0, offset - 1))?.let {
+                        PsiTreeUtil.getParentOfType(it, KtImportDirective::class.java)
                     }
-                if (dotCompletion != null) {
-                    collectMemberCompletions(dotCompletion, itemsArray)
+                if (importDirective != null) {
+                    collectImportCompletionItems(importDirective, offset)
+                        .forEach(itemsArray::add)
                 } else {
-                    val prefix = extractCompletionPrefix(element, offset)
-                    val visibleCandidates = collectScopeCompletionCandidates(ktFile, element)
-                    val keywordCandidates = keywordCompletionCandidates()
-                    val autoImportCandidates = collectUnimportedCompletionCandidates(
-                        ktFile = ktFile,
-                        prefix = prefix,
-                        existingLabels = (visibleCandidates + keywordCandidates)
-                            .map { it.label }
-                            .toSet(),
-                    )
+                    // Check if we are in a dot-qualified expression (member completion)
+                    val dotCompletion = findDotCompletionReceiver(element, offset)
+                        ?: if (triggerCharacter == ".") {
+                            findDotCompletionReceiverAtOffset(ktFile, offset)
+                                ?: findReceiverExpressionEndingAtOffset(ktFile, offset)
+                        } else {
+                            null
+                        }
+                    if (dotCompletion != null) {
+                        collectMemberCompletions(dotCompletion, itemsArray)
+                    } else {
+                        val prefix = extractCompletionPrefix(element, offset)
+                        val visibleCandidates = collectScopeCompletionCandidates(ktFile, element)
+                        val keywordCandidates = keywordCompletionCandidates()
+                        val autoImportCandidates = collectUnimportedCompletionCandidates(
+                            ktFile = ktFile,
+                            prefix = prefix,
+                            existingLabels = (visibleCandidates + keywordCandidates)
+                                .map { it.label }
+                                .toSet(),
+                        )
 
-                    rankScopeCompletionCandidates(
-                        prefix = prefix,
-                        candidates = visibleCandidates + keywordCandidates + autoImportCandidates,
-                    ).forEach(itemsArray::add)
+                        rankScopeCompletionCandidates(
+                            prefix = prefix,
+                            candidates = visibleCandidates + keywordCandidates + autoImportCandidates,
+                        ).forEach(itemsArray::add)
+                    }
                 }
 
                 if (itemsArray.size() == 0) {
@@ -4646,6 +4663,131 @@ class CompilerBridge {
     }
 
     /**
+     * Collects completion items for import statements.
+     * Enumerates sub-packages and top-level declarations matching the FQN prefix
+     * typed so far in the import directive. Uses the classpath FQN index (built from
+     * stdlib and dependency JARs) and the project symbol index.
+     */
+    private fun collectImportCompletionItems(
+        importDirective: KtImportDirective,
+        offset: Int,
+    ): List<JsonObject> {
+        // Extract the fully-qualified prefix from the import text up to the cursor.
+        // For "import com.example.My|", we want fqnUpToCursor = "com.example.My"
+        // For "import com.|", we want fqnUpToCursor = "com."
+        val importText = importDirective.text  // e.g. "import com.example.My"
+        val importKeyword = "import "
+        val importStart = importDirective.textRange.startOffset
+        val relativeOffset = offset - importStart
+        val textUpToCursor = if (relativeOffset in 0..importText.length) {
+            importText.substring(0, relativeOffset)
+        } else {
+            importText
+        }
+        val fqnUpToCursor = textUpToCursor.removePrefix(importKeyword).trim()
+
+        // Determine the package prefix (everything before the last dot) and the name prefix
+        // (partial identifier after the last dot, if any).
+        val afterDot = fqnUpToCursor.endsWith(".")
+        val packagePrefix: String
+        val namePrefix: String
+        if (afterDot) {
+            packagePrefix = fqnUpToCursor.dropLast(1)  // remove trailing dot
+            namePrefix = ""
+        } else if (fqnUpToCursor.contains('.')) {
+            packagePrefix = fqnUpToCursor.substringBeforeLast('.')
+            namePrefix = fqnUpToCursor.substringAfterLast('.')
+        } else {
+            // Just "import co" — no dot yet, search top-level packages
+            packagePrefix = ""
+            namePrefix = fqnUpToCursor
+        }
+
+        val items = mutableListOf<JsonObject>()
+        val seen = mutableSetOf<String>()
+
+        // The search prefix for FQN matching
+        val searchFqnPrefix = if (packagePrefix.isEmpty()) "" else "$packagePrefix."
+
+        // Collect from classpath FQN index (stdlib + dependencies)
+        for (fqn in classpathFqns) {
+            if (searchFqnPrefix.isNotEmpty() && !fqn.startsWith(searchFqnPrefix)) continue
+            if (searchFqnPrefix.isEmpty() && fqn.indexOf('.') < 0) continue  // skip default-package classes
+
+            val remainder = if (searchFqnPrefix.isNotEmpty()) {
+                fqn.removePrefix(searchFqnPrefix)
+            } else {
+                fqn
+            }
+            val nextSegment = remainder.substringBefore('.')
+            val isSubPackage = remainder.contains('.')
+
+            if (nextSegment.isEmpty()) continue
+            if (namePrefix.isNotEmpty() && !nextSegment.lowercase().startsWith(namePrefix.lowercase())) continue
+
+            if (isSubPackage) {
+                if (seen.add("pkg:$nextSegment")) {
+                    val item = JsonObject()
+                    item.addProperty("label", nextSegment)
+                    item.addProperty("kind", "module")
+                    item.addProperty("detail", if (packagePrefix.isEmpty()) nextSegment else "$packagePrefix.$nextSegment")
+                    item.addProperty("insertText", nextSegment)
+                    items.add(item)
+                }
+            } else {
+                if (seen.add("type:$nextSegment")) {
+                    val item = JsonObject()
+                    item.addProperty("label", nextSegment)
+                    item.addProperty("kind", "class")
+                    item.addProperty("detail", fqn)
+                    item.addProperty("insertText", nextSegment)
+                    items.add(item)
+                }
+            }
+        }
+
+        // Collect from the project symbol index for project source declarations
+        val projectDecls = symbolIndex.searchByFqnPrefix(searchFqnPrefix, limit = 200)
+        for (decl in projectDecls) {
+            val fqn = decl.fqn ?: continue
+            val remainder = fqn.removePrefix(searchFqnPrefix)
+            val nextSegment = remainder.substringBefore('.')
+            val isSubPackage = remainder.contains('.')
+
+            if (nextSegment.isEmpty()) continue
+            if (namePrefix.isNotEmpty() && !nextSegment.lowercase().startsWith(namePrefix.lowercase())) continue
+
+            if (isSubPackage) {
+                if (seen.add("pkg:$nextSegment")) {
+                    val item = JsonObject()
+                    item.addProperty("label", nextSegment)
+                    item.addProperty("kind", "module")
+                    item.addProperty("detail", if (packagePrefix.isEmpty()) nextSegment else "$packagePrefix.$nextSegment")
+                    item.addProperty("insertText", nextSegment)
+                    items.add(item)
+                }
+            } else {
+                if (seen.add("type:$nextSegment")) {
+                    val item = JsonObject()
+                    item.addProperty("label", nextSegment)
+                    item.addProperty("kind", decl.kind)
+                    item.addProperty("detail", fqn)
+                    item.addProperty("insertText", nextSegment)
+                    items.add(item)
+                }
+            }
+        }
+
+        // Sort: packages first, then types, alphabetically within each group
+        items.sortWith(compareBy(
+            { if (it.get("kind")?.asString == "module") 0 else 1 },
+            { it.get("label")?.asString?.lowercase() ?: "" },
+        ))
+
+        return items
+    }
+
+    /**
      * Extracts the identifier prefix being typed at the cursor position.
      * Looks at the raw file text before the cursor to find the identifier being typed.
      */
@@ -5804,6 +5946,41 @@ class CompilerBridge {
         }
         return null
     }
+    /**
+     * Builds a set of fully-qualified class names from all JARs on the classpath.
+     * Used by import completion to enumerate available packages and types.
+     */
+    private fun buildClasspathFqnIndex(jars: List<String>): Set<String> {
+        val fqns = mutableSetOf<String>()
+        for (entry in jars) {
+            val file = File(entry)
+            if (!file.isFile || file.extension.lowercase() != "jar") continue
+            try {
+                java.util.jar.JarFile(file).use { jar ->
+                    val entries = jar.entries()
+                    while (entries.hasMoreElements()) {
+                        val jarEntry = entries.nextElement()
+                        val name = jarEntry.name
+                        if (!name.endsWith(".class")) continue
+                        if (name.startsWith("META-INF/")) continue
+                        val className = name.removeSuffix(".class")
+                        if (className.endsWith("/package-info") || className == "module-info") continue
+                        val relativeName = className.substringAfterLast('/')
+                        if ('$' in relativeName) continue
+                        val fqn = className.replace('/', '.')
+                        if (fqn.isBlank()) continue
+                        val shortName = fqn.substringAfterLast('.')
+                        if (shortName.isEmpty() || !shortName.first().isJavaIdentifierStart()) continue
+                        fqns.add(fqn)
+                    }
+                }
+            } catch (_: Exception) {
+                // Ignore unreadable jars
+            }
+        }
+        return fqns
+    }
+
     private fun findKotlinStdlibJars(): List<Path> {
         // 1. Check java.class.path (works when running as individual JARs)
         val classpath = System.getProperty("java.class.path") ?: ""
