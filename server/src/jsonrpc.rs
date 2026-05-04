@@ -28,6 +28,18 @@ pub struct Response {
     pub error: Option<ResponseError>,
 }
 
+/// A message read from the sidecar's stdout.
+/// The sidecar normally sends responses to our requests, but may also send
+/// unsolicited notifications (e.g. workspace/applyEdit).
+#[derive(Debug)]
+pub enum SidecarMessage {
+    Response(Response),
+    Notification {
+        method: String,
+        params: Option<serde_json::Value>,
+    },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResponseError {
     pub code: i32,
@@ -79,9 +91,12 @@ pub async fn write_message(
 
 /// Reads a JSON-RPC message with Content-Length framing from an async reader.
 /// Returns `None` on EOF (sidecar exited).
+///
+/// The sidecar may send either a response (to one of our requests) or a
+/// notification (unsolicited, identified by having a `method` field).
 pub async fn read_message(
     reader: &mut BufReader<ChildStdout>,
-) -> Result<Option<Response>, crate::error::Error> {
+) -> Result<Option<SidecarMessage>, crate::error::Error> {
     let content_length = match read_content_length(reader).await? {
         Some(len) => len,
         None => return Ok(None), // EOF
@@ -94,9 +109,23 @@ pub async fn read_message(
         Err(e) => return Err(crate::error::Error::Io(e)),
     }
 
-    let response: Response = serde_json::from_slice(&body).map_err(ProtocolError::JsonParse)?;
+    let raw: serde_json::Value = serde_json::from_slice(&body).map_err(ProtocolError::JsonParse)?;
 
-    Ok(Some(response))
+    if let Some(method) = raw.get("method").and_then(|m| m.as_str()) {
+        if raw.get("id").is_some() {
+            tracing::warn!(
+                "sidecar sent a request with method+id ({}), treating as notification",
+                method
+            );
+        }
+        let method = method.to_string();
+        let params = raw.get("params").cloned();
+        Ok(Some(SidecarMessage::Notification { method, params }))
+    } else {
+        let response: Response =
+            serde_json::from_value(raw).map_err(ProtocolError::JsonParse)?;
+        Ok(Some(SidecarMessage::Response(response)))
+    }
 }
 
 /// Reads headers until the empty line separator, extracts Content-Length.
@@ -148,6 +177,7 @@ pub fn encode_message(message: &impl Serialize) -> Result<Vec<u8>, ProtocolError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn serialize_request() {
@@ -193,6 +223,27 @@ mod tests {
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32601);
         assert_eq!(err.message, "Method not found");
+    }
+
+    #[test]
+    fn sidecar_message_notification_detection() {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/applyEdit",
+            "params": { "label": "Auto-import" }
+        });
+        // Has method + no id → notification
+        assert!(notification.get("method").is_some());
+        assert!(notification.get("id").is_none());
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "pong": true }
+        });
+        // Has id + no method → response
+        assert!(response.get("id").is_some());
+        assert!(response.get("method").is_none());
     }
 
     #[test]

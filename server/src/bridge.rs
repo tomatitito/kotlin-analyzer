@@ -11,8 +11,15 @@ use tokio::time;
 
 use crate::config::Config;
 use crate::error::{BridgeError, Error};
-use crate::jsonrpc::{self, Request, Response};
+use crate::jsonrpc::{self, Request, Response, SidecarMessage};
 use crate::runtime::SidecarRuntime;
+
+/// An unsolicited notification sent by the sidecar (e.g. workspace/applyEdit).
+#[derive(Debug)]
+pub struct SidecarNotification {
+    pub method: String,
+    pub params: Option<Value>,
+}
 
 /// Sidecar lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -61,11 +68,22 @@ pub struct Bridge {
     init_params: Mutex<InitParams>,
     /// Prevents overlapping restart loops from racing and killing fresh sidecars.
     restart_in_progress: AtomicBool,
+    /// Channel for forwarding unsolicited sidecar notifications to the server.
+    notification_tx: mpsc::Sender<SidecarNotification>,
 }
 
 impl Bridge {
     /// Creates a new bridge but does not start the sidecar yet.
-    pub fn new(runtime: SidecarRuntime, java_path: PathBuf, config: Config) -> Self {
+    ///
+    /// The `notification_tx` channel is used to forward unsolicited
+    /// notifications from the sidecar (e.g. workspace/applyEdit) to the
+    /// server, which then relays them to the LSP client.
+    pub fn new(
+        runtime: SidecarRuntime,
+        java_path: PathBuf,
+        config: Config,
+        notification_tx: mpsc::Sender<SidecarNotification>,
+    ) -> Self {
         tracing::debug!(
             "Bridge::new called with runtime: {:?}, java_path: {:?}",
             runtime,
@@ -90,6 +108,7 @@ impl Bridge {
             child: Mutex::new(None),
             init_params: Mutex::new(InitParams::default()),
             restart_in_progress: AtomicBool::new(false),
+            notification_tx,
         }
     }
 
@@ -313,12 +332,13 @@ impl Bridge {
             });
         }
 
-        // Spawn the reader task to process incoming responses
+        // Spawn the reader task to process incoming responses and notifications
         let pending = Arc::clone(&self.pending);
         let state = Arc::clone(&self.state);
         let state_watch_tx = Arc::clone(&self.state_watch_tx);
         let shutdown = Arc::clone(&self.shutdown_notify);
         let reader_bridge = Arc::clone(self);
+        let notification_tx = self.notification_tx.clone();
 
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
@@ -328,9 +348,15 @@ impl Bridge {
                 tokio::select! {
                     result = jsonrpc::read_message(&mut reader) => {
                         match result {
-                            Ok(Some(response)) => {
-                                tracing::debug!("Read message from sidecar");
+                            Ok(Some(SidecarMessage::Response(response))) => {
+                                tracing::debug!("Read response from sidecar");
                                 Self::dispatch_response(&pending, response).await;
+                            }
+                            Ok(Some(SidecarMessage::Notification { method, params })) => {
+                                tracing::debug!("Read notification from sidecar: {}", method);
+                                if notification_tx.send(SidecarNotification { method, params }).await.is_err() {
+                                    tracing::debug!("notification channel closed, listener has exited");
+                                }
                             }
                             Ok(None) => {
                                 // EOF - sidecar exited. Cancel all pending requests immediately.
@@ -808,8 +834,8 @@ pub fn find_java() -> Result<PathBuf, Error> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn initial_state_is_stopped() {
+    fn test_bridge() -> (Bridge, mpsc::Receiver<SidecarNotification>) {
+        let (tx, rx) = mpsc::channel(16);
         let bridge = Bridge::new(
             SidecarRuntime {
                 requested_kotlin_version: None,
@@ -820,7 +846,14 @@ mod tests {
             },
             PathBuf::from("/usr/bin/java"),
             Config::default(),
+            tx,
         );
+        (bridge, rx)
+    }
+
+    #[test]
+    fn initial_state_is_stopped() {
+        let (bridge, _rx) = test_bridge();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let state = rt.block_on(bridge.state());
         assert_eq!(state, SidecarState::Stopped);
@@ -828,17 +861,7 @@ mod tests {
 
     #[test]
     fn next_id_increments() {
-        let bridge = Bridge::new(
-            SidecarRuntime {
-                requested_kotlin_version: None,
-                kotlin_version: Some("2.3.20".into()),
-                classpath: vec![PathBuf::from("sidecar.jar")],
-                main_class: None,
-                selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
-            },
-            PathBuf::from("/usr/bin/java"),
-            Config::default(),
-        );
+        let (bridge, _rx) = test_bridge();
         let id1 = bridge.next_id();
         let id2 = bridge.next_id();
         assert_eq!(id2, id1 + 1);
@@ -846,17 +869,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_before_start_returns_not_ready() {
-        let bridge = Bridge::new(
-            SidecarRuntime {
-                requested_kotlin_version: None,
-                kotlin_version: Some("2.3.20".into()),
-                classpath: vec![PathBuf::from("sidecar.jar")],
-                main_class: None,
-                selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
-            },
-            PathBuf::from("/usr/bin/java"),
-            Config::default(),
-        );
+        let (bridge, _rx) = test_bridge();
         // State is Stopped, so wait_for_ready should return NotReady immediately
         let result = bridge.request("hover", None).await;
         assert!(result.is_err());
@@ -870,17 +883,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_ready_returns_immediately_when_ready() {
-        let bridge = Bridge::new(
-            SidecarRuntime {
-                requested_kotlin_version: None,
-                kotlin_version: Some("2.3.20".into()),
-                classpath: vec![PathBuf::from("sidecar.jar")],
-                main_class: None,
-                selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
-            },
-            PathBuf::from("/usr/bin/java"),
-            Config::default(),
-        );
+        let (bridge, _rx) = test_bridge();
         // Manually set state to Ready
         Bridge::set_state(&bridge.state, &bridge.state_watch_tx, SidecarState::Ready).await;
 
@@ -890,17 +893,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_ready_blocks_during_starting() {
-        let bridge = Bridge::new(
-            SidecarRuntime {
-                requested_kotlin_version: None,
-                kotlin_version: Some("2.3.20".into()),
-                classpath: vec![PathBuf::from("sidecar.jar")],
-                main_class: None,
-                selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
-            },
-            PathBuf::from("/usr/bin/java"),
-            Config::default(),
-        );
+        let (bridge, _rx) = test_bridge();
         // Set state to Starting
         Bridge::set_state(
             &bridge.state,
@@ -924,17 +917,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_ready_waits_then_times_out_on_degraded() {
-        let bridge = Bridge::new(
-            SidecarRuntime {
-                requested_kotlin_version: None,
-                kotlin_version: Some("2.3.20".into()),
-                classpath: vec![PathBuf::from("sidecar.jar")],
-                main_class: None,
-                selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
-            },
-            PathBuf::from("/usr/bin/java"),
-            Config::default(),
-        );
+        let (bridge, _rx) = test_bridge();
         Bridge::set_state(
             &bridge.state,
             &bridge.state_watch_tx,
@@ -980,10 +963,12 @@ mod tests {
             main_class: Some("dev.kouros.sidecar.MainKt".into()),
             selection_reason: crate::runtime::RuntimeSelectionReason::SameMinorFallback,
         };
+        let (tx, _rx) = mpsc::channel(1);
         let bridge = Bridge::new(
             runtime.clone(),
             PathBuf::from("/usr/bin/java"),
             Config::default(),
+            tx,
         );
 
         assert_eq!(bridge.runtime, runtime);

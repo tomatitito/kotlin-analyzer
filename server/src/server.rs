@@ -17,7 +17,7 @@ use tower_lsp::jsonrpc::{Error as JsonRpcError, ErrorCode, Result as LspResult};
 use tower_lsp::lsp_types;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::bridge::{Bridge, SidecarState};
+use crate::bridge::{Bridge, SidecarNotification, SidecarState};
 use crate::config::{Config, FormattingTool};
 use crate::project;
 use crate::runtime;
@@ -90,6 +90,14 @@ impl LspRequest for CompatibleShowDocument {
     type Params = ShowDocumentParams;
     type Result = Option<ShowDocumentResult>;
     const METHOD: &'static str = "window/showDocument";
+}
+
+enum CompatibleApplyEdit {}
+
+impl LspRequest for CompatibleApplyEdit {
+    type Params = ApplyWorkspaceEditParams;
+    type Result = ApplyWorkspaceEditResponse;
+    const METHOD: &'static str = "workspace/applyEdit";
 }
 
 fn analyzer_command_contract() -> &'static AnalyzerCommandContract {
@@ -290,6 +298,107 @@ fn parse_code_actions_result(
             }))
         })
         .collect()
+}
+
+async fn handle_sidecar_apply_edit(
+    client: &Client,
+    documents: &Mutex<DocumentStore>,
+    params: Option<Value>,
+) {
+    let params = match params {
+        Some(p) => p,
+        None => {
+            tracing::warn!("workspace/applyEdit notification missing params");
+            return;
+        }
+    };
+
+    let label = params
+        .get("label")
+        .and_then(|l| l.as_str())
+        .unwrap_or("sidecar edit")
+        .to_string();
+
+    let edits = parse_workspace_edits(&params);
+    if edits.is_empty() {
+        tracing::debug!("workspace/applyEdit: no edits in notification");
+        return;
+    }
+
+    // Best-effort staleness check: a single version from the notification is
+    // compared against all target URIs. Multi-file edits with per-file versions
+    // would need a richer protocol.
+    let edit_version = params
+        .get("version")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+
+    let open_document_versions: HashMap<Url, i32> = {
+        let docs = documents.lock().await;
+        docs.all()
+            .map(|(uri, doc)| (uri.clone(), doc.version))
+            .collect()
+    };
+
+    if let Some(expected_version) = edit_version {
+        let stale = edits.keys().any(|uri| {
+            open_document_versions
+                .get(uri)
+                .map(|&current| current != expected_version)
+                .unwrap_or(false)
+        });
+        if stale {
+            tracing::debug!(
+                "workspace/applyEdit: dropping stale edit '{}' (version {})",
+                label,
+                expected_version
+            );
+            return;
+        }
+    }
+
+    let document_changes = edits
+        .iter()
+        .map(|(uri, uri_edits)| TextDocumentEdit {
+            text_document: OptionalVersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version: open_document_versions.get(uri).copied(),
+            },
+            edits: uri_edits.iter().cloned().map(OneOf::Left).collect(),
+        })
+        .collect::<Vec<_>>();
+
+    let apply_params = ApplyWorkspaceEditParams {
+        label: Some(label.clone()),
+        edit: WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Edits(document_changes)),
+            change_annotations: None,
+        },
+    };
+
+    match client
+        .send_request::<CompatibleApplyEdit>(apply_params)
+        .await
+    {
+        Ok(response) => {
+            if response.applied {
+                tracing::debug!("workspace/applyEdit '{}' applied", label);
+            } else {
+                tracing::warn!(
+                    "workspace/applyEdit '{}' rejected: {}",
+                    label,
+                    response
+                        .failure_reason
+                        .as_deref()
+                        .unwrap_or("unknown reason")
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!("workspace/applyEdit '{}' failed: {}", label, e);
+        }
+    }
 }
 
 fn temporary_target_path(target_path: &Path) -> PathBuf {
@@ -1143,7 +1252,14 @@ impl LanguageServer for KotlinLanguageServer {
                 client.show_message(MessageType::WARNING, message).await;
             }
 
-            let bridge = Arc::new(Bridge::new(sidecar_runtime, java_path, config));
+            let (notification_tx, mut notification_rx) =
+                tokio::sync::mpsc::channel::<SidecarNotification>(32);
+            let bridge = Arc::new(Bridge::new(
+                sidecar_runtime,
+                java_path,
+                config,
+                notification_tx,
+            ));
 
             // Store the bridge BEFORE starting so LSP requests that arrive
             // during sidecar startup can reach it and wait for Ready state
@@ -1155,6 +1271,31 @@ impl LanguageServer for KotlinLanguageServer {
             // Lock is released here so hover/completion handlers can access
             // the bridge while start() is running. Their requests will wait
             // for Ready via the watch channel in bridge.rs.
+
+            // Spawn a listener for sidecar-initiated notifications (e.g.
+            // workspace/applyEdit for auto-import). This runs for the
+            // lifetime of the sidecar — the channel closes when the bridge
+            // is dropped or the sidecar exits.
+            let edit_client = client.clone();
+            let edit_documents = Arc::clone(&documents_holder);
+            tokio::spawn(async move {
+                while let Some(notification) = notification_rx.recv().await {
+                    if notification.method == "workspace/applyEdit" {
+                        handle_sidecar_apply_edit(
+                            &edit_client,
+                            &edit_documents,
+                            notification.params,
+                        )
+                        .await;
+                    } else {
+                        tracing::debug!(
+                            "ignoring unknown sidecar notification: {}",
+                            notification.method
+                        );
+                    }
+                }
+                tracing::debug!("sidecar notification listener exiting");
+            });
 
             // Prepare project config for the sidecar
             let project_root_str = project_root
@@ -3380,6 +3521,96 @@ mod tests {
 
         assert_eq!(error.code, ErrorCode::InvalidParams);
         assert!(error.message.contains("invalid arguments"));
+    }
+
+    #[test]
+    fn parse_workspace_edits_from_sidecar_notification() {
+        let params = json!({
+            "label": "Auto-import",
+            "version": 3,
+            "edits": [
+                {
+                    "uri": "file:///tmp/Test.kt",
+                    "range": {
+                        "startLine": 2,
+                        "startColumn": 0,
+                        "endLine": 2,
+                        "endColumn": 0
+                    },
+                    "newText": "import kotlin.collections.List\n"
+                }
+            ]
+        });
+
+        let edits = parse_workspace_edits(&params);
+        assert_eq!(edits.len(), 1);
+
+        let uri = Url::parse("file:///tmp/Test.kt").unwrap();
+        let file_edits = edits.get(&uri).expect("expected edits for Test.kt");
+        assert_eq!(file_edits.len(), 1);
+        assert_eq!(file_edits[0].new_text, "import kotlin.collections.List\n");
+        assert_eq!(file_edits[0].range.start.line, 1);
+        assert_eq!(file_edits[0].range.start.character, 0);
+    }
+
+    #[test]
+    fn stale_version_detected_for_apply_edit() {
+        let uri = Url::parse("file:///tmp/Test.kt").unwrap();
+        let open_versions: HashMap<Url, i32> = HashMap::from([(uri.clone(), 5)]);
+
+        let edit_version: Option<i32> = Some(3);
+        let edits: HashMap<Url, Vec<TextEdit>> = HashMap::from([(uri, vec![])]);
+
+        let stale = edit_version.map_or(false, |expected| {
+            edits.keys().any(|uri| {
+                open_versions
+                    .get(uri)
+                    .map(|&current| current != expected)
+                    .unwrap_or(false)
+            })
+        });
+
+        assert!(stale, "edit with version 3 should be stale when doc is at version 5");
+    }
+
+    #[test]
+    fn matching_version_not_stale_for_apply_edit() {
+        let uri = Url::parse("file:///tmp/Test.kt").unwrap();
+        let open_versions: HashMap<Url, i32> = HashMap::from([(uri.clone(), 3)]);
+
+        let edit_version: Option<i32> = Some(3);
+        let edits: HashMap<Url, Vec<TextEdit>> = HashMap::from([(uri, vec![])]);
+
+        let stale = edit_version.map_or(false, |expected| {
+            edits.keys().any(|uri| {
+                open_versions
+                    .get(uri)
+                    .map(|&current| current != expected)
+                    .unwrap_or(false)
+            })
+        });
+
+        assert!(!stale, "edit with matching version should not be stale");
+    }
+
+    #[test]
+    fn no_version_skips_stale_check() {
+        let uri = Url::parse("file:///tmp/Test.kt").unwrap();
+        let open_versions: HashMap<Url, i32> = HashMap::from([(uri.clone(), 5)]);
+
+        let edit_version: Option<i32> = None;
+        let edits: HashMap<Url, Vec<TextEdit>> = HashMap::from([(uri, vec![])]);
+
+        let stale = edit_version.map_or(false, |expected| {
+            edits.keys().any(|uri| {
+                open_versions
+                    .get(uri)
+                    .map(|&current| current != expected)
+                    .unwrap_or(false)
+            })
+        });
+
+        assert!(!stale, "no version in edit should skip stale check");
     }
 
     #[test]

@@ -514,6 +514,7 @@ impl LspTestClient {
 fn server_request_result(msg: &Value) -> Value {
     match msg.get("method").and_then(|method| method.as_str()) {
         Some("window/showDocument") => json!({ "success": true }),
+        Some("workspace/applyEdit") => json!({ "applied": true }),
         _ => Value::Null,
     }
 }
