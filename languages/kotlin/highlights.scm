@@ -125,7 +125,7 @@
 ;;; Function definitions
 
 (function_declaration
-  . (simple_identifier) @function)
+  (simple_identifier) @function)
 
 (getter
   ("get") @function.builtin)

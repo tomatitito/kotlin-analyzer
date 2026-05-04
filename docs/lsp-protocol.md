@@ -87,6 +87,7 @@ surface is nearly identical, so migration would be straightforward.
 
 | Feature | LSP Method |
 |---------|-----------|
+| Go to implementation | `textDocument/implementation` |
 | Find references | `textDocument/references` |
 | Rename | `textDocument/rename` |
 | Code actions | `textDocument/codeAction` |
@@ -120,6 +121,7 @@ model and human-readable wire format for debugging.
 | `completion` | Rust -> JVM | `{ uri, line, character }` | `{ items[] }` |
 | `hover` | Rust -> JVM | `{ uri, line, character }` | `{ contents, reason? }` |
 | `definition` | Rust -> JVM | `{ uri, line, character }` | `{ locations[] }` |
+| `implementation` | Rust -> JVM | `{ uri, line, character }` | `{ locations[] }` |
 | `references` | Rust -> JVM | `{ uri, line, character, includeDeclaration }` | `{ locations[] }` |
 | `formatting` | Rust -> JVM | `{ uri, options }` | `{ edits[] }` |
 | `shutdown` | Rust -> JVM | -- | `{ success }` |
@@ -249,8 +251,8 @@ analysis. The bridge waits 300 ms after the last change event before sending an
 `analyze` request to the JVM. Each new change resets the timer. This prevents redundant
 analysis during rapid typing.
 
-**Not debounced**: User-initiated requests (`completion`, `definition`, `hover`,
-`signatureHelp`, `references`, `formatting`) are forwarded immediately. These are
+**Not debounced**: User-initiated requests (`completion`, `definition`, `implementation`,
+`hover`, `signatureHelp`, `references`, `formatting`) are forwarded immediately. These are
 explicit user actions that expect a prompt response.
 
 **Stale cancellation**: When a new `textDocument/didChange` arrives while a previous
@@ -358,6 +360,7 @@ list grows as features are implemented across phases.
 
 ```json
 {
+  "implementationProvider": true,
   "referencesProvider": true,
   "renameProvider": { "prepareProvider": true },
   "codeActionProvider": true,

@@ -29,8 +29,7 @@ Archive contents:
 kotlin-analyzer-0.1.0-aarch64-apple-darwin/
 ├── kotlin-analyzer          # Rust binary (platform-specific)
 └── sidecar-runtimes/        # Launcher + versioned JVM runtime payloads
-    ├── 2.2.0-RC2/
-    └── 2.2.21/
+    └── 2.3.20/
 ```
 
 Each runtime directory contains a `manifest.json`, a small launcher jar, and a payload classpath with the sidecar implementation plus the Kotlin compiler and Analysis API artifacts for that Kotlin line. Build this layout with `./gradlew assembleRuntimePayloads`.

@@ -149,60 +149,105 @@ kotlin-analyzer requires JDK 17+. It searches for Java in this order:
 
 ### Prerequisites
 
-- Rust 1.70+ (via [rustup](https://rustup.rs))
-- JDK 17+ (for sidecar)
-- wasm32-wasip1 target (`rustup target add wasm32-wasip1`)
+- Rust toolchain (via [rustup](https://rustup.rs))
+- JDK 17+ (for the sidecar)
+- `wasm32-wasip2` target for the Zed extension (`rustup target add wasm32-wasip2`)
 
 ### Build
 
+Run these commands from the repository root:
+
 ```bash
 # Rust LSP binary
-cd server && cargo build --release
+cargo build
 
 # JVM sidecar runtimes
 cd sidecar && ./gradlew assembleRuntimePayloads
 
-# Zed extension (WASM)
-cargo build --target wasm32-wasip1
+# Zed extension (WASM -> extension.wasm)
+bash scripts/build-extension.sh
 ```
 
 ### Install locally
 
-```bash
-ln -sf "$(pwd)/server/target/release/kotlin-analyzer" ~/.local/bin/kotlin-analyzer
-rm -rf ~/.local/bin/sidecar-runtimes
-cp -R sidecar/build/runtime ~/.local/bin/sidecar-runtimes
+Use one of these two workflows.
 
-# Symlink the Zed extension (only needed once)
-ln -sfn "$(pwd)" ~/Library/Application\ Support/Zed/extensions/installed/kotlin-analyzer
-```
-
-For local source-tree development, keep `~/.local/bin/kotlin-analyzer` as a symlink rather than a copied binary. The server uses its resolved executable path to locate versioned runtimes under `sidecar/build/runtime/`.
-
-For development builds, use the helper script:
+#### Option 1: one-command dev install
 
 ```bash
 ./scripts/rebuild-dev.sh
 ```
 
-That script:
+This is the easiest way to install a local development build. The script:
 
-- rebuilds the sidecar runtime payloads
-- rebuilds the debug server binary
-- rebuilds `extension.wasm`
-- refreshes the `~/.local/bin/kotlin-analyzer` symlink
-- refreshes the Zed dev extension symlink under `~/Library/Application Support/Zed/extensions/installed/kotlin-analyzer`
+- runs `sidecar/gradlew clean assembleRuntimePayloads`
+- builds the debug Rust server at `server/target/debug/kotlin-analyzer`
+- rebuilds `extension.wasm` via `scripts/build-extension.sh`
+- refreshes `~/.local/bin/kotlin-analyzer` as a symlink to the debug server binary
+- refreshes the Zed extension symlink at `~/Library/Application Support/Zed/extensions/installed/kotlin-analyzer`
 
-After it finishes, fully restart `my-zed`/Zed so the rebuilt sidecar payloads are picked up.
+After it finishes, fully restart Zed or `my-zed` so the rebuilt sidecar payloads are picked up.
+
+#### Option 2: build and install step by step
+
+1. Build the server:
+
+```bash
+cd server && cargo build
+```
+
+2. Build the JVM sidecar runtimes:
+
+```bash
+cd sidecar && ./gradlew assembleRuntimePayloads
+```
+
+3. Build the Zed extension WASM:
+
+```bash
+./scripts/build-extension.sh
+```
+
+4. Install the local binary and runtime payloads:
+
+```bash
+./scripts/install-dev-runtime.sh
+```
+
+5. Symlink the repository into Zed's local extensions directory if you have not done that before:
+
+```bash
+ln -sfn "$(pwd)" ~/Library/Application\ Support/Zed/extensions/installed/kotlin-analyzer
+```
+
+Then restart Zed.
+
+#### Why the binary should be a symlink
+
+For local source-tree development, keep `~/.local/bin/kotlin-analyzer` as a symlink rather than a copied binary. The server uses its resolved executable path to locate versioned runtimes under `sidecar/build/runtime/`.
+
+#### Useful scripts in `scripts/`
+
+- `scripts/rebuild-dev.sh` — rebuilds everything needed for local development and refreshes symlinks
+- `scripts/install-dev-runtime.sh` — installs the debug server binary and copies `sidecar/build/runtime` into `~/.local/bin/sidecar-runtimes`
+- `scripts/build-extension.sh` — rebuilds `extension.wasm`
+- `scripts/check-version-sync.sh` — verifies release/version metadata stays in sync
+- `scripts/set-version.sh` — updates the project version
 
 ### Test
 
 ```bash
-# Unit tests
-cd server && cargo test
+# Rust tests
+cargo test
+
+# Rust integration tests with the real sidecar
+cargo test --features integration
+
+# Sidecar tests
+cd sidecar && ./gradlew test
 
 # Full smoke test
-cargo build && (cd sidecar && ./gradlew assembleRuntimePayloads) && cd server && cargo test
+cargo build && (cd sidecar && ./gradlew assembleRuntimePayloads) && cargo test
 ```
 
 ## Documentation

@@ -30,7 +30,7 @@ repositories {
     maven("https://maven.pkg.jetbrains.space/kotlin/p/kotlin/kotlin-ide-plugin-dependencies")
 }
 
-val analysisApiVersion = "2.2.21"
+val analysisApiVersion = "2.3.20"
 
 dependencies {
     // From Maven Central
