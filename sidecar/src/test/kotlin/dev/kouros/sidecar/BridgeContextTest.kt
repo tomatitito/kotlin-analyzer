@@ -54,8 +54,7 @@ class BridgeContextTest {
 
     @Test
     fun `makeEdit constructs proper JSON edit object`() {
-        val ctx = BridgeContext()
-        val edit = ctx.makeEdit("file:///test.kt", 1, 0, 1, 5, "hello")
+        val edit = makeEdit("file:///test.kt", 1, 0, 1, 5, "hello")
         assertEquals("file:///test.kt", edit.get("uri").asString)
         assertEquals("hello", edit.get("newText").asString)
         val range = edit.getAsJsonObject("range")

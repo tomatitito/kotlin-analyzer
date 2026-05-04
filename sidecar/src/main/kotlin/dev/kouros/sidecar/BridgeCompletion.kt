@@ -599,7 +599,7 @@ private fun extractCompletionPrefix(element: PsiElement, offset: Int): String {
     return fileText.substring(start, offset)
 }
 
-// --- Unimported completion candidates (needs BridgeContext for symbolIndex and computeImportInsertion) ---
+// --- Unimported completion candidates (needs BridgeContext for symbolIndex) ---
 
 private fun BridgeContext.collectUnimportedCompletionCandidates(
     ktFile: KtFile,

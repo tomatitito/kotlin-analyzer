@@ -1711,6 +1711,189 @@ class CompilerBridgeIntegrationTest {
         )
     }
 
+    // --- Type-position import code actions ---
+
+    @Test
+    fun `codeActions - property type annotation offers import action`() {
+        val uri = "file://$testSourceDir/ImportPropertyType.kt"
+        // "val x: PersonService = TODO()" — PersonService at col 7
+        val content = """
+            package scratch
+
+            val x: PersonService = TODO()
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 3, character = 7)
+        val actions = result.getAsJsonArray("actions")
+        assertNotNull(actions, "actions array should be present")
+
+        val titles = actions.titles()
+        assertTrue(
+            titles.contains("Import 'PersonService'"),
+            "should offer Import 'PersonService' for property type annotation, got: $titles"
+        )
+
+        val importAction = actions.findByTitle("Import 'PersonService'")
+        val edits = importAction.getAsJsonArray("edits")
+        assertTrue(edits.size() > 0, "import action should have edits")
+        val newText = edits[0].asJsonObject.get("newText")?.asString ?: ""
+        assertTrue(
+            newText.contains("import") && newText.contains("PersonService"),
+            "edit should contain import statement, got: $newText"
+        )
+    }
+
+    @Test
+    fun `codeActions - function return type annotation offers import action`() {
+        val uri = "file://$testSourceDir/ImportReturnType.kt"
+        // "fun load(): PersonService = TODO()" — PersonService at col 13
+        val content = """
+            package scratch
+
+            fun load(): PersonService = TODO()
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 3, character = 13)
+        val actions = result.getAsJsonArray("actions")
+        assertNotNull(actions, "actions array should be present")
+
+        val titles = actions.titles()
+        assertTrue(
+            titles.contains("Import 'PersonService'"),
+            "should offer Import 'PersonService' for return type annotation, got: $titles"
+        )
+    }
+
+    @Test
+    fun `codeActions - generic type argument offers import action`() {
+        val uri = "file://$testSourceDir/ImportGenericTypeArg.kt"
+        // "val items: List<PersonService> = listOf()" — PersonService at col 17
+        val content = """
+            package scratch
+
+            val items: List<PersonService> = listOf()
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 3, character = 17)
+        val actions = result.getAsJsonArray("actions")
+        assertNotNull(actions, "actions array should be present")
+
+        val titles = actions.titles()
+        assertTrue(
+            titles.contains("Import 'PersonService'"),
+            "should offer Import 'PersonService' for generic type argument, got: $titles"
+        )
+    }
+
+    @Test
+    fun `codeActions - nullable type annotation offers import action`() {
+        val uri = "file://$testSourceDir/ImportNullableType.kt"
+        // "val x: PersonService? = null" — PersonService at col 7
+        val content = """
+            package scratch
+
+            val x: PersonService? = null
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 3, character = 7)
+        val actions = result.getAsJsonArray("actions")
+        assertNotNull(actions, "actions array should be present")
+
+        val titles = actions.titles()
+        assertTrue(
+            titles.contains("Import 'PersonService'"),
+            "should offer Import 'PersonService' for nullable type annotation, got: $titles"
+        )
+    }
+
+    @Test
+    fun `codeActions - same-package type produces no import action`() {
+        val uri = "file://$testSourceDir/service/SamePackageImport.kt"
+        // PersonService is in package service — same package should not produce import
+        val content = """
+            package service
+
+            val x: PersonService? = null
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 3, character = 7)
+        val actions = result.getAsJsonArray("actions")
+        assertNotNull(actions, "actions array should be present")
+
+        val titles = actions.titles()
+        assertTrue(
+            titles.none { it.startsWith("Import 'PersonService'") },
+            "same-package types should not produce import actions, got: $titles"
+        )
+    }
+
+    @Test
+    fun `codeActions - already-imported type produces no import action`() {
+        val uri = "file://$testSourceDir/AlreadyImportedCodeAction.kt"
+        val content = """
+            package scratch
+
+            import service.PersonService
+
+            val x: PersonService? = null
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 5, character = 7)
+        val actions = result.getAsJsonArray("actions")
+        assertNotNull(actions, "actions array should be present")
+
+        val titles = actions.titles()
+        assertTrue(
+            titles.none { it.startsWith("Import 'PersonService'") },
+            "already-imported types should not produce import actions, got: $titles"
+        )
+    }
+
+    @Test
+    fun `codeActions - ambiguous generic type argument shows per-candidate actions`() {
+        bridge.updateFile(
+            "file://$testSourceDir/alpha/UserService.kt",
+            """
+                package alpha
+
+                class UserService
+            """.trimIndent(),
+        )
+        bridge.updateFile(
+            "file://$testSourceDir/beta/UserService.kt",
+            """
+                package beta
+
+                class UserService
+            """.trimIndent(),
+        )
+
+        val uri = "file://$testSourceDir/AmbiguousGenericTypeArg.kt"
+        // "val items: List<UserService> = listOf()" — UserService at col 17
+        val content = """
+            package scratch
+
+            val items: List<UserService> = listOf()
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 3, character = 17)
+        val actions = result.getAsJsonArray("actions")
+        assertNotNull(actions, "actions array should be present")
+
+        val importTitles = actions.titles().filter { it.startsWith("Import 'UserService' from ") }
+        assertEquals(
+            2, importTitles.size,
+            "should offer two import candidates for ambiguous generic type argument, got: $importTitles"
+        )
+    }
+
     // --- Move to Companion Object ---
 
     @Test

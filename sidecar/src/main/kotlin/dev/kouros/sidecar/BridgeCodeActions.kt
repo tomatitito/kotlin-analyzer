@@ -593,11 +593,11 @@ private fun addTypeImportCodeActions(
     endOffset: Int,
     actionsArray: JsonArray,
 ) {
-    val plan = ctx.planTypeImportAssist(ktFile, factoryName, startOffset, endOffset) ?: return
+    val plan = planTypeImportAssist(ktFile, factoryName, startOffset, endOffset, ctx.symbolIndex, ctx.classpathFqns) ?: return
     if (plan.candidates.isEmpty()) return
 
     for (candidate in plan.candidates) {
-        val importEdit = ctx.buildImportEdit(uri, ktFile, document, candidate.fqn) ?: continue
+        val importEdit = buildImportEdit(uri, ktFile, document, candidate.fqn) ?: continue
         val action = JsonObject()
         val title = if (plan.candidates.size == 1) {
             "Import '${plan.shortName}'"
@@ -675,7 +675,7 @@ private fun KaSession.addInterfaceSignaturePropagationAction(
             action.addProperty("title", "Update interface signature")
             action.addProperty("kind", "refactor")
             val edits = JsonArray()
-            edits.add(ctx.makeEdit(interfaceUri, startLine, startCol, endLine, endCol, "($newParamText)"))
+            edits.add(makeEdit(interfaceUri, startLine, startCol, endLine, endCol, "($newParamText)"))
             action.add("edits", edits)
             actionsArray.add(action)
         } else {
@@ -727,7 +727,7 @@ private fun KaSession.addInterfaceSignaturePropagationAction(
                     } else {
                         sourceParamList.text
                     }
-                    edits.add(ctx.makeEdit(implUri, startLine, startCol, endLine, endCol, newParamListText))
+                    edits.add(makeEdit(implUri, startLine, startCol, endLine, endCol, newParamListText))
                 }
             }
 
@@ -774,7 +774,7 @@ private fun makeDeleteEdit(
         endOffset++
     }
     val (endLine, endCol) = ctx.offsetToLineCol(document, endOffset)
-    return ctx.makeEdit(fileUri, startLine, startCol, endLine, endCol, "")
+    return makeEdit(fileUri, startLine, startCol, endLine, endCol, "")
 }
 
 /**
@@ -788,7 +788,7 @@ private fun makeAppendToFileEdit(
 ): JsonObject {
     val lastLineEnd = document.getLineEndOffset(document.lineCount - 1)
     val (endLine, endCol) = ctx.offsetToLineCol(document, lastLineEnd)
-    return ctx.makeEdit(fileUri, endLine, endCol, endLine, endCol, "\n\n$text")
+    return makeEdit(fileUri, endLine, endCol, endLine, endCol, "\n\n$text")
 }
 
 /**
@@ -856,7 +856,7 @@ private fun KaSession.addMoveToCompanionAction(
                     val reindentedText = memberText.lines().joinToString("\n") { line ->
                         if (line.isBlank()) line else "$companionIndent$line".trimEnd()
                     }
-                    actionEdits.add(ctx.makeEdit(fileUri, insertLine, insertCol, insertLine, insertCol,
+                    actionEdits.add(makeEdit(fileUri, insertLine, insertCol, insertLine, insertCol,
                         "$reindentedText\n$memberIndent"))
                 }
             }
@@ -871,7 +871,7 @@ private fun KaSession.addMoveToCompanionAction(
                         if (line.isBlank()) line else "$companionIndent    $line".trimEnd()
                     }
                     val companionText = "${memberIndent}companion object {\n$reindentedMember\n$memberIndent}\n"
-                    actionEdits.add(ctx.makeEdit(fileUri, insertLine, insertCol, insertLine, insertCol,
+                    actionEdits.add(makeEdit(fileUri, insertLine, insertCol, insertLine, insertCol,
                         "\n$companionText$memberIndent"))
                 }
             }
@@ -932,7 +932,7 @@ private fun addMoveFromCompanionAction(
             }
             val (compStartLine, compStartCol) = ctx.offsetToLineCol(document, companionDeleteStart)
             val (compEndLine, compEndCol) = ctx.offsetToLineCol(document, companionDeleteEnd)
-            actionEdits.add(ctx.makeEdit(fileUri, compStartLine, compStartCol, compEndLine, compEndCol, ""))
+            actionEdits.add(makeEdit(fileUri, compStartLine, compStartCol, compEndLine, compEndCol, ""))
         } else {
             actionEdits.add(makeDeleteEdit(ctx, document, fileUri, declaration))
         }
@@ -945,7 +945,7 @@ private fun addMoveFromCompanionAction(
         val reindentedText = memberText.lines().joinToString("\n") { line ->
             if (line.isBlank()) line else "$memberIndent${line.trimStart()}".trimEnd()
         }
-        actionEdits.add(ctx.makeEdit(fileUri, insertLine, insertCol, insertLine, insertCol,
+        actionEdits.add(makeEdit(fileUri, insertLine, insertCol, insertLine, insertCol,
             "$reindentedText\n\n"))
 
         action.add("edits", actionEdits)
@@ -1046,13 +1046,13 @@ private fun KaSession.addMoveToTopLevelAction(
                     val newCallText = "$funcName($newArgs)"
                     val (csStartLine, csStartCol) = ctx.offsetToLineCol(document, parent.textOffset)
                     val (csEndLine, csEndCol) = ctx.offsetToLineCol(document, parent.textRange.endOffset)
-                    actionEdits.add(ctx.makeEdit(fileUri, csStartLine, csStartCol, csEndLine, csEndCol, newCallText))
+                    actionEdits.add(makeEdit(fileUri, csStartLine, csStartCol, csEndLine, csEndCol, newCallText))
                 } else {
                     val newArgs = if (existingArgs.isBlank()) "this" else "this, $existingArgs"
                     val newCallText = "$funcName($newArgs)"
                     val (csStartLine, csStartCol) = ctx.offsetToLineCol(document, call.textOffset)
                     val (csEndLine, csEndCol) = ctx.offsetToLineCol(document, call.textRange.endOffset)
-                    actionEdits.add(ctx.makeEdit(fileUri, csStartLine, csStartCol, csEndLine, csEndCol, newCallText))
+                    actionEdits.add(makeEdit(fileUri, csStartLine, csStartCol, csEndLine, csEndCol, newCallText))
                 }
             }
         }
