@@ -1,8 +1,8 @@
 ---
 id: ka-3sg2
-status: open
+status: closed
 deps: []
-links: [ka-pg9l, ka-fm0u]
+links: [ka-pg9l, ka-fm0u, ka-4qf5]
 created: 2026-04-02T11:50:25Z
 type: feature
 priority: 2
@@ -137,3 +137,9 @@ Suggested touch points:
 - Existing imports are not duplicated.
 - Same-package symbols do not produce duplicate or unnecessary imports.
 - Add regression tests covering successful auto-import, already-imported types, same-package symbols, and ambiguous candidates with candidate-specific code actions.
+
+## Notes
+
+**2026-05-04T12:35:06Z**
+
+Superseded by epic ka-4qf5 which splits this into focused subtasks: ka-cyb9 (shared import utility), ka-466n (code-action imports for type positions), ka-4ssc (workspace/applyEdit transport), ka-otgo (post-edit auto-import). Closing as superseded.

@@ -2,7 +2,7 @@
 id: ka-pg9l
 status: open
 deps: []
-links: [ka-3sg2]
+links: [ka-3sg2, ka-4qf5]
 created: 2026-03-30T21:50:09Z
 type: feature
 priority: 2

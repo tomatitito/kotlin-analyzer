@@ -2,7 +2,7 @@
 id: ka-fm0u
 status: open
 deps: []
-links: [ka-3sg2]
+links: [ka-3sg2, ka-4ssc]
 created: 2026-04-04T16:22:50Z
 type: bug
 priority: 2
