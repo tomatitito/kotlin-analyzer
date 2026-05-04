@@ -341,6 +341,16 @@ impl LspTestClient {
             return Err("Server doesn't support hover".into());
         }
 
+        let implementation_provider = capabilities.get("implementationProvider");
+        if implementation_provider.is_none()
+            || !implementation_provider
+                .unwrap()
+                .as_bool()
+                .unwrap_or(false)
+        {
+            return Err("Server doesn't support go-to-implementation".into());
+        }
+
         // Send initialized notification (no response expected)
         self.send_notification("initialized", json!({}))?;
 
@@ -467,6 +477,38 @@ impl LspTestClient {
 
         Ok(None)
     }
+
+    fn implementation(
+        &mut self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        let response = self.send_request("textDocument/implementation", params)?;
+
+        if let Some(result) = response.get("result") {
+            if result.is_null() {
+                return Ok(None);
+            }
+            return Ok(Some(result.clone()));
+        }
+
+        if let Some(error) = response.get("error") {
+            let message = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown error");
+            return Err(format!("Implementation request failed: {}", message).into());
+        }
+
+        Ok(None)
+    }
+
 }
 
 fn server_request_result(msg: &Value) -> Value {
@@ -868,6 +910,162 @@ fn test_execute_command_rejects_unsupported_command_ids() {
         .as_str()
         .unwrap_or_default()
         .contains("unsupported analyzer command"));
+}
+
+#[test]
+fn test_goto_implementation_resolves_interface_method_targets() {
+    let workspace = tempdir().expect("failed to create temporary workspace");
+    let source_root = workspace.path().join("src/main/kotlin/com/example");
+    std::fs::create_dir_all(&source_root).expect("failed to create source root");
+
+    let service_path = source_root.join("Service.kt");
+    let primary_path = source_root.join("PrimaryService.kt");
+    let fallback_path = source_root.join("FallbackService.kt");
+
+    let service_text = r#"package com.example
+
+interface Service {
+    fun fetch(id: String): String
+}
+"#;
+    let primary_text = r#"package com.example
+
+class PrimaryService : Service {
+    override fun fetch(id: String): String = id
+}
+"#;
+    let fallback_text = r#"package com.example
+
+object FallbackService : Service {
+    override fun fetch(id: String): String = id.reversed()
+}
+"#;
+
+    std::fs::write(&service_path, service_text).expect("failed to write interface");
+    std::fs::write(&primary_path, primary_text).expect("failed to write primary implementation");
+    std::fs::write(&fallback_path, fallback_text)
+        .expect("failed to write fallback implementation");
+
+    let root_uri = format!("file://{}", workspace.path().display());
+    let service_uri = format!("file://{}", service_path.display());
+    let primary_uri = format!("file://{}", primary_path.display());
+    let fallback_uri = format!("file://{}", fallback_path.display());
+
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize_with_root(&root_uri)
+        .expect("Failed to initialize LSP server");
+
+    client
+        .open_document(&service_uri, service_text)
+        .expect("failed to open interface document");
+    client
+        .open_document(&primary_uri, primary_text)
+        .expect("failed to open primary implementation document");
+    client
+        .open_document(&fallback_uri, fallback_text)
+        .expect("failed to open fallback implementation document");
+
+    let result = client
+        .implementation(&service_uri, 2, 8)
+        .expect("implementation request failed")
+        .expect("implementation request returned null");
+
+    let locations = result
+        .as_array()
+        .expect("multi-target implementation response should be an array");
+    assert_eq!(locations.len(), 2, "expected two implementation targets");
+
+    let mut actual_targets = locations
+        .iter()
+        .map(|location| {
+            (
+                location["uri"].as_str().unwrap_or_default().to_string(),
+                location["range"]["start"]["line"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    actual_targets.sort();
+
+    let mut expected_targets = vec![(fallback_uri, 2_u64), (primary_uri, 2_u64)];
+    expected_targets.sort();
+
+    assert_eq!(actual_targets, expected_targets);
+}
+
+#[test]
+fn test_goto_definition_resolves_interface_method_declaration_from_override() {
+    let workspace = tempdir().expect("failed to create temporary workspace");
+    let source_root = workspace.path().join("src/main/kotlin/com/example");
+    std::fs::create_dir_all(&source_root).expect("failed to create source root");
+
+    let service_path = source_root.join("Service.kt");
+    let primary_path = source_root.join("PrimaryService.kt");
+    let fallback_path = source_root.join("FallbackService.kt");
+
+    let service_text = r#"package com.example
+
+interface Service {
+    fun fetch(id: String): String
+}
+"#;
+    let primary_text = r#"package com.example
+
+class PrimaryService : Service {
+    override fun fetch(id: String): String = id
+}
+"#;
+    let fallback_text = r#"package com.example
+
+object FallbackService : Service {
+    override fun fetch(id: String): String = id.reversed()
+}
+"#;
+
+    std::fs::write(&service_path, service_text).expect("failed to write interface");
+    std::fs::write(&primary_path, primary_text).expect("failed to write primary implementation");
+    std::fs::write(&fallback_path, fallback_text)
+        .expect("failed to write fallback implementation");
+
+    let root_uri = format!("file://{}", workspace.path().display());
+    let service_uri = format!("file://{}", service_path.display());
+    let primary_uri = format!("file://{}", primary_path.display());
+    let fallback_uri = format!("file://{}", fallback_path.display());
+
+    let mut client = LspTestClient::new().expect("Failed to start LSP server");
+    client
+        .initialize_with_root(&root_uri)
+        .expect("Failed to initialize LSP server");
+
+    client
+        .open_document(&service_uri, service_text)
+        .expect("failed to open interface document");
+    client
+        .open_document(&primary_uri, primary_text)
+        .expect("failed to open primary implementation document");
+    client
+        .open_document(&fallback_uri, fallback_text)
+        .expect("failed to open fallback implementation document");
+
+    for implementation_uri in [&primary_uri, &fallback_uri] {
+        let result = client
+            .definition(implementation_uri, 3, 17)
+            .expect("definition request failed")
+            .expect("definition request returned null");
+
+        let location = if result.is_array() {
+            result
+                .as_array()
+                .and_then(|locations| locations.first())
+                .cloned()
+                .expect("expected at least one definition location")
+        } else {
+            result
+        };
+
+        assert_eq!(location["uri"].as_str(), Some(service_uri.as_str()));
+        assert_eq!(location["range"]["start"]["line"].as_u64(), Some(3));
+    }
 }
 
 #[test]

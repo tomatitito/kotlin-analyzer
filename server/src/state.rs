@@ -137,6 +137,10 @@ impl DocumentStore {
     pub fn get_diagnostics(&self, uri: &Url) -> Option<&Vec<Diagnostic>> {
         self.diagnostics.get(uri)
     }
+
+    pub fn remove_diagnostics(&mut self, uri: &Url) {
+        self.diagnostics.remove(uri);
+    }
 }
 
 #[cfg(test)]
@@ -243,5 +247,115 @@ mod tests {
     fn pebble_extension_is_detected_from_uri() {
         let uri = test_uri("templates/page.pebble");
         assert_eq!(DocumentKind::from_uri(&uri), DocumentKind::Pebble);
+    }
+
+    #[test]
+    fn remove_diagnostics_clears_cached_entry() {
+        let mut store = DocumentStore::default();
+        let uri = test_uri("test.kt");
+
+        let diags = vec![Diagnostic::new_simple(
+            tower_lsp::lsp_types::Range::default(),
+            "unused variable".into(),
+        )];
+        store.set_diagnostics(uri.clone(), diags);
+        assert!(store.get_diagnostics(&uri).is_some());
+
+        store.remove_diagnostics(&uri);
+        assert!(store.get_diagnostics(&uri).is_none());
+    }
+
+    #[test]
+    fn remove_diagnostics_noop_for_missing_uri() {
+        let mut store = DocumentStore::default();
+        let uri = test_uri("missing.kt");
+        // Should not panic
+        store.remove_diagnostics(&uri);
+        assert!(store.get_diagnostics(&uri).is_none());
+    }
+
+    #[test]
+    fn diagnostics_survive_close_open_cycle() {
+        let mut store = DocumentStore::default();
+        let uri = test_uri("test.kt");
+
+        store.open(uri.clone(), "fun main() {}".into(), 1, DocumentKind::Kotlin);
+        let diags = vec![Diagnostic::new_simple(
+            tower_lsp::lsp_types::Range::default(),
+            "unused variable".into(),
+        )];
+        store.set_diagnostics(uri.clone(), diags);
+
+        // Close document — diagnostics cache should survive
+        store.close(&uri);
+        assert!(store.get(&uri).is_none());
+        assert!(store.get_diagnostics(&uri).is_some());
+        assert_eq!(store.get_diagnostics(&uri).unwrap().len(), 1);
+
+        // Reopen — cached diagnostics still available for replay
+        store.open(uri.clone(), "fun main() {}".into(), 2, DocumentKind::Kotlin);
+        assert_eq!(store.get_diagnostics(&uri).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stale_diagnostics_cleared_after_clean_analysis() {
+        let mut store = DocumentStore::default();
+        let uri = test_uri("test.kt");
+
+        // File initially has diagnostics
+        let diags = vec![Diagnostic::new_simple(
+            tower_lsp::lsp_types::Range::default(),
+            "unresolved reference".into(),
+        )];
+        store.set_diagnostics(uri.clone(), diags);
+        assert_eq!(store.get_diagnostics(&uri).unwrap().len(), 1);
+
+        // File becomes clean — remove cached diagnostics
+        store.remove_diagnostics(&uri);
+        assert!(store.get_diagnostics(&uri).is_none());
+
+        // Close/open cycle should NOT resurface stale diagnostics
+        store.open(uri.clone(), "fun main() {}".into(), 1, DocumentKind::Kotlin);
+        store.close(&uri);
+        store.open(uri.clone(), "fun main() {}".into(), 2, DocumentKind::Kotlin);
+        assert!(store.get_diagnostics(&uri).is_none());
+    }
+
+    #[test]
+    fn set_diagnostics_empty_replaces_previous() {
+        let mut store = DocumentStore::default();
+        let uri = test_uri("test.kt");
+
+        let diags = vec![Diagnostic::new_simple(
+            tower_lsp::lsp_types::Range::default(),
+            "error".into(),
+        )];
+        store.set_diagnostics(uri.clone(), diags);
+        assert_eq!(store.get_diagnostics(&uri).unwrap().len(), 1);
+
+        // Setting empty diagnostics replaces the cache entry
+        store.set_diagnostics(uri.clone(), vec![]);
+        assert!(store.get_diagnostics(&uri).unwrap().is_empty());
+    }
+
+    #[test]
+    fn diagnostics_independent_of_document_state() {
+        let mut store = DocumentStore::default();
+        let uri = test_uri("test.kt");
+
+        // Set diagnostics without opening the document
+        let diags = vec![Diagnostic::new_simple(
+            tower_lsp::lsp_types::Range::default(),
+            "warning".into(),
+        )];
+        store.set_diagnostics(uri.clone(), diags);
+        assert!(store.get_diagnostics(&uri).is_some());
+        assert!(store.get(&uri).is_none());
+
+        // Remove diagnostics — document state unaffected
+        store.open(uri.clone(), "text".into(), 1, DocumentKind::Kotlin);
+        store.remove_diagnostics(&uri);
+        assert!(store.get_diagnostics(&uri).is_none());
+        assert!(store.get(&uri).is_some());
     }
 }

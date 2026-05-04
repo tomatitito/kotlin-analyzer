@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn selection_prefers_exact_match() {
-        let available = vec![runtime("2.2.0"), runtime("2.2.21"), runtime("2.3.0")];
+        let available = vec![runtime("2.2.0"), runtime("2.2.21"), runtime("2.3.20")];
         let selected = select_sidecar_runtime(Some("2.2.0"), &available).unwrap();
 
         assert_eq!(selected.kotlin_version.as_deref(), Some("2.2.0"));
@@ -743,7 +743,7 @@ mod tests {
         let available = vec![
             validated_runtime("2.2.10", &["2.2"]),
             validated_runtime("2.2.21", &["2.2"]),
-            runtime("2.3.0"),
+            runtime("2.3.20"),
         ];
         let selected = select_sidecar_runtime(Some("2.2.5"), &available).unwrap();
 
@@ -756,10 +756,10 @@ mod tests {
 
     #[test]
     fn selection_falls_back_to_newest_bundled_runtime() {
-        let available = vec![runtime("2.1.20"), runtime("2.2.21"), runtime("2.3.0-RC2")];
+        let available = vec![runtime("2.1.20"), runtime("2.2.21"), runtime("2.3.20")];
         let selected = select_sidecar_runtime(Some("1.9.25"), &available).unwrap();
 
-        assert_eq!(selected.kotlin_version.as_deref(), Some("2.3.0-RC2"));
+        assert_eq!(selected.kotlin_version.as_deref(), Some("2.3.20"));
         assert_eq!(
             selected.selection_reason,
             RuntimeSelectionReason::BundledFallback
@@ -920,10 +920,10 @@ mod tests {
 
     #[test]
     fn same_minor_fallback_requires_validation() {
-        let available = vec![runtime("2.2.21"), runtime("2.3.0")];
+        let available = vec![runtime("2.2.21"), runtime("2.3.20")];
         let selected = select_sidecar_runtime(Some("2.2.5"), &available).unwrap();
 
-        assert_eq!(selected.kotlin_version.as_deref(), Some("2.3.0"));
+        assert_eq!(selected.kotlin_version.as_deref(), Some("2.3.20"));
         assert_eq!(
             selected.selection_reason,
             RuntimeSelectionReason::BundledFallback

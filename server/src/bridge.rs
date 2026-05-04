@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,6 +59,8 @@ pub struct Bridge {
     child: Mutex<Option<tokio::process::Child>>,
     /// Stored init params for automatic restart.
     init_params: Mutex<InitParams>,
+    /// Prevents overlapping restart loops from racing and killing fresh sidecars.
+    restart_in_progress: AtomicBool,
 }
 
 impl Bridge {
@@ -87,6 +89,7 @@ impl Bridge {
             health_check_shutdown: Arc::new(Notify::new()),
             child: Mutex::new(None),
             init_params: Mutex::new(InitParams::default()),
+            restart_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -598,73 +601,89 @@ impl Bridge {
         bridge: Arc<Self>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         Box::pin(async move {
-            let attempt = {
-                let mut count = bridge.restart_count.lock().await;
-                if *count >= MAX_RESTART_ATTEMPTS {
-                    tracing::error!(
-                        "sidecar restart limit reached ({}/{}), giving up",
-                        *count,
-                        MAX_RESTART_ATTEMPTS,
-                    );
-                    Self::set_state(&bridge.state, &bridge.state_watch_tx, SidecarState::Stopped)
-                        .await;
-                    return;
-                }
-                *count += 1;
-                *count
-            };
-
-            // Exponential backoff: 2^attempt seconds (2, 4, 8, 16, 32)
-            let delay = Duration::from_secs(1 << attempt);
-            tracing::warn!(
-                "sidecar restart attempt {}/{} in {:?}",
-                attempt,
-                MAX_RESTART_ATTEMPTS,
-                delay,
-            );
-            time::sleep(delay).await;
-
-            // Kill old process if still running
+            if bridge
+                .restart_in_progress
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
             {
-                let mut child = bridge.child.lock().await;
-                if let Some(mut proc) = child.take() {
-                    let _ = proc.kill().await;
-                }
+                tracing::debug!("sidecar restart already in progress, skipping duplicate trigger");
+                return;
             }
 
-            // Cancel any lingering pending requests
-            Self::cancel_all_pending(&bridge.pending, "sidecar restarting").await;
+            loop {
+                let attempt = {
+                    let mut count = bridge.restart_count.lock().await;
+                    if *count >= MAX_RESTART_ATTEMPTS {
+                        tracing::error!(
+                            "sidecar restart limit reached ({}/{}), giving up",
+                            *count,
+                            MAX_RESTART_ATTEMPTS,
+                        );
+                        Self::set_state(
+                            &bridge.state,
+                            &bridge.state_watch_tx,
+                            SidecarState::Stopped,
+                        )
+                        .await;
+                        bridge.restart_in_progress.store(false, Ordering::Release);
+                        return;
+                    }
+                    *count += 1;
+                    *count
+                };
 
-            // Stop old health check
-            bridge.health_check_shutdown.notify_waiters();
+                // Exponential backoff: 2^attempt seconds (2, 4, 8, 16, 32)
+                let delay = Duration::from_secs(1 << attempt);
+                tracing::warn!(
+                    "sidecar restart attempt {}/{} in {:?}",
+                    attempt,
+                    MAX_RESTART_ATTEMPTS,
+                    delay,
+                );
+                time::sleep(delay).await;
 
-            // Retrieve stored init params
-            let params = bridge.init_params.lock().await.clone();
-
-            // Attempt restart
-            let result = bridge
-                .start(
-                    Some(&params.project_root),
-                    &params.classpath,
-                    &params.compiler_flags,
-                    &params.source_roots,
-                )
-                .await;
-
-            match result {
-                Ok(()) => {
-                    tracing::info!("sidecar restarted successfully (attempt {})", attempt);
+                // Kill old process if still running
+                {
+                    let mut child = bridge.child.lock().await;
+                    if let Some(mut proc) = child.take() {
+                        let _ = proc.kill().await;
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("sidecar restart failed (attempt {}): {}", attempt, e);
-                    Self::set_state(
-                        &bridge.state,
-                        &bridge.state_watch_tx,
-                        SidecarState::Degraded,
+
+                // Cancel any lingering pending requests
+                Self::cancel_all_pending(&bridge.pending, "sidecar restarting").await;
+
+                // Stop old health check
+                bridge.health_check_shutdown.notify_waiters();
+
+                // Retrieve stored init params
+                let params = bridge.init_params.lock().await.clone();
+
+                // Attempt restart
+                let result = bridge
+                    .start(
+                        Some(&params.project_root),
+                        &params.classpath,
+                        &params.compiler_flags,
+                        &params.source_roots,
                     )
                     .await;
-                    // Schedule another attempt
-                    tokio::spawn(Self::try_restart(bridge));
+
+                match result {
+                    Ok(()) => {
+                        tracing::info!("sidecar restarted successfully (attempt {})", attempt);
+                        bridge.restart_in_progress.store(false, Ordering::Release);
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("sidecar restart failed (attempt {}): {}", attempt, e);
+                        Self::set_state(
+                            &bridge.state,
+                            &bridge.state_watch_tx,
+                            SidecarState::Degraded,
+                        )
+                        .await;
+                    }
                 }
             }
         })
@@ -794,7 +813,7 @@ mod tests {
         let bridge = Bridge::new(
             SidecarRuntime {
                 requested_kotlin_version: None,
-                kotlin_version: Some("2.2.21".into()),
+                kotlin_version: Some("2.3.20".into()),
                 classpath: vec![PathBuf::from("sidecar.jar")],
                 main_class: None,
                 selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
@@ -812,7 +831,7 @@ mod tests {
         let bridge = Bridge::new(
             SidecarRuntime {
                 requested_kotlin_version: None,
-                kotlin_version: Some("2.2.21".into()),
+                kotlin_version: Some("2.3.20".into()),
                 classpath: vec![PathBuf::from("sidecar.jar")],
                 main_class: None,
                 selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
@@ -830,7 +849,7 @@ mod tests {
         let bridge = Bridge::new(
             SidecarRuntime {
                 requested_kotlin_version: None,
-                kotlin_version: Some("2.2.21".into()),
+                kotlin_version: Some("2.3.20".into()),
                 classpath: vec![PathBuf::from("sidecar.jar")],
                 main_class: None,
                 selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
@@ -854,7 +873,7 @@ mod tests {
         let bridge = Bridge::new(
             SidecarRuntime {
                 requested_kotlin_version: None,
-                kotlin_version: Some("2.2.21".into()),
+                kotlin_version: Some("2.3.20".into()),
                 classpath: vec![PathBuf::from("sidecar.jar")],
                 main_class: None,
                 selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
@@ -874,7 +893,7 @@ mod tests {
         let bridge = Bridge::new(
             SidecarRuntime {
                 requested_kotlin_version: None,
-                kotlin_version: Some("2.2.21".into()),
+                kotlin_version: Some("2.3.20".into()),
                 classpath: vec![PathBuf::from("sidecar.jar")],
                 main_class: None,
                 selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
@@ -908,7 +927,7 @@ mod tests {
         let bridge = Bridge::new(
             SidecarRuntime {
                 requested_kotlin_version: None,
-                kotlin_version: Some("2.2.21".into()),
+                kotlin_version: Some("2.3.20".into()),
                 classpath: vec![PathBuf::from("sidecar.jar")],
                 main_class: None,
                 selection_reason: crate::runtime::RuntimeSelectionReason::DefaultBundled,
@@ -956,7 +975,7 @@ mod tests {
     fn bridge_stores_selected_runtime_for_restarts() {
         let runtime = SidecarRuntime {
             requested_kotlin_version: Some("2.2.20".into()),
-            kotlin_version: Some("2.2.21".into()),
+            kotlin_version: Some("2.3.20".into()),
             classpath: vec![PathBuf::from("runtime.jar")],
             main_class: Some("dev.kouros.sidecar.MainKt".into()),
             selection_reason: crate::runtime::RuntimeSelectionReason::SameMinorFallback,

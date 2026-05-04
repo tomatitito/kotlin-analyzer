@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use lsp_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use lsp_types::request::Request as LspRequest;
 use lsp_types::*;
 use serde::Deserialize;
@@ -221,22 +222,6 @@ fn parse_workspace_edits(result: &Value) -> HashMap<Url, Vec<TextEdit>> {
     changes
 }
 
-fn response_version(result: &Value) -> Option<i32> {
-    result
-        .get("version")
-        .and_then(|value| value.as_i64())
-        .and_then(|value| i32::try_from(value).ok())
-}
-
-fn analyze_edits_are_current(
-    expected_version: i32,
-    current_version: Option<i32>,
-    result: &Value,
-) -> bool {
-    let response_version = response_version(result).unwrap_or(expected_version);
-    response_version == expected_version && current_version == Some(expected_version)
-}
-
 fn parse_code_action_command(action: &Value) -> Option<lsp_types::Command> {
     let command = action.get("command")?.clone();
     match serde_json::from_value::<lsp_types::Command>(command) {
@@ -248,7 +233,10 @@ fn parse_code_action_command(action: &Value) -> Option<lsp_types::Command> {
     }
 }
 
-fn parse_code_actions_result(result: &Value) -> CodeActionResponse {
+fn parse_code_actions_result(
+    result: &Value,
+    open_document_versions: &HashMap<Url, i32>,
+) -> CodeActionResponse {
     let actions_array = match result.get("actions").and_then(|a| a.as_array()) {
         Some(arr) => arr,
         None => return Vec::new(),
@@ -267,9 +255,25 @@ fn parse_code_actions_result(result: &Value) -> CodeActionResponse {
             let edit = if edits.is_empty() {
                 None
             } else {
+                let document_changes = edits
+                    .iter()
+                    .map(|(uri, uri_edits)| {
+                        TextDocumentEdit {
+                            text_document: OptionalVersionedTextDocumentIdentifier {
+                                uri: uri.clone(),
+                                version: open_document_versions.get(uri).copied(),
+                            },
+                            edits: uri_edits
+                                .iter()
+                                .cloned()
+                                .map(OneOf::Left)
+                                .collect(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
                 Some(WorkspaceEdit {
-                    changes: Some(edits),
-                    document_changes: None,
+                    changes: None,
+                    document_changes: Some(DocumentChanges::Edits(document_changes)),
                     change_annotations: None,
                 })
             };
@@ -436,7 +440,6 @@ impl KotlinLanguageServer {
                     let mut documents = self.documents.lock().await;
                     documents.set_diagnostics(uri.clone(), diagnostics.clone());
                 }
-                self.apply_analyzed_edits(uri, &result).await;
                 self.client
                     .publish_diagnostics(uri.clone(), diagnostics, None)
                     .await;
@@ -638,60 +641,6 @@ impl KotlinLanguageServer {
             .collect()
     }
 
-    fn parse_result_version(result: &Value) -> Option<i32> {
-        result
-            .get("version")
-            .and_then(|value| value.as_i64())
-            .and_then(|value| i32::try_from(value).ok())
-    }
-
-    async fn apply_analyzed_edits(&self, uri: &Url, result: &Value) {
-        let planned_version = match Self::parse_result_version(result) {
-            Some(version) => version,
-            None => return,
-        };
-
-        let current_version = {
-            let documents = self.documents.lock().await;
-            documents.get(uri).map(|doc| doc.version)
-        };
-        if !analyze_edits_are_current(planned_version, current_version, result) {
-            tracing::debug!(
-                "skipping analyzer edit for {} because version changed (planned={}, current={:?}, response={:?})",
-                uri,
-                planned_version,
-                current_version,
-                response_version(result),
-            );
-            return;
-        }
-
-        let edits = parse_workspace_edits(result);
-        if edits.is_empty() {
-            return;
-        }
-
-        let edit = WorkspaceEdit {
-            changes: Some(edits),
-            document_changes: None,
-            change_annotations: None,
-        };
-
-        match self.client.apply_edit(edit).await {
-            Ok(response) if response.applied => {}
-            Ok(response) => {
-                tracing::warn!(
-                    "client rejected analyzer edit for {}: {:?}",
-                    uri,
-                    response.failure_reason,
-                );
-            }
-            Err(error) => {
-                tracing::warn!("failed to apply analyzer edit for {}: {}", uri, error);
-            }
-        }
-    }
-
     /// Starts the debounce loop for document analysis.
     fn start_debounce_loop(&self) -> tokio::sync::mpsc::Sender<Url> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Url>(64);
@@ -748,35 +697,6 @@ impl KotlinLanguageServer {
                                             "version": version,
                                         }))).await {
                                             Ok(result) => {
-                                                if let Some(planned_version) = Self::parse_result_version(&result) {
-                                                    let current_version = {
-                                                        let document_store = documents.lock().await;
-                                                        document_store.get(&uri).map(|doc| doc.version)
-                                                    };
-                                                    if current_version == Some(planned_version) {
-                                                        let edits = parse_workspace_edits(&result);
-                                                        if !edits.is_empty() {
-                                                            let edit = WorkspaceEdit {
-                                                                changes: Some(edits),
-                                                                document_changes: None,
-                                                                change_annotations: None,
-                                                            };
-                                                            match client.apply_edit(edit).await {
-                                                                Ok(response) if response.applied => {}
-                                                                Ok(response) => tracing::warn!(
-                                                                    "client rejected analyzer edit for {}: {:?}",
-                                                                    uri,
-                                                                    response.failure_reason,
-                                                                ),
-                                                                Err(error) => tracing::warn!(
-                                                                    "failed to apply analyzer edit for {}: {}",
-                                                                    uri,
-                                                                    error,
-                                                                ),
-                                                            }
-                                                        }
-                                                    }
-                                                }
                                                 let diagnostics = parse_diagnostics_static(&result);
                                                 client.publish_diagnostics(uri, diagnostics, None).await;
                                             }
@@ -953,6 +873,7 @@ impl LanguageServer for KotlinLanguageServer {
                     ..Default::default()
                 }),
                 definition_provider: Some(OneOf::Left(true)),
+                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Left(true)),
@@ -1496,7 +1417,6 @@ impl LanguageServer for KotlinLanguageServer {
 
                                         let diagnostics = parse_diagnostics_static(file_entry);
 
-                                        // Only publish and cache files with actual diagnostics
                                         if !diagnostics.is_empty() {
                                             {
                                                 let mut docs = bg_documents.lock().await;
@@ -1509,6 +1429,22 @@ impl LanguageServer for KotlinLanguageServer {
                                                 .publish_diagnostics(uri, diagnostics, None)
                                                 .await;
                                             _published += 1;
+                                        } else {
+                                            // File is now clean — clear stale cached diagnostics
+                                            // so they aren't re-published on didClose/didOpen cycles
+                                            let had_cached = {
+                                                let mut docs = bg_documents.lock().await;
+                                                let had = docs.get_diagnostics(&uri).is_some();
+                                                if had {
+                                                    docs.remove_diagnostics(&uri);
+                                                }
+                                                had
+                                            };
+                                            if had_cached {
+                                                bg_client
+                                                    .publish_diagnostics(uri, vec![], None)
+                                                    .await;
+                                            }
                                         }
 
                                         // Report progress periodically
@@ -1925,6 +1861,59 @@ impl LanguageServer for KotlinLanguageServer {
         }
     }
 
+    async fn goto_implementation(
+        &self,
+        params: GotoImplementationParams,
+    ) -> LspResult<Option<GotoImplementationResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let kind = {
+            let documents = self.documents.lock().await;
+            documents
+                .get(&uri)
+                .map(|doc| doc.kind)
+                .unwrap_or_else(|| DocumentKind::from_uri(&uri))
+        };
+
+        if !kind.supports_kotlin_analysis() {
+            return Ok(None);
+        }
+
+        let bridge = match self.get_bridge().await {
+            Some(b) => b,
+            None => return Self::server_not_initialized_error(),
+        };
+
+        match bridge
+            .request(
+                "implementation",
+                Some(serde_json::json!({
+                    "uri": uri.as_str(),
+                    "line": position.line + 1,
+                    "character": position.character,
+                })),
+            )
+            .await
+        {
+            Ok(result) => {
+                let locations = self.parse_locations(&result);
+                if locations.is_empty() {
+                    Ok(None)
+                } else if locations.len() == 1 {
+                    Ok(Some(GotoImplementationResponse::Scalar(
+                        locations.into_iter().next().unwrap(),
+                    )))
+                } else {
+                    Ok(Some(GotoImplementationResponse::Array(locations)))
+                }
+            }
+            Err(e) => {
+                tracing::warn!("goto_implementation failed: {}", e);
+                Ok(None)
+            }
+        }
+    }
+
     async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
@@ -2244,7 +2233,14 @@ impl LanguageServer for KotlinLanguageServer {
         {
             Ok(result) => {
                 tracing::debug!("code_action: raw sidecar response for {}: {}", uri, result);
-                let actions = parse_code_actions_result(&result);
+                let open_document_versions = {
+                    let documents = self.documents.lock().await;
+                    documents
+                        .all()
+                        .map(|(uri, doc)| (uri.clone(), doc.version))
+                        .collect::<HashMap<_, _>>()
+                };
+                let actions = parse_code_actions_result(&result, &open_document_versions);
                 tracing::debug!(
                     "code_action: parsed {} action(s) for {} at L{}:{}",
                     actions.len(),
@@ -2618,14 +2614,34 @@ impl KotlinLanguageServer {
         drop(stdin);
 
         let output = child.wait_with_output().await?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
         if output.status.success() {
-            Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()))
+            if looks_like_formatter_diagnostics(&stdout) || stdout.trim().is_empty() {
+                tracing::warn!(
+                    "ktlint returned non-source stdout; ignoring formatter output. stdout={:?} stderr={:?}",
+                    stdout,
+                    stderr
+                );
+                Ok(None)
+            } else {
+                Ok(Some(stdout))
+            }
         } else {
-            tracing::warn!("ktlint stderr: {}", String::from_utf8_lossy(&output.stderr));
+            tracing::warn!("ktlint stderr: {}", stderr);
             Ok(None)
         }
     }
+}
+
+fn looks_like_formatter_diagnostics(output: &str) -> bool {
+    let normalized = output.trim();
+    normalized.contains("KtlintCommandLine")
+        || normalized.contains("Not a valid Kotlin file")
+        || normalized.contains("Can not parse input from <stdin>")
+        || normalized.contains("[main] WARN")
+        || normalized.contains("[main] ERROR")
 }
 
 // Helper methods for parsing sidecar responses
@@ -3196,7 +3212,7 @@ mod tests {
             ]
         });
 
-        let actions = parse_code_actions_result(&result);
+        let actions = parse_code_actions_result(&result, &HashMap::new());
         assert_eq!(actions.len(), 1);
 
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
@@ -3253,7 +3269,7 @@ mod tests {
             ]
         });
 
-        let actions = parse_code_actions_result(&result);
+        let actions = parse_code_actions_result(&result, &HashMap::new());
         assert_eq!(actions.len(), 1);
 
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
@@ -3261,12 +3277,76 @@ mod tests {
         };
 
         let edit = action.edit.as_ref().expect("edit should be preserved");
-        let changes = edit.changes.as_ref().expect("changes should exist");
-        assert_eq!(changes.len(), 1);
+        let document_changes = edit
+            .document_changes
+            .as_ref()
+            .expect("document changes should exist");
+        let DocumentChanges::Edits(edits) = document_changes else {
+            panic!("expected text document edits");
+        };
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].text_document.uri.as_str(), "file:///tmp/Test.kt");
+        assert_eq!(edits[0].text_document.version, None);
         assert!(
             action.command.is_none(),
             "edit-only action should remain command-free"
         );
+    }
+
+    #[test]
+    fn parse_code_actions_attaches_open_document_versions_to_document_changes() {
+        let result = json!({
+            "actions": [
+                {
+                    "title": "Update implementation signatures",
+                    "kind": "refactor",
+                    "edits": [
+                        {
+                            "uri": "file:///tmp/Test.kt",
+                            "range": {
+                                "startLine": 4,
+                                "startColumn": 10,
+                                "endLine": 4,
+                                "endColumn": 10
+                            },
+                            "newText": ", tenant: String"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let uri = Url::parse("file:///tmp/Test.kt").unwrap();
+        let actions = parse_code_actions_result(&result, &HashMap::from([(uri.clone(), 7)]));
+        assert_eq!(actions.len(), 1);
+
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected code action");
+        };
+
+        let edit = action.edit.as_ref().expect("edit should be preserved");
+        let document_changes = edit
+            .document_changes
+            .as_ref()
+            .expect("document changes should exist");
+        let DocumentChanges::Edits(edits) = document_changes else {
+            panic!("expected text document edits");
+        };
+
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].text_document.uri, uri);
+        assert_eq!(edits[0].text_document.version, Some(7));
+    }
+
+    #[test]
+    fn formatter_diagnostic_output_is_rejected() {
+        assert!(looks_like_formatter_diagnostics(
+            "16:52:34.957 [main] WARN com.pinterest.ktlint.cli.internal.KtlintCommandLine -- Can not parse input from <stdin>"
+        ));
+        assert!(looks_like_formatter_diagnostics(
+            "Not a valid Kotlin file (79:5 expecting a parameter declaration)"
+        ));
+        assert!(!looks_like_formatter_diagnostics("package com.example\n\nclass Test\n"));
     }
 
     #[test]
@@ -3300,40 +3380,6 @@ mod tests {
 
         assert_eq!(error.code, ErrorCode::InvalidParams);
         assert!(error.message.contains("invalid arguments"));
-    }
-
-    #[test]
-    fn analyze_edits_are_current_requires_matching_document_and_response_versions() {
-        let result = json!({
-            "version": 7,
-            "edits": [
-                {
-                    "uri": "file:///tmp/Test.kt",
-                    "range": {
-                        "startLine": 1,
-                        "startColumn": 0,
-                        "endLine": 1,
-                        "endColumn": 0
-                    },
-                    "newText": "import model.Person\n"
-                }
-            ]
-        });
-
-        assert!(analyze_edits_are_current(7, Some(7), &result));
-        assert!(!analyze_edits_are_current(7, Some(8), &result));
-        assert!(!analyze_edits_are_current(
-            7,
-            Some(7),
-            &json!({ "version": 8 })
-        ));
-    }
-
-    #[test]
-    fn response_version_handles_absent_and_non_numeric_values() {
-        assert_eq!(response_version(&json!({ "version": 3 })), Some(3));
-        assert_eq!(response_version(&json!({})), None);
-        assert_eq!(response_version(&json!({ "version": "three" })), None);
     }
 
     #[test]
