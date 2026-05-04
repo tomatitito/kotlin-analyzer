@@ -81,7 +81,7 @@ class CompilerBridgeIntegrationTest {
     }
 
     @Test
-    fun `analyze - unique property type candidate returns auto import edit`() {
+    fun `analyze - unique property type candidate returns diagnostic without auto import edit`() {
         val uri = "file://$testSourceDir/AutoImportPropertyType.kt"
         val content = """
             package scratch
@@ -93,18 +93,30 @@ class CompilerBridgeIntegrationTest {
         bridge.updateFile(uri, content)
 
         val result = bridge.analyze(uri, version = 7)
-        val edits = result.getAsJsonArray("edits")
 
+        // analyze must report the unresolved reference as a diagnostic
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        assertNotNull(diagnostics, "diagnostics array should be present")
+        val unresolvedDiags = (0 until diagnostics.size())
+            .map { diagnostics[it].asJsonObject }
+            .filter { it.get("code")?.asString == "UNRESOLVED_REFERENCE" }
+        assertTrue(unresolvedDiags.isNotEmpty(), "should report UNRESOLVED_REFERENCE for PersonService")
+
+        // analyze must NOT return import edits
+        val edits = result.getAsJsonArray("edits")
         assertNotNull(edits, "edits array should be present")
-        assertEquals(1, edits.size(), "should return exactly one auto-import edit")
+        assertEquals(0, edits.size(), "analyze must not return auto-import edits")
         assertEquals(7, result.get("version")?.asInt, "analyze should echo the analyzed version")
 
-        val newText = edits[0].asJsonObject.get("newText")?.asString ?: ""
-        assertEquals("import service.PersonService\n\n", newText)
+        // import should be available via code actions instead
+        val actions = bridge.codeActions(uri, line = 4, character = 21).getAsJsonArray("actions")
+        assertNotNull(actions, "actions array should be present")
+        val titles = actions.map { it.asJsonObject.get("title")?.asString ?: "" }
+        assertTrue(titles.contains("Import 'PersonService'"), "should offer import quick fix, got: $titles")
     }
 
     @Test
-    fun `analyze - unique function return type candidate returns auto import edit`() {
+    fun `analyze - unique function return type candidate returns diagnostic without auto import edit`() {
         val uri = "file://$testSourceDir/AutoImportReturnType.kt"
         val content = """
             package scratch
@@ -114,13 +126,22 @@ class CompilerBridgeIntegrationTest {
         bridge.updateFile(uri, content)
 
         val result = bridge.analyze(uri)
+
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        assertNotNull(diagnostics, "diagnostics array should be present")
+        val unresolvedDiags = (0 until diagnostics.size())
+            .map { diagnostics[it].asJsonObject }
+            .filter { it.get("code")?.asString == "UNRESOLVED_REFERENCE" }
+        assertTrue(unresolvedDiags.isNotEmpty(), "should report UNRESOLVED_REFERENCE for Person")
+
         val edits = result.getAsJsonArray("edits")
-
         assertNotNull(edits, "edits array should be present")
-        assertEquals(1, edits.size(), "should auto-import the unique return type candidate")
+        assertEquals(0, edits.size(), "analyze must not return auto-import edits")
 
-        val newText = edits[0].asJsonObject.get("newText")?.asString ?: ""
-        assertEquals("import model.Person\n\n", newText)
+        val actions = bridge.codeActions(uri, line = 3, character = 14).getAsJsonArray("actions")
+        assertNotNull(actions, "actions array should be present")
+        val titles = actions.map { it.asJsonObject.get("title")?.asString ?: "" }
+        assertTrue(titles.contains("Import 'Person'"), "should offer import quick fix, got: $titles")
     }
 
     @Test
@@ -211,7 +232,7 @@ class CompilerBridgeIntegrationTest {
     }
 
     @Test
-    fun `analyze - constructor call returns auto import edit`() {
+    fun `analyze - constructor call returns diagnostic without auto import edit`() {
         val uri = "file://$testSourceDir/AutoImportConstructorCall.kt"
         val content = """
             package scratch
@@ -221,17 +242,26 @@ class CompilerBridgeIntegrationTest {
         bridge.updateFile(uri, content)
 
         val result = bridge.analyze(uri)
+
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        assertNotNull(diagnostics, "diagnostics array should be present")
+        val unresolvedDiags = (0 until diagnostics.size())
+            .map { diagnostics[it].asJsonObject }
+            .filter { it.get("code")?.asString == "UNRESOLVED_REFERENCE" }
+        assertTrue(unresolvedDiags.isNotEmpty(), "should report UNRESOLVED_REFERENCE for PersonService")
+
         val edits = result.getAsJsonArray("edits")
-
         assertNotNull(edits, "edits array should be present")
-        assertEquals(1, edits.size(), "should return exactly one auto-import edit for constructor call")
+        assertEquals(0, edits.size(), "analyze must not return auto-import edits")
 
-        val newText = edits[0].asJsonObject.get("newText")?.asString ?: ""
-        assertEquals("import service.PersonService\n\n", newText)
+        val actions = bridge.codeActions(uri, line = 3, character = 21).getAsJsonArray("actions")
+        assertNotNull(actions, "actions array should be present")
+        val titles = actions.map { it.asJsonObject.get("title")?.asString ?: "" }
+        assertTrue(titles.contains("Import 'PersonService'"), "should offer import quick fix, got: $titles")
     }
 
     @Test
-    fun `analyze - parameter type returns auto import edit`() {
+    fun `analyze - parameter type returns diagnostic without auto import edit`() {
         val uri = "file://$testSourceDir/AutoImportParameterType.kt"
         val content = """
             package scratch
@@ -241,17 +271,26 @@ class CompilerBridgeIntegrationTest {
         bridge.updateFile(uri, content)
 
         val result = bridge.analyze(uri)
+
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        assertNotNull(diagnostics, "diagnostics array should be present")
+        val unresolvedDiags = (0 until diagnostics.size())
+            .map { diagnostics[it].asJsonObject }
+            .filter { it.get("code")?.asString == "UNRESOLVED_REFERENCE" }
+        assertTrue(unresolvedDiags.isNotEmpty(), "should report UNRESOLVED_REFERENCE for PersonService")
+
         val edits = result.getAsJsonArray("edits")
-
         assertNotNull(edits, "edits array should be present")
-        assertEquals(1, edits.size(), "should return exactly one auto-import edit for parameter type")
+        assertEquals(0, edits.size(), "analyze must not return auto-import edits")
 
-        val newText = edits[0].asJsonObject.get("newText")?.asString ?: ""
-        assertEquals("import service.PersonService\n\n", newText)
+        val actions = bridge.codeActions(uri, line = 3, character = 22).getAsJsonArray("actions")
+        assertNotNull(actions, "actions array should be present")
+        val titles = actions.map { it.asJsonObject.get("title")?.asString ?: "" }
+        assertTrue(titles.contains("Import 'PersonService'"), "should offer import quick fix, got: $titles")
     }
 
     @Test
-    fun `analyze - supertype returns auto import edit`() {
+    fun `analyze - supertype returns diagnostic without auto import edit`() {
         // Create an open class to extend
         bridge.updateFile(
             "file://$testSourceDir/base/BaseService.kt",
@@ -271,13 +310,22 @@ class CompilerBridgeIntegrationTest {
         bridge.updateFile(uri, content)
 
         val result = bridge.analyze(uri)
+
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        assertNotNull(diagnostics, "diagnostics array should be present")
+        val unresolvedDiags = (0 until diagnostics.size())
+            .map { diagnostics[it].asJsonObject }
+            .filter { it.get("code")?.asString == "UNRESOLVED_REFERENCE" }
+        assertTrue(unresolvedDiags.isNotEmpty(), "should report UNRESOLVED_REFERENCE for BaseService")
+
         val edits = result.getAsJsonArray("edits")
-
         assertNotNull(edits, "edits array should be present")
-        assertEquals(1, edits.size(), "should return exactly one auto-import edit for supertype")
+        assertEquals(0, edits.size(), "analyze must not return auto-import edits")
 
-        val newText = edits[0].asJsonObject.get("newText")?.asString ?: ""
-        assertEquals("import base.BaseService\n\n", newText)
+        val actions = bridge.codeActions(uri, line = 3, character = 19).getAsJsonArray("actions")
+        assertNotNull(actions, "actions array should be present")
+        val titles = actions.map { it.asJsonObject.get("title")?.asString ?: "" }
+        assertTrue(titles.contains("Import 'BaseService'"), "should offer import quick fix, got: $titles")
     }
 
     @Test
@@ -535,6 +583,27 @@ class CompilerBridgeIntegrationTest {
         assertTrue(
             locations.size() > 0,
             "should find at least one definition location for 'Greeter'"
+        )
+    }
+
+    @Test
+    fun `definition - returns workspace URI not shadow root`() {
+        val uri = "file://$testSourceDir/Clean.kt"
+        val result = bridge.definition(uri, line = 11, character = 12)
+
+        val locations = result.getAsJsonArray("locations")
+        assertNotNull(locations, "locations array should be present")
+        assertTrue(locations.size() > 0, "should find definition for 'greeter'")
+
+        val defUri = locations[0].asJsonObject.get("uri")?.asString
+            ?: throw AssertionError("definition location should have a URI")
+        assertTrue(
+            defUri.startsWith("file://$testSourceDir"),
+            "definition URI should point to workspace ($testSourceDir), not shadow root. Got: $defUri"
+        )
+        assertTrue(
+            !defUri.contains("shadow"),
+            "definition URI must not contain shadow root path. Got: $defUri"
         )
     }
 

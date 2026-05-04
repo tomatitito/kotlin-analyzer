@@ -41,6 +41,10 @@ class SpringWebResolutionTest {
                 "fixture classpath should contain spring-web JAR, got: $projectClasspath"
             )
             assertTrue(
+                projectClasspath.any { it.contains("spring-data-mongodb") },
+                "fixture classpath should contain spring-data-mongodb JAR, got: $projectClasspath"
+            )
+            assertTrue(
                 projectClasspath.any { it.contains("arrow-core") },
                 "fixture classpath should contain arrow-core JAR, got: $projectClasspath"
             )
@@ -64,8 +68,33 @@ class SpringWebResolutionTest {
 
         private fun loadSpringProjectConfig(fixtureDir: String): ProjectConfig {
             val modelFile = File(fixtureDir, ".kotlin-analyzer/project-model.json")
+            val expectedClasspathMarkers = listOf("spring-web", "spring-data-mongodb", "arrow-core")
             val modelJson = if (modelFile.exists()) {
-                JsonParser.parseString(modelFile.readText()).asJsonObject
+                val cached = JsonParser.parseString(modelFile.readText()).asJsonObject
+                val cachedClasspath = cached.getAsJsonArray("classpath")
+                    ?.map { it.asString }
+                    .orEmpty()
+                val hasExpectedDeps = expectedClasspathMarkers.all { marker ->
+                    cachedClasspath.any { it.contains(marker) }
+                }
+                val hasUsableClasspath = cachedClasspath.isNotEmpty() && cachedClasspath.all { File(it).exists() }
+                if (hasExpectedDeps && hasUsableClasspath) {
+                    cached
+                } else {
+                    val generated = resolveGradleProjectConfig(fixtureDir)
+                    val json = JsonObject().apply {
+                        addProperty("jdk_home", System.getProperty("java.home"))
+                        add("classpath", com.google.gson.JsonArray().also { classpath ->
+                            generated.classpath.forEach { classpath.add(it) }
+                        })
+                        add("compiler_flags", com.google.gson.JsonArray().also { flags ->
+                            generated.compilerFlags.forEach { flags.add(it) }
+                        })
+                    }
+                    modelFile.parentFile?.mkdirs()
+                    modelFile.writeText(json.toString())
+                    json
+                }
             } else {
                 val generated = resolveGradleProjectConfig(fixtureDir)
                 val json = JsonObject().apply {
@@ -425,6 +454,87 @@ class SpringWebResolutionTest {
         // Completion at the annotation name position should return results
         // (may include GetMapping itself or other annotations)
         System.err.println("COMPLETION @GetMapping: ${items.size()} items")
+    }
+
+    @Test
+    fun `completion - MongoOperations members available`() {
+        val fixtureSourceDir = findFixtureDir() + "/src/main/kotlin"
+        bridge = CompilerBridge()
+        bridge.initialize(
+            projectRoot = fixtureSourceDir,
+            classpath = projectClasspath,
+            compilerFlags = projectCompilerFlags,
+            jdkHome = "",
+            sourceRoots = listOf(fixtureSourceDir),
+        )
+
+        val uri = "file://$fixtureSourceDir/MongoExample.kt"
+        val result = bridge.completion(uri, line = 7, character = 24, triggerCharacter = ".")
+
+        val items = result.getAsJsonArray("items")
+        assertNotNull(items, "completion items array should be present")
+        val labels = items.map { it.asJsonObject.get("label")?.asString ?: "" }
+
+        assertTrue(
+            labels.any { it == "findById" || it == "find" || it == "save" || it == "remove" },
+            "completion should include MongoOperations members, got: ${labels.take(20)} (reason=${result.get("reason")?.asString})"
+        )
+    }
+
+    @Test
+    fun `completion - MongoOperations prefix narrows member results`() {
+        val fixtureSourceDir = findFixtureDir() + "/src/main/kotlin"
+        bridge = CompilerBridge()
+        bridge.initialize(
+            projectRoot = fixtureSourceDir,
+            classpath = projectClasspath,
+            compilerFlags = projectCompilerFlags,
+            jdkHome = "",
+            sourceRoots = listOf(fixtureSourceDir),
+        )
+
+        val uri = "file://$fixtureSourceDir/MongoExample.kt"
+        val result = bridge.completion(uri, line = 13, character = 26)
+
+        val items = result.getAsJsonArray("items")
+        assertNotNull(items, "completion items array should be present")
+        val labels = items.map { it.asJsonObject.get("label")?.asString ?: "" }
+
+        assertTrue(labels.isNotEmpty(), "prefix completion should return MongoOperations matches")
+        assertTrue(
+            labels.all { it.startsWith("fi", ignoreCase = true) },
+            "member prefix completion should narrow to prefix matches, got: ${labels.take(20)}"
+        )
+        assertTrue(
+            labels.any { it == "find" || it == "findById" || it == "findAll" },
+            "member prefix completion should include find* MongoOperations methods, got: ${labels.take(20)}"
+        )
+    }
+
+    @org.junit.jupiter.api.Disabled("Multiline chained expression type resolution not yet implemented — tracked in completion tickets")
+    @Test
+    fun `completion - Criteria prefix includes in operator`() {
+        val fixtureSourceDir = findFixtureDir() + "/src/main/kotlin"
+        bridge = CompilerBridge()
+        bridge.initialize(
+            projectRoot = fixtureSourceDir,
+            classpath = projectClasspath,
+            compilerFlags = projectCompilerFlags,
+            jdkHome = "",
+            sourceRoots = listOf(fixtureSourceDir),
+        )
+
+        val uri = "file://$fixtureSourceDir/MongoExample.kt"
+        val result = bridge.completion(uri, line = 20, character = 18)
+
+        val items = result.getAsJsonArray("items")
+        assertNotNull(items, "completion items array should be present")
+        val labels = items.map { it.asJsonObject.get("label")?.asString ?: "" }
+
+        assertTrue(
+            labels.any { it == "in" || it == "`in`" },
+            "Criteria prefix completion should include in operator, got: ${labels.take(20)} (reason=${result.get("reason")?.asString})"
+        )
     }
 
     @Test

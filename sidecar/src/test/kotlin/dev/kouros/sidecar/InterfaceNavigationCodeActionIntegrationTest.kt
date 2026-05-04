@@ -165,6 +165,184 @@ class InterfaceNavigationCodeActionIntegrationTest {
         assertTrue(actions.isEmpty(), "expected no interface navigation actions, got: $titles")
     }
 
+    @Test
+    fun `implementation resolves concrete interface member implementations`() {
+        val workspace = Files.createTempDirectory("interface-method-impls")
+        val sourceRoot = workspace.resolve("src/main/kotlin")
+        writeSource(
+            sourceRoot.resolve("com/example/Service.kt"),
+            """
+            package com.example
+
+            interface Service {
+                fun fetch(id: String): String
+            }
+            """.trimIndent() + "\n",
+        )
+        val primaryPath = sourceRoot.resolve("com/example/PrimaryService.kt")
+        writeSource(
+            primaryPath,
+            """
+            package com.example
+
+            class PrimaryService : Service {
+                override fun fetch(id: String): String = id
+            }
+            """.trimIndent() + "\n",
+        )
+        val fallbackPath = sourceRoot.resolve("com/example/FallbackService.kt")
+        writeSource(
+            fallbackPath,
+            """
+            package com.example
+
+            object FallbackService : Service {
+                override fun fetch(id: String): String = id.reversed()
+            }
+            """.trimIndent() + "\n",
+        )
+
+        val bridge = createBridge(workspace, sourceRoot)
+        val locations = bridge
+            .implementation(sourceRoot.resolve("com/example/Service.kt").toUri().toString(), line = 4, character = 8)
+            .getAsJsonArray("locations")
+
+        assertEquals(2, locations.size(), "expected two concrete method implementations")
+        assertEquals(
+            listOf(
+                fallbackPath.toUri().toString(),
+                primaryPath.toUri().toString(),
+            ),
+            locations.map { it.asJsonObject.get("uri").asString }.sorted(),
+        )
+        assertEquals(
+            listOf(4, 4),
+            locations.map { it.asJsonObject.get("line").asInt }.sorted(),
+        )
+    }
+
+    @Test
+    fun `definition resolves interface member declaration from class implementation`() {
+        val workspace = Files.createTempDirectory("interface-method-definition-class")
+        val sourceRoot = workspace.resolve("src/main/kotlin")
+        val servicePath = sourceRoot.resolve("com/example/Service.kt")
+        writeSource(
+            servicePath,
+            """
+            package com.example
+
+            interface Service {
+                fun fetch(id: String): String
+            }
+            """.trimIndent() + "\n",
+        )
+        val primaryPath = sourceRoot.resolve("com/example/PrimaryService.kt")
+        writeSource(
+            primaryPath,
+            """
+            package com.example
+
+            class PrimaryService : Service {
+                override fun fetch(id: String): String = id
+            }
+            """.trimIndent() + "\n",
+        )
+
+        val bridge = createBridge(workspace, sourceRoot)
+        val locations = bridge
+            .definition(primaryPath.toUri().toString(), line = 4, character = 17)
+            .getAsJsonArray("locations")
+
+        assertEquals(1, locations.size(), "expected a single interface declaration target")
+        val location = locations[0].asJsonObject
+        assertEquals(servicePath.toUri().toString(), location.get("uri").asString)
+        assertEquals(4, location.get("line").asInt)
+    }
+
+    @Test
+    fun `definition resolves interface member declaration from object implementation`() {
+        val workspace = Files.createTempDirectory("interface-method-definition-object")
+        val sourceRoot = workspace.resolve("src/main/kotlin")
+        val servicePath = sourceRoot.resolve("com/example/Service.kt")
+        writeSource(
+            servicePath,
+            """
+            package com.example
+
+            interface Service {
+                fun fetch(id: String): String
+            }
+            """.trimIndent() + "\n",
+        )
+        val fallbackPath = sourceRoot.resolve("com/example/FallbackService.kt")
+        writeSource(
+            fallbackPath,
+            """
+            package com.example
+
+            object FallbackService : Service {
+                override fun fetch(id: String): String = id.reversed()
+            }
+            """.trimIndent() + "\n",
+        )
+
+        val bridge = createBridge(workspace, sourceRoot)
+        val locations = bridge
+            .definition(fallbackPath.toUri().toString(), line = 4, character = 17)
+            .getAsJsonArray("locations")
+
+        assertEquals(1, locations.size(), "expected a single interface declaration target")
+        val location = locations[0].asJsonObject
+        assertEquals(servicePath.toUri().toString(), location.get("uri").asString)
+        assertEquals(4, location.get("line").asInt)
+    }
+
+    @Test
+    fun `implementation resolves concrete interface type implementations`() {
+        val workspace = Files.createTempDirectory("interface-type-impls")
+        val sourceRoot = workspace.resolve("src/main/kotlin")
+        writeSource(
+            sourceRoot.resolve("com/example/Service.kt"),
+            """
+            package com.example
+
+            interface Service
+            """.trimIndent() + "\n",
+        )
+        val primaryPath = sourceRoot.resolve("com/example/PrimaryService.kt")
+        writeSource(
+            primaryPath,
+            """
+            package com.example
+
+            class PrimaryService : Service
+            """.trimIndent() + "\n",
+        )
+        val fallbackPath = sourceRoot.resolve("com/example/FallbackService.kt")
+        writeSource(
+            fallbackPath,
+            """
+            package com.example
+
+            object FallbackService : Service
+            """.trimIndent() + "\n",
+        )
+
+        val bridge = createBridge(workspace, sourceRoot)
+        val locations = bridge
+            .implementation(sourceRoot.resolve("com/example/Service.kt").toUri().toString(), line = 3, character = 11)
+            .getAsJsonArray("locations")
+
+        assertEquals(2, locations.size(), "expected two concrete type implementations")
+        assertEquals(
+            listOf(
+                fallbackPath.toUri().toString(),
+                primaryPath.toUri().toString(),
+            ),
+            locations.map { it.asJsonObject.get("uri").asString }.sorted(),
+        )
+    }
+
     private fun createBridge(workspace: Path, sourceRoot: Path): CompilerBridge {
         return CompilerBridge().also { bridge ->
             bridges += bridge

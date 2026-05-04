@@ -59,6 +59,7 @@ class AnalysisServer(
             "hover" -> handleHover(request)
             "completion" -> handleCompletion(request)
             "definition" -> handleDefinition(request)
+            "implementation" -> handleImplementation(request)
             "references" -> handleReferences(request)
             "pebble/definition" -> handlePebbleDefinition(request)
             "pebble/references" -> handlePebbleReferences(request)
@@ -235,6 +236,25 @@ class AnalysisServer(
         val character = params.get("character")?.asInt ?: 0
 
         val result = bridge.definition(uri, line, character)
+        transport.sendResult(request.id, result)
+    }
+
+    private fun handleImplementation(request: JsonRpcRequest) {
+        val params = request.params ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("locations", com.google.gson.JsonArray()) })
+            return
+        }
+        val uri = params.get("uri")?.asString ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("locations", com.google.gson.JsonArray()) })
+            return
+        }
+        val line = params.get("line")?.asInt ?: run {
+            transport.sendResult(request.id, JsonObject().apply { add("locations", com.google.gson.JsonArray()) })
+            return
+        }
+        val character = params.get("character")?.asInt ?: 0
+
+        val result = bridge.implementation(uri, line, character)
         transport.sendResult(request.id, result)
     }
 

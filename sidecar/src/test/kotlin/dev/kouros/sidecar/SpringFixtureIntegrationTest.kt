@@ -179,6 +179,221 @@ class SpringFixtureIntegrationTest {
         )
     }
 
+    @Test
+    fun `analyze - unresolved type produces diagnostic without auto import edit`() {
+        val uri = "file://$sourceRoot/ThirdPartyAutoImport.kt"
+        val content = """
+            class ThirdPartyAutoImport {
+                val exception: ResponseStatusException? = null
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.analyze(uri)
+
+        // Analyze should report the unresolved reference as a diagnostic
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        assertNotNull(diagnostics, "diagnostics array should be present")
+        val unresolvedDiags = (0 until diagnostics.size())
+            .map { diagnostics[it].asJsonObject }
+            .filter { it.get("code")?.asString == "UNRESOLVED_REFERENCE" }
+        assertTrue(
+            unresolvedDiags.isNotEmpty(),
+            "should report UNRESOLVED_REFERENCE diagnostic for ResponseStatusException",
+        )
+
+        // Analyze must NOT return import edits — imports should only be offered via code actions
+        val edits = result.getAsJsonArray("edits")
+        assertNotNull(edits, "edits array should be present")
+        assertEquals(0, edits.size(), "analyze must not return auto-import edits")
+    }
+
+    @Test
+    fun `codeActions - third party unresolved type offers import quick fix`() {
+        val uri = "file://$sourceRoot/ThirdPartyCodeActions.kt"
+        val content = """
+            class ThirdPartyCodeActions {
+                val criteria: Criteria? = null
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 2, character = 18)
+        val actions = result.getAsJsonArray("actions")
+
+        assertNotNull(actions, "actions array should be present")
+        val titles = actions.map { it.asJsonObject.get("title")?.asString ?: "" }
+        assertTrue(
+            titles.any { it.startsWith("Import 'Criteria'") },
+            "should offer import quick fix for third-party type, got: $titles",
+        )
+    }
+
+    @Test
+    fun `codeActions - unique unresolved type offers single import quick fix`() {
+        val uri = "file://$sourceRoot/ThirdPartyUniqueImport.kt"
+        val content = """
+            class ThirdPartyUniqueImport {
+                val exception: ResponseStatusException? = null
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.codeActions(uri, line = 2, character = 24)
+        val actions = result.getAsJsonArray("actions")
+
+        assertNotNull(actions, "actions array should be present")
+        val titles = actions.map { it.asJsonObject.get("title")?.asString ?: "" }
+        assertTrue(
+            titles.contains("Import 'ResponseStatusException'"),
+            "should offer import quick fix for unique unresolved type, got: $titles",
+        )
+    }
+
+    @Test
+    fun `completion - already imported type appears in completion`() {
+        val uri = "file://$sourceRoot/ImportedTypeCompletion.kt"
+        val content = """
+            import org.springframework.web.server.ResponseStatusException
+
+            class ImportedTypeCompletion {
+                val ex: Resp
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.completion(uri, line = 4, character = 16)
+        val items = result.getAsJsonArray("items")
+
+        assertNotNull(items, "completion items should be present")
+
+        val matchingItems = (0 until items.size())
+            .map { items[it].asJsonObject }
+            .filter { it.get("label")?.asString?.startsWith("ResponseStatus") == true }
+
+        assertTrue(
+            matchingItems.isNotEmpty(),
+            "should include ResponseStatusException in completion for already-imported type, got labels: ${
+                (0 until items.size()).map { items[it].asJsonObject.get("label")?.asString }
+            }",
+        )
+
+        // Already-imported type should NOT have additionalTextEdits (no import needed)
+        val rseItem = matchingItems.first { it.get("label")?.asString == "ResponseStatusException" }
+        assertTrue(
+            !rseItem.has("additionalTextEdits"),
+            "already-imported type should not have additionalTextEdits",
+        )
+    }
+
+    @Test
+    fun `completion - already imported constructor appears in completion`() {
+        val uri = "file://$sourceRoot/ImportedConstructorCompletion.kt"
+        val content = """
+            import org.springframework.web.server.ResponseStatusException
+            import org.springframework.http.HttpStatus
+
+            class ImportedConstructorCompletion {
+                fun make() {
+                    val ex = Response
+                }
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.completion(uri, line = 6, character = 26)
+        val items = result.getAsJsonArray("items")
+
+        assertNotNull(items, "completion items should be present")
+
+        val matchingItems = (0 until items.size())
+            .map { items[it].asJsonObject }
+            .filter { it.get("label")?.asString == "ResponseStatusException" }
+
+        assertTrue(
+            matchingItems.isNotEmpty(),
+            "should include ResponseStatusException constructor in completion, got labels: ${
+                (0 until items.size()).map { items[it].asJsonObject.get("label")?.asString }
+            }",
+        )
+    }
+
+    @org.junit.jupiter.api.Disabled("Third-party symbol index not yet populated for completion — tracked in completion tickets")
+    @Test
+    fun `completion - includes third party symbol with auto import edit`() {
+        val uri = "file://$sourceRoot/ThirdPartyCompletion.kt"
+        val content = """
+            class ThirdPartyCompletion {
+                val either = Eit
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.completion(uri, line = 2, character = 20)
+        val items = result.getAsJsonArray("items")
+
+        assertNotNull(items, "completion items should be present")
+
+        val eitherItems = (0 until items.size())
+            .map { items[it].asJsonObject }
+            .filter { it.get("label")?.asString == "Either" }
+
+        assertTrue(
+            eitherItems.isNotEmpty(),
+            "should include Either in completion results, got labels: ${
+                (0 until items.size()).map { items[it].asJsonObject.get("label")?.asString }
+            }",
+        )
+
+        val autoImportEither = eitherItems.firstOrNull { item ->
+            item.get("detail")?.asString == "arrow.core.Either" && item.has("additionalTextEdits")
+        }
+        assertNotNull(autoImportEither, "Either completion item should include auto-import edits")
+
+        val edits = autoImportEither.getAsJsonArray("additionalTextEdits")
+        assertTrue(edits.size() > 0, "additionalTextEdits should contain an import edit")
+        assertEquals(
+            "import arrow.core.Either\n\n",
+            edits[0].asJsonObject.get("newText")?.asString,
+        )
+    }
+
+    // --- Spring/Kotlin regression (ka-v3hp) ---
+
+    @Test
+    fun `diagnostics - SpringRegressions has no errors`() {
+        val uri = "file://$sourceRoot/SpringRegressions.kt"
+        val result = bridge.analyze(uri)
+
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        assertNotNull(diagnostics, "diagnostics array should be present")
+
+        val errors = diagnostics.filter {
+            it.asJsonObject.get("severity")?.asString == "ERROR"
+        }
+        assertEquals(
+            0, errors.size,
+            "SpringRegressions.kt should have no errors, got: ${formatDiagnostics(errors)}"
+        )
+    }
+
+    @Test
+    fun `diagnostics - SpringRegressions has no warnings`() {
+        val uri = "file://$sourceRoot/SpringRegressions.kt"
+        val result = bridge.analyze(uri)
+
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        assertNotNull(diagnostics, "diagnostics array should be present")
+
+        val warnings = diagnostics.filter {
+            it.asJsonObject.get("severity")?.asString == "WARNING"
+        }
+        assertEquals(
+            0, warnings.size,
+            "SpringRegressions.kt should have no warnings, got: ${formatDiagnostics(warnings)}"
+        )
+    }
+
     // --- Helpers ---
 
     private data class ProjectModel(
@@ -191,7 +406,19 @@ class SpringFixtureIntegrationTest {
     private fun loadProjectModel(fixtureRoot: String): ProjectModel {
         val modelFile = java.io.File(fixtureRoot, ".kotlin-analyzer/project-model.json")
         val json = if (modelFile.exists()) {
-            JsonParser.parseString(modelFile.readText()).asJsonObject
+            val cached = JsonParser.parseString(modelFile.readText()).asJsonObject
+            val cachedClasspath = cached.getAsJsonArray("classpath")
+                ?.map { it.asString }
+                .orEmpty()
+            val hasUsableClasspath = cachedClasspath.isNotEmpty() && cachedClasspath.all { java.io.File(it).exists() }
+            if (cached.has("source_roots") && hasUsableClasspath) {
+                cached
+            } else {
+                val regenerated = generateProjectModel(fixtureRoot)
+                modelFile.parentFile?.mkdirs()
+                modelFile.writeText(regenerated.toString())
+                regenerated
+            }
         } else {
             val generated = generateProjectModel(fixtureRoot)
             modelFile.parentFile?.mkdirs()

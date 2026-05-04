@@ -4,7 +4,7 @@ import org.gradle.api.tasks.compile.JavaCompile
 import org.gradle.jvm.tasks.Jar
 
 plugins {
-    kotlin("jvm") version "2.2.0-RC2"
+    kotlin("jvm") version "2.3.20"
     id("com.github.johnrengelman.shadow") version "8.1.1"
     application
 }
@@ -19,11 +19,8 @@ repositories {
     maven("https://cache-redirector.jetbrains.com/intellij-dependencies")
 }
 
-val kotlinVersion = "2.2.0-RC2"
-val supportedRuntimeKotlinVersions = listOf(
-    kotlinVersion,
-    "2.2.21",
-)
+val kotlinVersion = "2.3.20"
+val supportedRuntimeKotlinVersions = listOf(kotlinVersion)
 val analysisApiArtifacts = listOf(
     "analysis-api-for-ide",
     "analysis-api-standalone-for-ide",
