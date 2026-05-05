@@ -949,7 +949,7 @@ class BridgeContext {
     internal fun findSpringModelProducerDeclaration(element: PsiElement): PsiElement? {
         val call = PsiTreeUtil.getParentOfType(element, KtCallExpression::class.java, false) ?: return null
         val calleeName = call.calleeExpression?.text ?: return null
-        if (calleeName != "addAttribute" && calleeName != "addObject") return null
+        if (!pebbleSpringIndex.isSupportedModelAttributeCall(calleeName)) return null
 
         val args = call.valueArguments
         if (args.size < 2) return null

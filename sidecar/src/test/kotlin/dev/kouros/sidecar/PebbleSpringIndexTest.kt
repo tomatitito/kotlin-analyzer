@@ -14,6 +14,8 @@ class PebbleSpringIndexTest {
     private lateinit var detailTemplateUri: String
     private lateinit var summaryTemplateUri: String
     private lateinit var carouselTemplateUri: String
+    private lateinit var renderingCarouselTemplateUri: String
+    private lateinit var dynamicRenderingModelTemplateUri: String
     private lateinit var includeParentTemplateUri: String
     private lateinit var includeChildTemplateUri: String
     private lateinit var includeUnsupportedParentTemplateUri: String
@@ -35,6 +37,8 @@ class PebbleSpringIndexTest {
         detailTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/users/detail.peb").absolutePath}"
         summaryTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/users/summary.peb").absolutePath}"
         carouselTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/outfits/carousel.peb").absolutePath}"
+        renderingCarouselTemplateUri = "file://${fixtureRoot.resolve("src/frontend/templates/outfits/rendering-carousel.peb").absolutePath}"
+        dynamicRenderingModelTemplateUri = "file://${fixtureRoot.resolve("src/frontend/templates/outfits/dynamic-rendering-model.peb").absolutePath}"
         includeParentTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/users/include-parent.peb").absolutePath}"
         includeChildTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/users/include-child.peb").absolutePath}"
         includeUnsupportedParentTemplateUri = "file://${fixtureRoot.resolve("src/main/resources/templates/users/include-unsupported-parent.peb").absolutePath}"
@@ -43,6 +47,8 @@ class PebbleSpringIndexTest {
         bridge.updatePebbleFile(detailTemplateUri, fixtureRoot.resolve("src/main/resources/templates/users/detail.peb").readText())
         bridge.updatePebbleFile(summaryTemplateUri, fixtureRoot.resolve("src/main/resources/templates/users/summary.peb").readText())
         bridge.updatePebbleFile(carouselTemplateUri, fixtureRoot.resolve("src/main/resources/templates/outfits/carousel.peb").readText())
+        bridge.updatePebbleFile(renderingCarouselTemplateUri, fixtureRoot.resolve("src/frontend/templates/outfits/rendering-carousel.peb").readText())
+        bridge.updatePebbleFile(dynamicRenderingModelTemplateUri, fixtureRoot.resolve("src/frontend/templates/outfits/dynamic-rendering-model.peb").readText())
         bridge.updatePebbleFile(includeParentTemplateUri, fixtureRoot.resolve("src/main/resources/templates/users/include-parent.peb").readText())
         bridge.updatePebbleFile(includeChildTemplateUri, fixtureRoot.resolve("src/main/resources/templates/users/include-child.peb").readText())
         bridge.updatePebbleFile(
@@ -76,6 +82,24 @@ class PebbleSpringIndexTest {
 
         assertEquals(1, locations.size())
         assertEquals(summaryTemplateUri, locations[0].asJsonObject.get("uri").asString)
+    }
+
+    @Test
+    fun `definition maps Rendering view names to frontend pebble templates`() {
+        val result = bridge.definition(kotlinUri, line = 66, character = 24)
+        val locations = result.getAsJsonArray("locations")
+
+        assertEquals(1, locations.size())
+        assertEquals(renderingCarouselTemplateUri, locations[0].asJsonObject.get("uri").asString)
+    }
+
+    @Test
+    fun `definition maps Rendering qualifier to frontend pebble templates`() {
+        val result = bridge.definition(kotlinUri, line = 65, character = 16)
+        val locations = result.getAsJsonArray("locations")
+
+        assertEquals(1, locations.size())
+        assertEquals(renderingCarouselTemplateUri, locations[0].asJsonObject.get("uri").asString)
     }
 
     @Test
@@ -141,6 +165,15 @@ class PebbleSpringIndexTest {
     fun `unsupported dynamic spring view names fail conservatively`() {
         val result = bridge.definition(kotlinUri, line = 35, character = 17)
         assertTrue(result.getAsJsonArray("locations").isEmpty)
+    }
+
+    @Test
+    fun `unsupported Rendering view patterns fail conservatively`() {
+        val dynamicResult = bridge.definition(kotlinUri, line = 75, character = 22)
+        assertTrue(dynamicResult.getAsJsonArray("locations").isEmpty)
+
+        val statusResult = bridge.definition(kotlinUri, line = 78, character = 25)
+        assertTrue(statusResult.getAsJsonArray("locations").isEmpty)
     }
 
     @Test
@@ -284,6 +317,65 @@ class PebbleSpringIndexTest {
                 location.get("line").asInt == 3 &&
                 location.get("column").asInt == 3
         })
+    }
+
+    @Test
+    fun `Rendering modelAttribute chains resolve pebble variables to kotlin producers`() {
+        val outfitsDefinition = bridge.pebbleDefinition(renderingCarouselTemplateUri, line = 1, character = 4)
+        val outfitsLocations = outfitsDefinition.getAsJsonArray("locations")
+        assertEquals(1, outfitsLocations.size())
+        assertEquals(kotlinUri, outfitsLocations[0].asJsonObject.get("uri").asString)
+        assertEquals(67, outfitsLocations[0].asJsonObject.get("line").asInt)
+
+        val farbartikelPropertyDefinition = bridge.pebbleDefinition(renderingCarouselTemplateUri, line = 2, character = 18)
+        val farbartikelPropertyLocations = farbartikelPropertyDefinition.getAsJsonArray("locations")
+        assertEquals(1, farbartikelPropertyLocations.size())
+        assertEquals(kotlinUri, farbartikelPropertyLocations[0].asJsonObject.get("uri").asString)
+        assertEquals(14, farbartikelPropertyLocations[0].asJsonObject.get("line").asInt)
+
+        val optionalDefinition = bridge.pebbleDefinition(renderingCarouselTemplateUri, line = 4, character = 4)
+        val optionalLocations = optionalDefinition.getAsJsonArray("locations")
+        assertEquals(1, optionalLocations.size())
+        assertEquals(kotlinUri, optionalLocations[0].asJsonObject.get("uri").asString)
+        assertEquals(70, optionalLocations[0].asJsonObject.get("line").asInt)
+    }
+
+    @Test
+    fun `Rendering modelAttribute chains contribute pebble references`() {
+        val outfitsProducerReferences = bridge.references(kotlinUri, line = 67, character = 15)
+        val outfitsProducerLocations = outfitsProducerReferences.getAsJsonArray("locations")
+        assertTrue((0 until outfitsProducerLocations.size()).any { index ->
+            val location = outfitsProducerLocations[index].asJsonObject
+            location.get("uri").asString == renderingCarouselTemplateUri &&
+                location.get("line").asInt == 1 &&
+                location.get("column").asInt == 3
+        })
+
+        val cssPathProducerReferences = bridge.references(kotlinUri, line = 70, character = 20)
+        val cssPathProducerLocations = cssPathProducerReferences.getAsJsonArray("locations")
+        assertTrue((0 until cssPathProducerLocations.size()).any { index ->
+            val location = cssPathProducerLocations[index].asJsonObject
+            location.get("uri").asString == renderingCarouselTemplateUri &&
+                location.get("line").asInt == 4 &&
+                location.get("column").asInt == 3
+        })
+    }
+
+    @Test
+    fun `definition from Rendering modelAttribute name navigates to pebble usage`() {
+        val result = bridge.definition(kotlinUri, line = 68, character = 30)
+        val locations = result.getAsJsonArray("locations")
+
+        assertEquals(1, locations.size(), "expected 1 pebble usage location, got: $locations")
+        val location = locations[0].asJsonObject
+        assertEquals(renderingCarouselTemplateUri, location.get("uri").asString)
+        assertEquals(2, location.get("line").asInt)
+    }
+
+    @Test
+    fun `unsupported dynamic Rendering model names fail conservatively`() {
+        val result = bridge.pebbleDefinition(dynamicRenderingModelTemplateUri, line = 1, character = 4)
+        assertTrue(result.getAsJsonArray("locations").isEmpty)
     }
 
     private fun findFixtureRoot(): File {

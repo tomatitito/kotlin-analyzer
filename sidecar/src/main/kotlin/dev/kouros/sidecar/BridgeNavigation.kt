@@ -23,18 +23,15 @@ internal fun BridgeContext.definition(uri: String, line: Int, character: Int): J
     val locationsArray = JsonArray()
     val perfStart = System.currentTimeMillis()
 
-    val springTemplateUri = pebbleSpringIndex.definitionForKotlinView(uri, line, character)
-    if (springTemplateUri != null) {
-        val location = JsonObject()
-        location.addProperty("uri", springTemplateUri)
-        location.addProperty("line", 1)
-        location.addProperty("column", 0)
-        locationsArray.add(location)
-        result.add("locations", locationsArray)
-        return result
-    }
-
     val currentSession = session ?: run {
+        val springTemplateUri = pebbleSpringIndex.definitionForKotlinView(uri, line, character)
+        if (springTemplateUri != null) {
+            val location = JsonObject()
+            location.addProperty("uri", springTemplateUri)
+            location.addProperty("line", 1)
+            location.addProperty("column", 0)
+            locationsArray.add(location)
+        }
         result.add("locations", locationsArray)
         return result
     }
@@ -62,6 +59,16 @@ internal fun BridgeContext.definition(uri: String, line: Int, character: Int): J
                         location.addProperty("column", usage.column)
                         locationsArray.add(location)
                     }
+                    return@analyze
+                }
+
+                val springTemplateUri = pebbleSpringIndex.definitionForKotlinView(uri, line, character)
+                if (springTemplateUri != null) {
+                    val location = JsonObject()
+                    location.addProperty("uri", springTemplateUri)
+                    location.addProperty("line", 1)
+                    location.addProperty("column", 0)
+                    locationsArray.add(location)
                     return@analyze
                 }
 

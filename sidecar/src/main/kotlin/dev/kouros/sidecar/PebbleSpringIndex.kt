@@ -6,7 +6,7 @@ import org.jetbrains.kotlin.psi.KtBlockExpression
 import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtClassBody
 import org.jetbrains.kotlin.psi.KtClassOrObject
-import org.jetbrains.kotlin.psi.KtDeclarationWithBody
+import org.jetbrains.kotlin.psi.KtDotQualifiedExpression
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtNameReferenceExpression
@@ -101,7 +101,7 @@ internal class PebbleSpringIndex(
 
     fun pebbleUsagesForDeclaration(declaration: PsiElement, declarationUri: String): List<PebbleUsageLocation> {
         val declarationLocation = declaration.toSourceLocation(declarationUri)
-        val declarationName = (declaration as? KtNamedDeclaration)?.name ?: return emptyList()
+        val declarationName = (declaration as? KtNamedDeclaration)?.name
         val usages = linkedSetOf<PebbleUsageLocation>()
         val declarationClassName = when (declaration) {
             is KtClassOrObject -> declaration.name
@@ -119,7 +119,7 @@ internal class PebbleSpringIndex(
                     usages.add(PebbleUsageLocation(templateUri, ref.range.startLine, ref.range.startColumn))
                 }
 
-                if (declarationClassName != null && normalizedTypeName(resolvedRoot.producerType) == declarationClassName) {
+                if (declarationClassName != null && declarationName != null && normalizedTypeName(resolvedRoot.producerType) == declarationClassName) {
                     when (declaration) {
                         is KtClassOrObject -> usages.add(PebbleUsageLocation(templateUri, ref.range.startLine, ref.range.startColumn))
                         is KtParameter -> if (declaration.hasValOrVar()) {
@@ -154,12 +154,12 @@ internal class PebbleSpringIndex(
             viewFactsByUri.getOrPut(uri) { mutableListOf() }.add(fact)
         }
 
-        val templateUri = viewFacts.map { it.templateUri }.distinct().singleOrNull() ?: return
+        val singleFunctionTemplateUri = viewFacts.map { it.templateUri }.distinct().singleOrNull()
         val callExpressions = PsiTreeUtil.collectElementsOfType(function, KtCallExpression::class.java)
         for (call in callExpressions) {
-            val calleeName = call.calleeExpression?.text ?: continue
-            if (calleeName != "addAttribute" && calleeName != "addObject") continue
+            if (!isSupportedModelAttributeCall(call.calleeExpression?.text)) continue
 
+            val templateUri = templateUriForModelAttributeCall(uri, call) ?: singleFunctionTemplateUri ?: continue
             val args = call.valueArguments
             if (args.size < 2) continue
             val variableName = staticStringValue(args[0].getArgumentExpression()) ?: continue
@@ -207,21 +207,52 @@ internal class PebbleSpringIndex(
     private fun viewFactFromExpression(uri: String, ktFile: KtFile, expression: KtExpression?): SpringViewFact? {
         val targetTemplate = when (expression) {
             is KtStringTemplateExpression -> staticStringValue(expression)
-            is KtCallExpression -> {
-                val calleeText = expression.calleeExpression?.text ?: return null
-                if (calleeText != "ModelAndView" && !calleeText.endsWith(".ModelAndView")) return null
-                staticStringValue(expression.valueArguments.firstOrNull()?.getArgumentExpression())
-            }
+            is KtCallExpression -> staticViewTemplateName(expression)
+            is KtDotQualifiedExpression -> staticViewTemplateName(expression)
             else -> null
         } ?: return null
 
         val templateUri = templateIndex.resolveTemplateName(uri, targetTemplate) ?: return null
-        val range = expression?.toRange(ktFile) ?: return null
+        val rangeElement = renderingViewNavigationElement(expression) ?: expression
+        val range = rangeElement?.toRange(ktFile) ?: return null
         return SpringViewFact(
             sourceUri = uri,
             range = range,
             templateUri = templateUri,
         )
+    }
+
+    private fun templateUriForModelAttributeCall(uri: String, call: KtCallExpression): String? {
+        val targetTemplate = staticViewTemplateName(qualifiedReceiverExpression(call)) ?: return null
+        return templateIndex.resolveTemplateName(uri, targetTemplate)
+    }
+
+    private fun staticViewTemplateName(expression: KtExpression?): String? {
+        return when (expression) {
+            is KtStringTemplateExpression -> staticStringValue(expression)
+            is KtCallExpression -> {
+                val calleeText = expression.calleeExpression?.text ?: return null
+                if (calleeText == "ModelAndView" || calleeText.endsWith(".ModelAndView")) {
+                    return staticStringValue(expression.valueArguments.firstOrNull()?.getArgumentExpression())
+                }
+                if (calleeText == "view" || calleeText.endsWith(".view")) {
+                    return staticStringValue(expression.valueArguments.firstOrNull()?.getArgumentExpression())
+                }
+                staticViewTemplateName(qualifiedReceiverExpression(expression))
+            }
+            is KtDotQualifiedExpression -> staticViewTemplateName(expression.selectorExpression as? KtCallExpression)
+                ?: staticViewTemplateName(expression.receiverExpression)
+            else -> null
+        }
+    }
+
+    private fun renderingViewNavigationElement(expression: KtExpression?): KtExpression? {
+        val call = expression as? KtCallExpression ?: return expression
+        val calleeText = call.calleeExpression?.text ?: return expression
+        if (calleeText != "view" && !calleeText.endsWith(".view")) return expression
+        return (call.parent as? KtDotQualifiedExpression)
+            ?.takeIf { it.selectorExpression == call }
+            ?: expression
     }
 
     private fun staticStringValue(expression: KtExpression?): String? {
@@ -449,6 +480,16 @@ internal class PebbleSpringIndex(
         if (text.isEmpty()) return null
         val lineIndex = PebbleLineIndex(text)
         return lineIndex.range(textRange.startOffset, textRange.endOffset)
+    }
+
+    private fun qualifiedReceiverExpression(expression: KtExpression): KtExpression? =
+        (expression.parent as? KtDotQualifiedExpression)
+            ?.takeIf { it.selectorExpression == expression }
+            ?.receiverExpression
+
+    internal fun isSupportedModelAttributeCall(calleeName: String?): Boolean = when (calleeName) {
+        "addAttribute", "addObject", "modelAttribute", "optionalModelAttribute" -> true
+        else -> false
     }
 
     private companion object {

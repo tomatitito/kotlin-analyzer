@@ -1,0 +1,4 @@
+{{ outfits }}
+{{ farbartikel.brand }}
+{{ isPureLuxury }}
+{{ cssPath }}
