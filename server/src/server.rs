@@ -417,6 +417,33 @@ fn temporary_target_path(target_path: &Path) -> PathBuf {
     ))
 }
 
+fn package_for_file(file_path: &Path, source_roots: &[PathBuf]) -> Option<String> {
+    if file_path.extension().and_then(|e| e.to_str()) != Some("kt") {
+        return None;
+    }
+
+    // Find the longest matching source root (most specific wins)
+    let best_root = source_roots
+        .iter()
+        .filter(|root| file_path.starts_with(root))
+        .max_by_key(|root| root.components().count())?;
+
+    let relative = file_path.strip_prefix(best_root).ok()?;
+    let parent = relative.parent()?;
+
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+
+    let package = parent
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(".");
+
+    Some(package)
+}
+
 /// The main language server implementation.
 pub struct KotlinLanguageServer {
     client: Client,
@@ -424,6 +451,7 @@ pub struct KotlinLanguageServer {
     bridge: Arc<Mutex<Option<Arc<Bridge>>>>,
     config: Arc<Mutex<Config>>,
     project_root: Arc<Mutex<Option<PathBuf>>>,
+    source_roots: Arc<Mutex<Vec<PathBuf>>>,
     debounce_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Url>>>>,
     is_zed_client: Arc<Mutex<bool>>,
 }
@@ -436,6 +464,7 @@ impl KotlinLanguageServer {
             bridge: Arc::new(Mutex::new(None)),
             config: Arc::new(Mutex::new(Config::default())),
             project_root: Arc::new(Mutex::new(None)),
+            source_roots: Arc::new(Mutex::new(Vec::new())),
             debounce_tx: Arc::new(Mutex::new(None)),
             is_zed_client: Arc::new(Mutex::new(false)),
         }
@@ -1095,6 +1124,7 @@ impl LanguageServer for KotlinLanguageServer {
         let client = self.client.clone();
         let bridge_holder = Arc::clone(&self.bridge);
         let documents_holder = Arc::clone(&self.documents);
+        let source_roots_holder = Arc::clone(&self.source_roots);
         let config = self.config.lock().await.clone();
         let project_root = self.project_root.lock().await.clone();
 
@@ -1321,6 +1351,14 @@ impl LanguageServer for KotlinLanguageServer {
                 }
                 None => (Vec::new(), Vec::new(), Vec::new()),
             };
+
+            {
+                let roots: Vec<PathBuf> = match &project_model {
+                    Some(model) => model.source_roots.clone(),
+                    None => Vec::new(),
+                };
+                *source_roots_holder.lock().await = roots;
+            }
 
             // Note: when no source roots are found (no build system), the sidecar
             // falls back to creating ad-hoc KtFile objects from opened files via
@@ -1731,6 +1769,39 @@ impl LanguageServer for KotlinLanguageServer {
                 }
             }
             documents.open(uri.clone(), text.clone(), version, kind);
+        }
+
+        // Auto-insert package declaration for newly created empty Kotlin files
+        if kind == DocumentKind::Kotlin && text.trim().is_empty() {
+            if let Ok(file_path) = uri.to_file_path() {
+                let source_roots = self.source_roots.lock().await;
+                if let Some(package) = package_for_file(&file_path, &source_roots) {
+                    let new_text = format!("package {package}\n\n");
+                    let apply_params = ApplyWorkspaceEditParams {
+                        label: Some("Insert package declaration".to_string()),
+                        edit: WorkspaceEdit {
+                            changes: None,
+                            document_changes: Some(DocumentChanges::Edits(vec![
+                                TextDocumentEdit {
+                                    text_document: OptionalVersionedTextDocumentIdentifier {
+                                        uri: uri.clone(),
+                                        version: Some(version),
+                                    },
+                                    edits: vec![OneOf::Left(TextEdit {
+                                        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                                        new_text: new_text,
+                                    })],
+                                },
+                            ])),
+                            change_annotations: None,
+                        },
+                    };
+                    let _ = self
+                        .client
+                        .send_request::<CompatibleApplyEdit>(apply_params)
+                        .await;
+                }
+            }
         }
 
         // Notify sidecar
@@ -3637,5 +3708,78 @@ mod tests {
         );
 
         assert_eq!(target, "/tmp/Example.kt:3:6");
+    }
+
+    #[test]
+    fn package_for_nested_kotlin_file() {
+        let roots = vec![PathBuf::from("/project/src/main/kotlin")];
+        let result = package_for_file(
+            Path::new("/project/src/main/kotlin/com/example/Foo.kt"),
+            &roots,
+        );
+        assert_eq!(result, Some("com.example".to_string()));
+    }
+
+    #[test]
+    fn package_for_deeply_nested_file() {
+        let roots = vec![PathBuf::from("/project/src/main/kotlin")];
+        let result = package_for_file(
+            Path::new("/project/src/main/kotlin/com/example/service/impl/UserService.kt"),
+            &roots,
+        );
+        assert_eq!(result, Some("com.example.service.impl".to_string()));
+    }
+
+    #[test]
+    fn package_for_file_at_source_root() {
+        let roots = vec![PathBuf::from("/project/src/main/kotlin")];
+        let result = package_for_file(
+            Path::new("/project/src/main/kotlin/Main.kt"),
+            &roots,
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn package_for_non_kotlin_file() {
+        let roots = vec![PathBuf::from("/project/src/main/kotlin")];
+        let result = package_for_file(
+            Path::new("/project/src/main/kotlin/com/example/readme.md"),
+            &roots,
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn package_for_file_outside_source_roots() {
+        let roots = vec![PathBuf::from("/project/src/main/kotlin")];
+        let result = package_for_file(
+            Path::new("/other/com/example/Foo.kt"),
+            &roots,
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn package_for_file_picks_most_specific_source_root() {
+        let roots = vec![
+            PathBuf::from("/project/src"),
+            PathBuf::from("/project/src/main/kotlin"),
+        ];
+        let result = package_for_file(
+            Path::new("/project/src/main/kotlin/com/example/Foo.kt"),
+            &roots,
+        );
+        assert_eq!(result, Some("com.example".to_string()));
+    }
+
+    #[test]
+    fn package_for_file_with_empty_source_roots() {
+        let roots: Vec<PathBuf> = vec![];
+        let result = package_for_file(
+            Path::new("/project/src/main/kotlin/com/example/Foo.kt"),
+            &roots,
+        );
+        assert_eq!(result, None);
     }
 }
