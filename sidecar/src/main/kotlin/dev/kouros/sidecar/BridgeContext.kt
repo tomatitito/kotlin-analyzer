@@ -337,7 +337,7 @@ class BridgeContext {
         val kotlinFiles = linkedMapOf<String, KtFile>()
         for ((_, files) in currentSession.modulesWithFiles) {
             for (ktFile in files.filterIsInstance<KtFile>()) {
-                kotlinFiles["file://${ktFile.virtualFile.path}"] = ktFile
+                kotlinFiles[buildFileUri(ktFile.virtualFile.path)] = ktFile
             }
         }
         for ((uri, text) in virtualFiles) {
@@ -363,11 +363,9 @@ class BridgeContext {
     }
 
     internal fun buildFileUri(vfPath: String): String {
-        return if (vfPath.contains("!/")) {
-            "file://$vfPath"
-        } else {
-            "file://$vfPath"
-        }
+        val originalPath = shadowPathMapping[vfPath] ?: vfPath
+        return virtualFiles.keys.firstOrNull { uriToPath(it) == originalPath }
+            ?: "file://$originalPath"
     }
 
     // --- Virtual file accessors ---
@@ -511,8 +509,7 @@ class BridgeContext {
 
     internal fun fileUriForKtFile(ktFile: KtFile): String? {
         val path = ktFile.virtualFile?.path ?: return null
-        val originalPath = shadowPathMapping[path] ?: path
-        return virtualFiles.keys.firstOrNull { uriToPath(it) == originalPath } ?: buildFileUri(originalPath)
+        return buildFileUri(path)
     }
 
     // --- Offset / position conversion ---

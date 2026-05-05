@@ -54,7 +54,7 @@ internal fun BridgeContext.references(uri: String, line: Int, character: Int): J
                 val declLineStart = declDocument.getLineStartOffset(declDocument.getLineNumber(resolvedDeclaration.textOffset))
                 val declCol = resolvedDeclaration.textOffset - declLineStart
                 val declLoc = JsonObject()
-                declLoc.addProperty("uri", "file://${containingFile.virtualFile.path}")
+                declLoc.addProperty("uri", fileUriForKtFile(containingFile))
                 declLoc.addProperty("line", declLine)
                 declLoc.addProperty("column", declCol)
                 locationsArray.add(declLoc)
@@ -94,7 +94,7 @@ internal fun BridgeContext.references(uri: String, line: Int, character: Int): J
                                     val refCol = refOffset - refLineStart
 
                                     val loc = JsonObject()
-                                    loc.addProperty("uri", "file://${sessionFile.virtualFile.path}")
+                                    loc.addProperty("uri", fileUriForKtFile(sessionFile))
                                     loc.addProperty("line", refLine)
                                     loc.addProperty("column", refCol)
 
@@ -119,7 +119,7 @@ internal fun BridgeContext.references(uri: String, line: Int, character: Int): J
 
         targetDeclaration?.let { declaration ->
             val declarationKtFile = declaration.containingFile as? KtFile
-            val declarationUri = declarationKtFile?.virtualFile?.path?.let { "file://$it" } ?: uri
+            val declarationUri = declarationKtFile?.let { fileUriForKtFile(it) } ?: uri
             for (usage in pebbleSpringIndex.pebbleUsagesForDeclaration(declaration, declarationUri)) {
                 val isDup = (0 until locationsArray.size()).any { i ->
                     val existing = locationsArray[i].asJsonObject

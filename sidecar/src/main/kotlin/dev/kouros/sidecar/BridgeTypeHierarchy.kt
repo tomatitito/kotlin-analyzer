@@ -39,7 +39,7 @@ internal fun BridgeContext.typeHierarchyPrepare(uri: String, line: Int, characte
             if (classOrObject != null) {
                 val document = ktFile.viewProvider.document
                 if (document != null) {
-                    val item = buildTypeHierarchyItem(classOrObject, ktFile, document)
+                    val item = buildTypeHierarchyItem(this, classOrObject, ktFile, document)
                     if (item != null) {
                         itemsArray.add(item)
                     }
@@ -126,7 +126,7 @@ internal fun BridgeContext.typeHierarchySupertypes(uri: String, line: Int, chara
                             val superLineStart = superDoc.getLineStartOffset(superDoc.getLineNumber(superOffset))
                             val superCol = superOffset - superLineStart
 
-                            superObj.addProperty("uri", "file://${superFile.virtualFile.path}")
+                            superObj.addProperty("uri", (superFile as? KtFile)?.let { fileUriForKtFile(it) } ?: buildFileUri(superFile.virtualFile.path))
                             superObj.addProperty("line", superLine)
                             superObj.addProperty("column", superCol)
                         } else {
@@ -153,6 +153,7 @@ internal fun BridgeContext.typeHierarchySupertypes(uri: String, line: Int, chara
 }
 
 private fun buildTypeHierarchyItem(
+    ctx: BridgeContext,
     classOrObject: KtClassOrObject,
     ktFile: KtFile,
     document: com.intellij.openapi.editor.Document,
@@ -175,7 +176,7 @@ private fun buildTypeHierarchyItem(
     val item = JsonObject()
     item.addProperty("name", name)
     item.addProperty("kind", kind)
-    item.addProperty("uri", "file://${ktFile.virtualFile.path}")
+    item.addProperty("uri", ctx.fileUriForKtFile(ktFile))
     item.addProperty("line", declLine)
     item.addProperty("column", declCol)
     return item

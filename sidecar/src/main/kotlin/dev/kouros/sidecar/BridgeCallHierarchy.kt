@@ -33,7 +33,7 @@ internal fun BridgeContext.callHierarchyPrepare(uri: String, line: Int, characte
             if (function != null) {
                 val document = ktFile.viewProvider.document
                 if (document != null) {
-                    val item = buildCallHierarchyItem(function, ktFile, document)
+                    val item = buildCallHierarchyItem(this, function, ktFile, document)
                     if (item != null) {
                         itemsArray.add(item)
                     }
@@ -86,7 +86,7 @@ internal fun BridgeContext.callHierarchyIncoming(uri: String, line: Int, charact
 
             for (searchFile in allKtFiles) {
                 val searchDoc = searchFile.viewProvider.document ?: continue
-                val fileUri = "file://${searchFile.virtualFile.path}"
+                val fileUri = fileUriForKtFile(searchFile)
 
                 val callExprs = PsiTreeUtil.collectElementsOfType(
                     searchFile, KtCallExpression::class.java
@@ -168,6 +168,7 @@ internal fun BridgeContext.callHierarchyIncoming(uri: String, line: Int, charact
 }
 
 private fun buildCallHierarchyItem(
+    ctx: BridgeContext,
     function: KtNamedFunction,
     ktFile: KtFile,
     document: com.intellij.openapi.editor.Document,
@@ -188,7 +189,7 @@ private fun buildCallHierarchyItem(
     val item = JsonObject()
     item.addProperty("name", name)
     item.addProperty("kind", "function")
-    item.addProperty("uri", "file://${ktFile.virtualFile.path}")
+    item.addProperty("uri", ctx.fileUriForKtFile(ktFile))
     item.addProperty("line", declLine)
     item.addProperty("column", declCol)
     item.addProperty("selectionLine", selLine)

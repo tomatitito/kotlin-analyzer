@@ -222,6 +222,74 @@ class InterfaceNavigationCodeActionIntegrationTest {
     }
 
     @Test
+    fun `implementation returns workspace URIs after shadow rebuild`() {
+        val workspace = Files.createTempDirectory("interface-shadow-impls")
+        val sourceRoot = workspace.resolve("src/main/kotlin")
+        val servicePath = sourceRoot.resolve("com/example/Service.kt")
+        writeSource(
+            servicePath,
+            """
+            package com.example
+
+            interface Service
+            """.trimIndent() + "\n",
+        )
+        val primaryPath = sourceRoot.resolve("com/example/PrimaryService.kt")
+        val primaryText = """
+            package com.example
+
+            class PrimaryService : Service
+            """.trimIndent() + "\n"
+        writeSource(primaryPath, primaryText)
+
+        val bridge = createBridge(workspace, sourceRoot)
+        bridge.updateFile(primaryPath.toUri().toString(), primaryText.replace(": Service", ": Service /* open buffer */"))
+
+        val locations = bridge
+            .implementation(servicePath.toUri().toString(), line = 3, character = 11)
+            .getAsJsonArray("locations")
+
+        assertEquals(1, locations.size(), "expected one concrete implementation")
+        val uri = locations[0].asJsonObject.get("uri").asString
+        assertEquals(primaryPath.toUri().toString(), uri)
+        assertTrue(!uri.contains("/shadow/"), "implementation URI must not contain shadow root path: $uri")
+    }
+
+    @Test
+    fun `definition returns workspace URI after shadow rebuild`() {
+        val workspace = Files.createTempDirectory("interface-shadow-definition")
+        val sourceRoot = workspace.resolve("src/main/kotlin")
+        val servicePath = sourceRoot.resolve("com/example/Service.kt")
+        writeSource(
+            servicePath,
+            """
+            package com.example
+
+            interface Service
+            """.trimIndent() + "\n",
+        )
+        val primaryPath = sourceRoot.resolve("com/example/PrimaryService.kt")
+        val primaryText = """
+            package com.example
+
+            class PrimaryService : Service
+            """.trimIndent() + "\n"
+        writeSource(primaryPath, primaryText)
+
+        val bridge = createBridge(workspace, sourceRoot)
+        bridge.updateFile(primaryPath.toUri().toString(), primaryText.replace(": Service", ": Service /* open buffer */"))
+
+        val locations = bridge
+            .definition(primaryPath.toUri().toString(), line = 3, character = 23)
+            .getAsJsonArray("locations")
+
+        assertEquals(1, locations.size(), "expected one interface definition")
+        val uri = locations[0].asJsonObject.get("uri").asString
+        assertEquals(servicePath.toUri().toString(), uri)
+        assertTrue(!uri.contains("/shadow/"), "definition URI must not contain shadow root path: $uri")
+    }
+
+    @Test
     fun `definition resolves interface member declaration from class implementation`() {
         val workspace = Files.createTempDirectory("interface-method-definition-class")
         val sourceRoot = workspace.resolve("src/main/kotlin")

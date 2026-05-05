@@ -664,7 +664,7 @@ private fun KaSession.addInterfaceSignaturePropagationAction(
 
             val interfaceFile = interfaceClass.containingFile as? KtFile ?: return
             val interfaceDoc = interfaceFile.viewProvider.document ?: return
-            val interfaceUri = "file://${interfaceFile.virtualFile.path}"
+            val interfaceUri = ctx.fileUriForKtFile(interfaceFile) ?: return
 
             val newParamText = overrideParams.joinToString(", ") { it.text }
             val paramListRange = interfaceFunc.valueParameterList ?: return
@@ -709,7 +709,7 @@ private fun KaSession.addInterfaceSignaturePropagationAction(
 
                     val implFile = candidate.containingFile as? KtFile ?: continue
                     val implDoc = implFile.viewProvider.document ?: continue
-                    val implUri = "file://${implFile.virtualFile.path}"
+                    val implUri = ctx.fileUriForKtFile(implFile) ?: continue
                     if (implUri in seenUris) continue
                     seenUris.add(implUri)
 

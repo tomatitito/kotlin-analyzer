@@ -54,7 +54,7 @@ internal fun BridgeContext.definition(uri: String, line: Int, character: Int): J
             if (element != null) {
                 val springProducer = findSpringModelProducerDeclaration(element)
                 if (springProducer != null) {
-                    val declarationUri = ((springProducer.containingFile as? KtFile)?.virtualFile?.path)?.let { "file://$it" } ?: uri
+                    val declarationUri = (springProducer.containingFile as? KtFile)?.let { fileUriForKtFile(it) } ?: uri
                     for (usage in pebbleSpringIndex.pebbleUsagesForDeclaration(springProducer, declarationUri)) {
                         val location = JsonObject()
                         location.addProperty("uri", usage.uri)
@@ -235,7 +235,7 @@ internal fun BridgeContext.implementation(uri: String, line: Int, character: Int
                                     val implLineStart = candidateDoc.getLineStartOffset(candidateDoc.getLineNumber(implOffset))
                                     val implCol = implOffset - implLineStart
                                     val loc = JsonObject()
-                                    loc.addProperty("uri", "file://${candidateFile.virtualFile.path}")
+                                    loc.addProperty("uri", fileUriForKtFile(candidateFile))
                                     loc.addProperty("line", implLine)
                                     loc.addProperty("column", implCol)
                                     locationsArray.add(loc)
@@ -425,7 +425,7 @@ private fun KaSession.findImplementingMemberLocations(
                 val implLineStart = candidateDoc.getLineStartOffset(candidateDoc.getLineNumber(implOffset))
                 val implCol = implOffset - implLineStart
                 val loc = JsonObject()
-                loc.addProperty("uri", "file://${candidateFile.virtualFile.path}")
+                loc.addProperty("uri", ctx.fileUriForKtFile(candidateFile))
                 loc.addProperty("line", implLine)
                 loc.addProperty("column", implCol)
                 locationsArray.add(loc)
