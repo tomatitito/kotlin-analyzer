@@ -48,8 +48,15 @@ class CompilerBridge {
     fun hover(uri: String, line: Int, character: Int): JsonObject =
         ctx.hover(uri, line, character)
 
-    fun completion(uri: String, line: Int, character: Int, triggerCharacter: String? = null): JsonObject =
-        ctx.completion(uri, line, character, triggerCharacter)
+    fun completion(
+        uri: String,
+        line: Int,
+        character: Int,
+        triggerCharacter: String? = null,
+        correlationId: String? = null,
+        includeMetrics: Boolean = false,
+    ): JsonObject =
+        ctx.completion(uri, line, character, triggerCharacter, correlationId, includeMetrics)
 
     fun definition(uri: String, line: Int, character: Int): JsonObject =
         ctx.definition(uri, line, character)

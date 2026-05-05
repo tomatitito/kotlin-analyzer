@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::BufReader;
@@ -36,6 +36,14 @@ struct PendingRequest {
     response_tx: oneshot::Sender<Result<Value, Error>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BridgeRequestTiming {
+    pub ready_wait_ms: f64,
+    pub enqueue_send_ms: f64,
+    pub response_wait_ms: f64,
+    pub total_ms: f64,
+}
+
 /// Stored initialization parameters for restart.
 #[derive(Clone, Default)]
 struct InitParams {
@@ -46,6 +54,10 @@ struct InitParams {
 }
 
 const MAX_RESTART_ATTEMPTS: u32 = 5;
+
+fn elapsed_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
 
 /// Manages the JVM sidecar process lifecycle and JSON-RPC communication.
 pub struct Bridge {
@@ -573,7 +585,23 @@ impl Bridge {
         params: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, Error> {
+        let (value, _) = self
+            .request_with_timeout_timed(method, params, timeout)
+            .await?;
+        Ok(value)
+    }
+
+    pub async fn request_with_timeout_timed(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<(Value, BridgeRequestTiming), Error> {
+        let total_start = Instant::now();
+
+        let ready_start = Instant::now();
         self.wait_for_ready(Duration::from_secs(30)).await?;
+        let ready_wait_ms = elapsed_ms(ready_start.elapsed());
 
         tracing::debug!(
             "Sending request '{}' to sidecar (timeout: {:?})",
@@ -581,6 +609,7 @@ impl Bridge {
             timeout
         );
 
+        let enqueue_start = Instant::now();
         let id = self.next_id();
         let request = Request::new(id, method, params);
 
@@ -596,9 +625,25 @@ impl Bridge {
             .send(request)
             .await
             .map_err(|_| BridgeError::Crashed("request channel closed".into()))?;
+        let enqueue_send_ms = elapsed_ms(enqueue_start.elapsed());
 
+        let response_start = Instant::now();
         match time::timeout(timeout, response_rx).await {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => {
+                let response_wait_ms = elapsed_ms(response_start.elapsed());
+                let total_ms = elapsed_ms(total_start.elapsed());
+                result.map(|value| {
+                    (
+                        value,
+                        BridgeRequestTiming {
+                            ready_wait_ms,
+                            enqueue_send_ms,
+                            response_wait_ms,
+                            total_ms,
+                        },
+                    )
+                })
+            }
             Ok(Err(_)) => Err(BridgeError::Crashed("response channel dropped".into()).into()),
             Err(_) => Err(BridgeError::Timeout(timeout.as_millis() as u64).into()),
         }

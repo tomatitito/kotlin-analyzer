@@ -16,6 +16,27 @@ cd sidecar && ./gradlew assembleRuntimePayloads   # build launcher + versioned r
 cd sidecar && ./gradlew test               # unit tests
 ```
 
+## Sensors
+
+Sensors are runnable observability probes. The intended top-level entrypoint is:
+
+```bash
+sensors run
+```
+
+Until the sensor CLI exists, run the completion latency sensor through Gradle:
+
+```bash
+cd sidecar && ./gradlew benchmark
+cd sidecar && ./gradlew benchmark --args="--warmups 3 --iterations 30 --jsonl-output build/completion-sensor.jsonl"
+```
+
+Editor completion timing logs are quiet by default. Enable structured Rust and sidecar completion timing with:
+
+```bash
+KOTLIN_ANALYZER_COMPLETION_METRICS=1 cargo run -- --log-level info
+```
+
 ## Zed extension
 
 ```bash

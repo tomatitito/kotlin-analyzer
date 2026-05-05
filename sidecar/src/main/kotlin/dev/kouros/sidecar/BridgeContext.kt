@@ -47,6 +47,7 @@ class BridgeContext {
     internal val virtualFileDiskPaths = mutableMapOf<String, String>()
     internal val decompiledFileCache = mutableMapOf<String, Path>()
     internal var sessionDirty = false
+    internal var newFilesPendingInSession = false
     internal val dirtyOnDiskFiles = mutableSetOf<String>()
     internal val shadowPathMapping = mutableMapOf<String, String>()
     internal var initProjectRoot = ""
@@ -222,8 +223,10 @@ class BridgeContext {
         }
 
         sessionDirty = false
+        newFilesPendingInSession = false
 
         registerVirtualFileModuleProvider()
+        disablePsiValidation()
 
         val elapsed = System.currentTimeMillis() - startTime
         System.err.println("CompilerBridge: session created in ${elapsed}ms")
@@ -291,6 +294,7 @@ class BridgeContext {
         val nowOnDisk = uri in virtualFilesOnDisk
         if (nowOnDisk && !wasOnDisk) {
             sessionDirty = true
+            newFilesPendingInSession = true
             System.err.println("CompilerBridge: updateFile($uri) — new virtual file in temp dir, session marked dirty")
         } else if (nowOnDisk && wasOnDisk) {
             sessionDirty = true
@@ -801,6 +805,27 @@ class BridgeContext {
 
     internal fun updateFileInSession(uri: String, text: String) {
         System.err.println("CompilerBridge: updateFile($uri) — stored in virtualFiles (${text.length} chars)")
+    }
+
+    // The standalone Analysis API rejects LightVirtualFile-backed PSI elements
+    // via a registry-guarded check in KaBaseIllegalPsiExceptionKt.checkValidity().
+    // Disabling this allows completion and hover to analyze in-memory file content
+    // (from updateFile) without rebuilding the entire session on every keystroke.
+    private fun disablePsiValidation() {
+        try {
+            com.intellij.openapi.util.registry.Registry
+                .get("kotlin.analysis.validate.psi.input").setValue(false)
+        } catch (_: Exception) {}
+        try {
+            val field = Class.forName(
+                "org.jetbrains.kotlin.analysis.api.impl.base.components.KaBaseIllegalPsiExceptionKt"
+            ).getDeclaredField("allowIllegalPsiAccess")
+            field.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            (field.get(null) as ThreadLocal<Boolean>).set(true)
+        } catch (e: Exception) {
+            System.err.println("CompilerBridge: could not disable PSI validation: ${e.message}")
+        }
     }
 
     // --- Session infrastructure ---

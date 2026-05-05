@@ -41,31 +41,32 @@ internal fun BridgeContext.completion(
     line: Int,
     character: Int,
     triggerCharacter: String? = null,
+    correlationId: String? = null,
+    includeMetrics: Boolean = false,
 ): JsonObject {
-    val perfStart = System.currentTimeMillis()
-
-    if (sessionDirty) {
-        System.err.println("CompilerBridge: completion($uri) — rebuilding session before completion")
-        ensureSessionCurrent()
+    val shouldCollectMetrics = includeMetrics || completionMetricsEnabledByEnv()
+    val metrics = if (shouldCollectMetrics) {
+        CompletionMetrics(correlationId ?: "sidecar-${System.nanoTime()}")
+    } else {
+        null
     }
 
-    var result = completionOnce(uri, line, character, triggerCharacter)
+    if (metrics?.stage("session_freshness_check") { newFilesPendingInSession } ?: newFilesPendingInSession) {
+        metrics?.count("sessionRebuilt", 1)
+        metrics?.stage("session_refresh") { ensureSessionCurrent() } ?: ensureSessionCurrent()
+    } else {
+        metrics?.count("sessionRebuilt", 0)
+    }
 
-    if (result.getAsJsonArray("items")?.size() == 0 && sessionDirty) {
-        val currentReason = result.get("reason")?.asString ?: "no explicit reason"
-        System.err.println("CompilerBridge: completion($uri) — retrying after rebuild (reason=$currentReason)")
-        try {
-            ensureSessionCurrent()
-            result = completionOnce(uri, line, character, triggerCharacter)
-        } catch (e: Throwable) {
-            val retryFailure = JsonObject()
-            retryFailure.addProperty("reason", "completion retry failed: ${e.javaClass.name}: ${e.message}")
-            retryFailure.add("items", JsonArray())
-            result = retryFailure
+    val result = completionOnce(uri, line, character, triggerCharacter, metrics)
+
+    if (metrics != null) {
+        val metricsJson = metrics.toJson()
+        result.add("metrics", metricsJson)
+        if (completionMetricsEnabledByEnv()) {
+            System.err.println("completion_metrics=$metricsJson")
         }
     }
-
-    System.err.println("[PERF] method=completion uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
     return result
 }
 
@@ -76,6 +77,7 @@ private fun BridgeContext.completionOnce(
     line: Int,
     character: Int,
     triggerCharacter: String?,
+    metrics: CompletionMetrics?,
 ): JsonObject {
     val result = JsonObject()
     val itemsArray = JsonArray()
@@ -85,79 +87,47 @@ private fun BridgeContext.completionOnce(
         }
     }
 
-    val currentSession = session ?: run {
+    val currentSession = metrics?.stage("session_lookup") { session } ?: session
+    if (currentSession == null) {
         setFailureReason("no-active-session")
         result.add("items", itemsArray)
         return result
     }
-    val ktFile = findKtFile(currentSession, uri) ?: run {
+    val ktFile = metrics?.stage("file_lookup") { findKtFile(currentSession, uri) } ?: findKtFile(currentSession, uri)
+    if (ktFile == null) {
         setFailureReason("file-not-found")
         result.add("items", itemsArray)
         return result
     }
+    val context = this
 
     try {
-        analyze(ktFile) {
-            val offset = lineColToOffset(ktFile, line, character) ?: run {
-                setFailureReason("line-col-offset-null (line=$line, char=$character)")
-                result.add("items", itemsArray)
-                return@analyze
+        metrics?.stage("analysis_api_analyze_block") {
+            analyze(ktFile) {
+                completeInsideAnalysis(
+                    context = context,
+                    ktFile = ktFile,
+                    line = line,
+                    character = character,
+                    triggerCharacter = triggerCharacter,
+                    result = result,
+                    itemsArray = itemsArray,
+                    setFailureReason = setFailureReason,
+                    metrics = metrics,
+                )
             }
-
-            val element = ktFile.findElementAt(offset)
-                ?: ktFile.findElementAt(maxOf(0, offset - 1))
-
-            if (element == null) {
-                setFailureReason("findElementAt=null (offset=$offset)")
-                result.add("items", itemsArray)
-                return@analyze
-            }
-
-            // Check if we are inside an import directive
-            val importDirective = PsiTreeUtil.getParentOfType(element, KtImportDirective::class.java)
-                ?: ktFile.findElementAt(maxOf(0, offset - 1))?.let {
-                    PsiTreeUtil.getParentOfType(it, KtImportDirective::class.java)
-                }
-            if (importDirective != null) {
-                collectImportCompletionItems(importDirective, offset)
-                    .forEach(itemsArray::add)
-            } else {
-                // Check if we are in a dot-qualified expression (member completion)
-                val dotCompletion = findDotCompletionReceiver(element, offset)
-                    ?: if (triggerCharacter == ".") {
-                        findDotCompletionReceiverAtOffset(ktFile, offset)
-                            ?: findReceiverExpressionEndingAtOffset(ktFile, offset)
-                    } else {
-                        // Look backward past the typed prefix for a dot
-                        findDotCompletionReceiverBeforePrefix(ktFile, offset)
-                    }
-                if (dotCompletion != null) {
-                    val memberPrefix = extractCompletionPrefix(element, offset)
-                    collectMemberCompletions(dotCompletion, itemsArray, memberPrefix)
-                } else {
-                    val prefix = extractCompletionPrefix(element, offset)
-                    val visibleCandidates = collectScopeCompletionCandidates(ktFile, element)
-                    val keywordCandidates = keywordCompletionCandidates()
-                    val autoImportCandidates = collectUnimportedCompletionCandidates(
-                        ktFile = ktFile,
-                        prefix = prefix,
-                        existingLabels = (visibleCandidates + keywordCandidates)
-                            .map { it.label }
-                            .toSet(),
-                    )
-
-                    rankScopeCompletionCandidates(
-                        prefix = prefix,
-                        candidates = visibleCandidates + keywordCandidates + autoImportCandidates,
-                    ).forEach(itemsArray::add)
-                }
-            }
-
-            if (itemsArray.size() == 0) {
-                setFailureReason("no-completion-items")
-            } else {
-                result.remove("reason")
-            }
+        } ?: analyze(ktFile) {
+            completeInsideAnalysis(
+                context = context,
+                ktFile = ktFile,
+                line = line,
+                character = character,
+                triggerCharacter = triggerCharacter,
+                result = result,
+                itemsArray = itemsArray,
+                setFailureReason = setFailureReason,
+                metrics = null,
+            )
         }
     } catch (e: Throwable) {
         val reason = "completion failed: ${e.javaClass.name}: ${e.message}"
@@ -165,8 +135,128 @@ private fun BridgeContext.completionOnce(
         System.err.println("CompilerBridge: $reason")
     }
 
-    result.add("items", itemsArray)
+    metrics?.count("finalItems", itemsArray.size())
+    result.add("items", metrics?.stage("json_item_assembly") { itemsArray } ?: itemsArray)
     return result
+}
+
+private fun org.jetbrains.kotlin.analysis.api.KaSession.completeInsideAnalysis(
+    context: BridgeContext,
+    ktFile: KtFile,
+    line: Int,
+    character: Int,
+    triggerCharacter: String?,
+    result: JsonObject,
+    itemsArray: JsonArray,
+    setFailureReason: (String) -> Unit,
+    metrics: CompletionMetrics?,
+) {
+    val offset = (metrics?.stage("offset_lookup") { context.lineColToOffset(ktFile, line, character) }
+        ?: context.lineColToOffset(ktFile, line, character)) ?: run {
+        setFailureReason("line-col-offset-null (line=$line, char=$character)")
+        result.add("items", itemsArray)
+        return
+    }
+
+    val element = metrics?.stage("psi_file_lookup") {
+        ktFile.findElementAt(offset) ?: ktFile.findElementAt(maxOf(0, offset - 1))
+    } ?: (ktFile.findElementAt(offset) ?: ktFile.findElementAt(maxOf(0, offset - 1)))
+
+    if (element == null) {
+        setFailureReason("findElementAt=null (offset=$offset)")
+        result.add("items", itemsArray)
+        return
+    }
+
+    // Check if we are inside an import directive
+    val importDirective = metrics?.stage("import_context_detection") {
+        PsiTreeUtil.getParentOfType(element, KtImportDirective::class.java)
+            ?: ktFile.findElementAt(maxOf(0, offset - 1))?.let {
+                PsiTreeUtil.getParentOfType(it, KtImportDirective::class.java)
+            }
+    } ?: (PsiTreeUtil.getParentOfType(element, KtImportDirective::class.java)
+        ?: ktFile.findElementAt(maxOf(0, offset - 1))?.let {
+            PsiTreeUtil.getParentOfType(it, KtImportDirective::class.java)
+        })
+    if (importDirective != null) {
+        val importItems = metrics?.stage("import_candidate_lookup") {
+            context.collectImportCompletionItems(importDirective, offset)
+        } ?: context.collectImportCompletionItems(importDirective, offset)
+        metrics?.count("importCandidates", importItems.size)
+        importItems
+            .forEach(itemsArray::add)
+    } else {
+        // Check if we are in a dot-qualified expression (member completion)
+        val dotCompletion = metrics?.stage("receiver_detection") {
+            findDotCompletionReceiver(element, offset)
+                ?: if (triggerCharacter == ".") {
+                    findDotCompletionReceiverAtOffset(ktFile, offset)
+                        ?: findReceiverExpressionEndingAtOffset(ktFile, offset)
+                } else {
+                    // Look backward past the typed prefix for a dot
+                    findDotCompletionReceiverBeforePrefix(ktFile, offset)
+                }
+        } ?: (findDotCompletionReceiver(element, offset)
+            ?: if (triggerCharacter == ".") {
+                findDotCompletionReceiverAtOffset(ktFile, offset)
+                    ?: findReceiverExpressionEndingAtOffset(ktFile, offset)
+            } else {
+                findDotCompletionReceiverBeforePrefix(ktFile, offset)
+            })
+        if (dotCompletion != null) {
+            val memberPrefix = extractCompletionPrefix(element, offset)
+            val before = itemsArray.size()
+            metrics?.stage("member_candidate_collection") {
+                collectMemberCompletions(dotCompletion, itemsArray, memberPrefix, metrics)
+            } ?: collectMemberCompletions(dotCompletion, itemsArray, memberPrefix, null)
+            metrics?.count("memberCandidates", itemsArray.size() - before)
+        } else {
+            val prefix = extractCompletionPrefix(element, offset)
+            val visibleCandidates = metrics?.stage("scope_candidate_collection") {
+                collectScopeCompletionCandidates(ktFile, element, metrics)
+            } ?: collectScopeCompletionCandidates(ktFile, element, null)
+            metrics?.count("scopeCandidates", visibleCandidates.size)
+            val keywordCandidates = metrics?.stage("keyword_fallback_collection") {
+                keywordCompletionCandidates()
+            } ?: keywordCompletionCandidates()
+            metrics?.count("keywordCandidates", keywordCandidates.size)
+            val autoImportCandidates = metrics?.stage("auto_import_candidate_lookup") {
+                context.collectUnimportedCompletionCandidates(
+                    ktFile = ktFile,
+                    prefix = prefix,
+                    existingLabels = (visibleCandidates + keywordCandidates)
+                        .map { it.label }
+                        .toSet(),
+                    metrics = metrics,
+                )
+            } ?: context.collectUnimportedCompletionCandidates(
+                ktFile = ktFile,
+                prefix = prefix,
+                existingLabels = (visibleCandidates + keywordCandidates)
+                    .map { it.label }
+                    .toSet(),
+                metrics = null,
+            )
+            metrics?.count("autoImportCandidates", autoImportCandidates.size)
+
+            val rankedItems = metrics?.stage("ranking_scoring") {
+                rankScopeCompletionCandidates(
+                    prefix = prefix,
+                    candidates = visibleCandidates + keywordCandidates + autoImportCandidates,
+                )
+            } ?: rankScopeCompletionCandidates(
+                prefix = prefix,
+                candidates = visibleCandidates + keywordCandidates + autoImportCandidates,
+            )
+            rankedItems.forEach(itemsArray::add)
+        }
+    }
+
+    if (itemsArray.size() == 0) {
+        setFailureReason("no-completion-items")
+    } else {
+        result.remove("reason")
+    }
 }
 
 // --- Dot completion helpers (pure PSI, no BridgeContext state) ---
@@ -276,6 +366,7 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectMemberCompletions
     receiverExpr: KtExpression,
     itemsArray: JsonArray,
     prefix: String = "",
+    metrics: CompletionMetrics? = null,
 ) {
     val receiverType = receiverExpr.expressionType ?: return
     val lowerPrefix = prefix.lowercase()
@@ -290,7 +381,14 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectMemberCompletions
                 if (name.startsWith("<")) continue
                 if (lowerPrefix.isNotEmpty() && !name.lowercase().startsWith(lowerPrefix)) continue
 
-                val returnType = try {
+                val returnType = metrics?.stage("detail_type_rendering") {
+                    try {
+                        sig.returnType.render(
+                            KaTypeRendererForSource.WITH_SHORT_NAMES,
+                            Variance.INVARIANT
+                        )
+                    } catch (_: Exception) { "" }
+                } ?: try {
                     sig.returnType.render(
                         KaTypeRendererForSource.WITH_SHORT_NAMES,
                         Variance.INVARIANT
@@ -351,7 +449,14 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectMemberCompletions
                     if (lowerPrefix.isNotEmpty() && !name.lowercase().startsWith(lowerPrefix)) continue
                     existingLabels.add(name)
 
-                    val returnType = try {
+                    val returnType = metrics?.stage("detail_type_rendering") {
+                        try {
+                            callable.returnType.render(
+                                KaTypeRendererForSource.WITH_SHORT_NAMES,
+                                Variance.INVARIANT
+                            )
+                        } catch (_: Exception) { "" }
+                    } ?: try {
                         callable.returnType.render(
                             KaTypeRendererForSource.WITH_SHORT_NAMES,
                             Variance.INVARIANT
@@ -384,6 +489,7 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectMemberCompletions
 private fun org.jetbrains.kotlin.analysis.api.KaSession.collectScopeCompletionCandidates(
     ktFile: KtFile,
     element: PsiElement,
+    metrics: CompletionMetrics? = null,
 ): List<ScopeCompletionCandidate> {
     val candidates = mutableListOf<ScopeCompletionCandidate>()
 
@@ -414,7 +520,14 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectScopeCompletionCa
                 val name = callable.name.asString()
                 if (name.startsWith("<") || !seen.add(name)) continue
 
-                val returnType = try {
+                val returnType = metrics?.stage("detail_type_rendering") {
+                    try {
+                        callable.returnType.render(
+                            KaTypeRendererForSource.WITH_SHORT_NAMES,
+                            Variance.INVARIANT
+                        )
+                    } catch (_: Exception) { "" }
+                } ?: try {
                     callable.returnType.render(
                         KaTypeRendererForSource.WITH_SHORT_NAMES,
                         Variance.INVARIANT
@@ -605,6 +718,7 @@ private fun BridgeContext.collectUnimportedCompletionCandidates(
     ktFile: KtFile,
     prefix: String,
     existingLabels: Set<String>,
+    metrics: CompletionMetrics? = null,
 ): List<ScopeCompletionCandidate> {
     if (prefix.isEmpty()) return emptyList()
 
@@ -628,7 +742,9 @@ private fun BridgeContext.collectUnimportedCompletionCandidates(
 
         val editsArray = JsonArray()
         val edit = JsonObject()
-        val (importLine, newText) = computeImportInsertion(ktFile, document, decl.fqn!!)
+        val (importLine, newText) = metrics?.stage("import_edit_construction") {
+            computeImportInsertion(ktFile, document, decl.fqn!!)
+        } ?: computeImportInsertion(ktFile, document, decl.fqn!!)
         edit.addProperty("newText", newText)
         edit.addProperty("line", importLine)
         edit.addProperty("column", 0)

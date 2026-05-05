@@ -234,3 +234,16 @@ tasks.named<JavaExec>("run") {
         "--add-opens", "java.base/java.util=ALL-UNNAMED",
     )
 }
+
+tasks.register<JavaExec>("benchmark") {
+    group = "verification"
+    description = "Run BridgeContext completion latency benchmarks against the gradle-spring-web fixture."
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("dev.kouros.sidecar.CompletionBenchmarkKt")
+    jvmArgs(
+        "--add-opens", "java.base/java.lang=ALL-UNNAMED",
+        "--add-opens", "java.base/java.lang.reflect=ALL-UNNAMED",
+        "--add-opens", "java.base/java.util=ALL-UNNAMED",
+    )
+    maxHeapSize = "1g"
+}

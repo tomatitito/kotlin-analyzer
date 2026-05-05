@@ -201,6 +201,7 @@ class AnalysisServer(
     }
 
     private fun handleCompletion(request: JsonRpcRequest) {
+        val dispatchStart = System.nanoTime()
         val params = request.params ?: run {
             transport.sendResult(request.id, JsonObject().apply { add("items", com.google.gson.JsonArray()) })
             return
@@ -215,8 +216,24 @@ class AnalysisServer(
         }
         val character = params.get("character")?.asInt ?: 0
         val triggerCharacter = params.get("triggerCharacter")?.takeUnless { it.isJsonNull }?.asString
+        val correlationId = params.get("correlationId")?.takeUnless { it.isJsonNull }?.asString
+            ?: "sidecar-request-${request.id ?: System.nanoTime()}"
+        val includeMetrics = params.get("includeMetrics")?.takeUnless { it.isJsonNull }?.asBoolean ?: false
+        val rustSentAtEpochMicros = params.get("rustSentAtEpochMicros")?.takeUnless { it.isJsonNull }?.asLong
+        val queueWaitMs = rustSentAtEpochMicros?.let {
+            (System.currentTimeMillis() * 1000L - it).coerceAtLeast(0L) / 1000.0
+        }
 
-        val result = bridge.completion(uri, line, character, triggerCharacter)
+        val result = bridge.completion(uri, line, character, triggerCharacter, correlationId, includeMetrics)
+        if (includeMetrics || completionMetricsEnabledByEnv()) {
+            val metrics = result.getAsJsonObject("metrics") ?: JsonObject().also { result.add("metrics", it) }
+            metrics.addProperty("correlationId", correlationId)
+            val stages = metrics.getAsJsonObject("stages") ?: JsonObject().also { metrics.add("stages", it) }
+            stages.addProperty("sidecar_dispatch_total", (System.nanoTime() - dispatchStart) / 1_000_000.0)
+            if (queueWaitMs != null) {
+                stages.addProperty("sidecar_queue_wait", queueWaitMs)
+            }
+        }
         transport.sendResult(request.id, result)
     }
 

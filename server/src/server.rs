@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lsp_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use lsp_types::request::Request as LspRequest;
@@ -454,6 +455,8 @@ pub struct KotlinLanguageServer {
     source_roots: Arc<Mutex<Vec<PathBuf>>>,
     debounce_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Url>>>>,
     is_zed_client: Arc<Mutex<bool>>,
+    interactive_epoch: Arc<AtomicU64>,
+    completion_request_id: AtomicU64,
 }
 
 impl KotlinLanguageServer {
@@ -467,6 +470,8 @@ impl KotlinLanguageServer {
             source_roots: Arc::new(Mutex::new(Vec::new())),
             debounce_tx: Arc::new(Mutex::new(None)),
             is_zed_client: Arc::new(Mutex::new(false)),
+            interactive_epoch: Arc::new(AtomicU64::new(0)),
+            completion_request_id: AtomicU64::new(1),
         }
     }
 
@@ -488,6 +493,21 @@ impl KotlinLanguageServer {
     async fn get_bridge(&self) -> Option<Arc<Bridge>> {
         let guard = self.bridge.lock().await;
         guard.as_ref().map(Arc::clone)
+    }
+
+    fn note_interactive_request(&self) {
+        self.interactive_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn completion_metrics_enabled() -> bool {
+        std::env::var("KOTLIN_ANALYZER_COMPLETION_METRICS")
+            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    }
+
+    fn next_completion_correlation_id(&self) -> String {
+        let id = self.completion_request_id.fetch_add(1, Ordering::Relaxed);
+        format!("completion-{id}")
     }
 
     /// Publishes diagnostics for a document by requesting analysis from the sidecar.
@@ -786,9 +806,10 @@ impl KotlinLanguageServer {
         let client = self.client.clone();
         let documents = Arc::clone(&self.documents);
         let bridge = Arc::clone(&self.bridge);
+        let interactive_epoch = Arc::clone(&self.interactive_epoch);
 
         tokio::spawn(async move {
-            let mut pending: Option<Url> = None;
+            let mut pending: Option<(Url, u64)> = None;
             let debounce_duration = Duration::from_millis(300);
 
             loop {
@@ -796,13 +817,23 @@ impl KotlinLanguageServer {
                     uri = rx.recv() => {
                         match uri {
                             Some(uri) => {
-                                pending = Some(uri);
+                                pending = Some((uri, interactive_epoch.load(Ordering::Relaxed)));
                             }
                             None => break,
                         }
                     }
                     _ = tokio::time::sleep(debounce_duration), if pending.is_some() => {
-                        if let Some(uri) = pending.take() {
+                        if let Some((uri, epoch_at_schedule)) = pending.take() {
+                            let current_epoch = interactive_epoch.load(Ordering::Relaxed);
+                            if current_epoch != epoch_at_schedule {
+                                tracing::debug!(
+                                    "debounced analysis deferred by interactive activity for {}",
+                                    uri
+                                );
+                                pending = Some((uri, current_epoch));
+                                continue;
+                            }
+
                             // Skip Gradle build scripts
                             if is_gradle_script(&uri) {
                                 continue;
@@ -866,6 +897,52 @@ fn is_gradle_script(uri: &Url) -> bool {
     } else {
         false
     }
+}
+
+fn collect_kotlin_source_uris(source_roots: &[String]) -> Vec<Url> {
+    fn visit(dir: &Path, uris: &mut Vec<Url>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!("background analysis: cannot read {:?}: {}", dir, e);
+                return;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let path_str = path.to_string_lossy();
+            if path_str.contains("/build/") || path_str.contains("/.gradle/") {
+                continue;
+            }
+
+            if path.is_dir() {
+                visit(&path, uris);
+                continue;
+            }
+
+            if path.extension().and_then(|ext| ext.to_str()) != Some("kt") {
+                continue;
+            }
+
+            match Url::from_file_path(&path) {
+                Ok(uri) if !is_gradle_script(&uri) => uris.push(uri),
+                Ok(_) => {}
+                Err(()) => tracing::warn!(
+                    "background analysis: cannot convert path to URI: {:?}",
+                    path
+                ),
+            }
+        }
+    }
+
+    let mut uris = Vec::new();
+    for root in source_roots {
+        visit(Path::new(root), &mut uris);
+    }
+    uris.sort();
+    uris.dedup();
+    uris
 }
 
 fn parse_diagnostics_static(result: &Value) -> Vec<Diagnostic> {
@@ -1125,6 +1202,7 @@ impl LanguageServer for KotlinLanguageServer {
         let bridge_holder = Arc::clone(&self.bridge);
         let documents_holder = Arc::clone(&self.documents);
         let source_roots_holder = Arc::clone(&self.source_roots);
+        let interactive_epoch_holder = Arc::clone(&self.interactive_epoch);
         let config = self.config.lock().await.clone();
         let project_root = self.project_root.lock().await.clone();
 
@@ -1487,9 +1565,13 @@ impl LanguageServer for KotlinLanguageServer {
                     let bg_bridge = Arc::clone(&bridge_holder);
                     let bg_documents = Arc::clone(&documents_holder);
                     let bg_client = client.clone();
+                    let bg_interactive_epoch = Arc::clone(&interactive_epoch_holder);
+                    let bg_source_roots = source_roots.clone();
                     tokio::spawn(async move {
                         // Small delay to let open-file diagnostics settle
                         tokio::time::sleep(Duration::from_secs(2)).await;
+                        let start_epoch = bg_interactive_epoch.load(Ordering::Relaxed);
+                        let source_uris = collect_kotlin_source_uris(&bg_source_roots);
 
                         // Create progress token for background analysis
                         let bg_token =
@@ -1523,174 +1605,140 @@ impl LanguageServer for KotlinLanguageServer {
                             )
                             .await;
 
-                        // Call analyzeAll with a generous timeout (5 minutes)
                         let bridge_arc = {
                             let guard = bg_bridge.lock().await;
                             guard.as_ref().map(Arc::clone)
                         };
-                        let analyze_result = match bridge_arc {
-                            Some(b) => {
-                                if b.state().await != SidecarState::Ready {
-                                    tracing::warn!(
-                                        "background analysis: sidecar not ready, skipping"
-                                    );
-                                    None
-                                } else {
-                                    Some(
-                                        b.request_with_timeout(
-                                            "analyzeAll",
-                                            None,
-                                            Duration::from_secs(300),
-                                        )
-                                        .await,
-                                    )
-                                }
-                            }
-                            None => None,
+
+                        let Some(bridge) = bridge_arc else {
+                            bg_client
+                                .send_notification::<lsp_types::notification::Progress>(
+                                    ProgressParams {
+                                        token: bg_token.clone(),
+                                        value: ProgressParamsValue::WorkDone(
+                                            WorkDoneProgress::End(WorkDoneProgressEnd {
+                                                message: Some(
+                                                    "Skipped — sidecar not ready".to_string(),
+                                                ),
+                                            }),
+                                        ),
+                                    },
+                                )
+                                .await;
+                            return;
                         };
 
-                        match analyze_result {
-                            Some(Ok(result)) => {
-                                let files = result.get("files").and_then(|f| f.as_array());
-                                let total_files = result
-                                    .get("totalFiles")
-                                    .and_then(|t| t.as_u64())
-                                    .unwrap_or(0);
-                                let total_errors = result
-                                    .get("totalErrors")
-                                    .and_then(|e| e.as_u64())
-                                    .unwrap_or(0);
-                                let total_warnings = result
-                                    .get("totalWarnings")
-                                    .and_then(|w| w.as_u64())
-                                    .unwrap_or(0);
-
-                                if let Some(files) = files {
-                                    let mut processed = 0u64;
-                                    let mut _published = 0u64;
-                                    for file_entry in files {
-                                        processed += 1;
-
-                                        let uri_str =
-                                            match file_entry.get("uri").and_then(|u| u.as_str()) {
-                                                Some(u) => u,
-                                                None => continue,
-                                            };
-
-                                        let uri = match Url::parse(uri_str) {
-                                            Ok(u) => u,
-                                            Err(e) => {
-                                                tracing::warn!("background analysis: invalid URI from sidecar: {:?} ({})", uri_str, e);
-                                                continue;
-                                            }
-                                        };
-
-                                        // Skip files that are currently open — their diagnostics
-                                        // from the replay loop are fresher
-                                        {
-                                            let docs = bg_documents.lock().await;
-                                            if docs.get(&uri).is_some() {
-                                                continue;
-                                            }
-                                        }
-
-                                        let diagnostics = parse_diagnostics_static(file_entry);
-
-                                        if !diagnostics.is_empty() {
-                                            {
-                                                let mut docs = bg_documents.lock().await;
-                                                docs.set_diagnostics(
-                                                    uri.clone(),
-                                                    diagnostics.clone(),
-                                                );
-                                            }
-                                            bg_client
-                                                .publish_diagnostics(uri, diagnostics, None)
-                                                .await;
-                                            _published += 1;
-                                        } else {
-                                            // File is now clean — clear stale cached diagnostics
-                                            // so they aren't re-published on didClose/didOpen cycles
-                                            let had_cached = {
-                                                let mut docs = bg_documents.lock().await;
-                                                let had = docs.get_diagnostics(&uri).is_some();
-                                                if had {
-                                                    docs.remove_diagnostics(&uri);
-                                                }
-                                                had
-                                            };
-                                            if had_cached {
-                                                bg_client
-                                                    .publish_diagnostics(uri, vec![], None)
-                                                    .await;
-                                            }
-                                        }
-
-                                        // Report progress periodically
-                                        if total_files > 0 && processed % 10 == 0 {
-                                            let pct = ((processed as f64 / total_files as f64)
-                                                * 100.0)
-                                                as u32;
-                                            bg_client
-                                                .send_notification::<lsp_types::notification::Progress>(ProgressParams {
-                                                    token: bg_token.clone(),
-                                                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
-                                                        WorkDoneProgressReport {
-                                                            message: Some(format!("Processed {}/{} files", processed, total_files)),
-                                                            percentage: Some(pct),
-                                                            cancellable: Some(false),
-                                                        },
-                                                    )),
-                                                })
-                                                .await;
-                                        }
-                                    }
-
-                                    let summary = format!(
-                                        "Complete — {} error(s), {} warning(s) in {} file(s)",
-                                        total_errors, total_warnings, total_files
-                                    );
-                                    tracing::info!("background analysis: {}", summary);
-
-                                    bg_client
-                                        .send_notification::<lsp_types::notification::Progress>(
-                                            ProgressParams {
-                                                token: bg_token.clone(),
-                                                value: ProgressParamsValue::WorkDone(
-                                                    WorkDoneProgress::End(WorkDoneProgressEnd {
-                                                        message: Some(summary),
-                                                    }),
+                        if bridge.state().await != SidecarState::Ready {
+                            tracing::warn!("background analysis: sidecar not ready, skipping");
+                            bg_client
+                                .send_notification::<lsp_types::notification::Progress>(
+                                    ProgressParams {
+                                        token: bg_token.clone(),
+                                        value: ProgressParamsValue::WorkDone(
+                                            WorkDoneProgress::End(WorkDoneProgressEnd {
+                                                message: Some(
+                                                    "Skipped — sidecar not ready".to_string(),
                                                 ),
-                                            },
-                                        )
-                                        .await;
+                                            }),
+                                        ),
+                                    },
+                                )
+                                .await;
+                            return;
+                        }
+
+                        let total_files = source_uris.len() as u64;
+                        let mut processed = 0u64;
+                        let mut published = 0u64;
+                        let mut total_errors = 0u64;
+                        let mut total_warnings = 0u64;
+                        let mut cancelled = false;
+
+                        for uri in source_uris {
+                            if bg_interactive_epoch.load(Ordering::Relaxed) != start_epoch {
+                                tracing::info!(
+                                    "background analysis: cancelled after interactive request"
+                                );
+                                cancelled = true;
+                                break;
+                            }
+
+                            // Skip files that are currently open — open-file diagnostics are fresher.
+                            {
+                                let docs = bg_documents.lock().await;
+                                if docs.get(&uri).is_some() {
+                                    continue;
                                 }
                             }
-                            Some(Err(e)) => {
-                                tracing::warn!("background analysis failed: {}", e);
+
+                            let result = bridge
+                                .request_with_timeout(
+                                    "analyze",
+                                    Some(serde_json::json!({ "uri": uri.as_str() })),
+                                    Duration::from_secs(30),
+                                )
+                                .await;
+
+                            processed += 1;
+                            let result = match result {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "background analysis failed for {}: {}",
+                                        uri,
+                                        e
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let diagnostics = parse_diagnostics_static(&result);
+                            total_errors += diagnostics
+                                .iter()
+                                .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+                                .count() as u64;
+                            total_warnings += diagnostics
+                                .iter()
+                                .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::WARNING))
+                                .count() as u64;
+
+                            if !diagnostics.is_empty() {
+                                {
+                                    let mut docs = bg_documents.lock().await;
+                                    docs.set_diagnostics(uri.clone(), diagnostics.clone());
+                                }
                                 bg_client
-                                    .send_notification::<lsp_types::notification::Progress>(
-                                        ProgressParams {
-                                            token: bg_token.clone(),
-                                            value: ProgressParamsValue::WorkDone(
-                                                WorkDoneProgress::End(WorkDoneProgressEnd {
-                                                    message: Some(format!("Failed: {}", e)),
-                                                }),
-                                            ),
-                                        },
-                                    )
+                                    .publish_diagnostics(uri.clone(), diagnostics, None)
                                     .await;
+                                published += 1;
+                            } else {
+                                let had_cached = {
+                                    let mut docs = bg_documents.lock().await;
+                                    let had = docs.get_diagnostics(&uri).is_some();
+                                    if had {
+                                        docs.remove_diagnostics(&uri);
+                                    }
+                                    had
+                                };
+                                if had_cached {
+                                    bg_client.publish_diagnostics(uri.clone(), vec![], None).await;
+                                }
                             }
-                            None => {
+
+                            if total_files > 0 && processed % 10 == 0 {
+                                let pct = ((processed as f64 / total_files as f64) * 100.0) as u32;
                                 bg_client
                                     .send_notification::<lsp_types::notification::Progress>(
                                         ProgressParams {
                                             token: bg_token.clone(),
                                             value: ProgressParamsValue::WorkDone(
-                                                WorkDoneProgress::End(WorkDoneProgressEnd {
-                                                    message: Some(
-                                                        "Skipped — sidecar not ready".to_string(),
-                                                    ),
+                                                WorkDoneProgress::Report(WorkDoneProgressReport {
+                                                    message: Some(format!(
+                                                        "Processed {}/{} files",
+                                                        processed, total_files
+                                                    )),
+                                                    percentage: Some(pct),
+                                                    cancellable: Some(false),
                                                 }),
                                             ),
                                         },
@@ -1698,6 +1746,36 @@ impl LanguageServer for KotlinLanguageServer {
                                     .await;
                             }
                         }
+
+                        let summary = if cancelled {
+                            format!(
+                                "Cancelled — processed {}/{} file(s)",
+                                processed, total_files
+                            )
+                        } else {
+                            format!(
+                                "Complete — {} error(s), {} warning(s) in {} file(s)",
+                                total_errors, total_warnings, processed
+                            )
+                        };
+                        tracing::info!(
+                            "background analysis: {} (published {} file(s))",
+                            summary,
+                            published
+                        );
+
+                        bg_client
+                            .send_notification::<lsp_types::notification::Progress>(
+                                ProgressParams {
+                                    token: bg_token.clone(),
+                                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                        WorkDoneProgressEnd {
+                                            message: Some(summary),
+                                        },
+                                    )),
+                                },
+                            )
+                            .await;
                     });
                 }
                 Err(e) => {
@@ -1913,6 +1991,11 @@ impl LanguageServer for KotlinLanguageServer {
     }
 
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
+        let request_received_at = Instant::now();
+        self.note_interactive_request();
+        let correlation_id = self.next_completion_correlation_id();
+        let metrics_enabled = Self::completion_metrics_enabled();
+
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let trigger_character = params
@@ -1920,25 +2003,67 @@ impl LanguageServer for KotlinLanguageServer {
             .as_ref()
             .and_then(|context| context.trigger_character.clone());
 
+        let doc_lookup_start = Instant::now();
+        let document_kind = {
+            let documents = self.documents.lock().await;
+            documents
+                .get(&uri)
+                .map(|doc| doc.kind)
+                .unwrap_or_else(|| DocumentKind::from_uri(&uri))
+        };
+        let document_lookup_ms = doc_lookup_start.elapsed().as_secs_f64() * 1000.0;
+
         let bridge = match self.get_bridge().await {
             Some(b) => b,
             None => return Self::server_not_initialized_error(),
         };
 
-        match bridge
-            .request(
+        let bridge_request_start = Instant::now();
+        let result = bridge
+            .request_with_timeout_timed(
                 "completion",
                 Some(serde_json::json!({
                     "uri": uri.as_str(),
                     "line": position.line + 1,
                     "character": position.character,
                     "triggerCharacter": trigger_character,
+                    "correlationId": correlation_id,
+                    "includeMetrics": metrics_enabled,
+                    "rustSentAtEpochMicros": SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| duration.as_micros() as u64)
+                        .unwrap_or_default(),
                 })),
+                Duration::from_secs(60),
             )
-            .await
-        {
-            Ok(result) => {
+            .await;
+
+        match result {
+            Ok((result, bridge_timing)) => {
+                let conversion_start = Instant::now();
                 let items = self.parse_completion_items(&result);
+                let conversion_ms = conversion_start.elapsed().as_secs_f64() * 1000.0;
+                if metrics_enabled {
+                    let sidecar_metrics = result.get("metrics").cloned().unwrap_or(Value::Null);
+                    tracing::info!(
+                        target: "completion_metrics",
+                        correlation_id = %correlation_id,
+                        uri = %uri,
+                        line = position.line,
+                        character = position.character,
+                        document_kind = ?document_kind,
+                        request_receipt_ms = 0.0,
+                        document_lookup_ms,
+                        bridge_ready_wait_ms = bridge_timing.ready_wait_ms,
+                        bridge_enqueue_send_ms = bridge_timing.enqueue_send_ms,
+                        bridge_response_wait_ms = bridge_timing.response_wait_ms,
+                        bridge_total_ms = bridge_timing.total_ms,
+                        response_conversion_ms = conversion_ms,
+                        rust_total_ms = request_received_at.elapsed().as_secs_f64() * 1000.0,
+                        sidecar = %sidecar_metrics,
+                        "completion timing"
+                    );
+                }
                 if items.is_empty() {
                     let reason = result
                         .get("reason")
@@ -1955,6 +2080,15 @@ impl LanguageServer for KotlinLanguageServer {
                 Ok(Some(CompletionResponse::Array(items)))
             }
             Err(e) => {
+                if metrics_enabled {
+                    tracing::warn!(
+                        target: "completion_metrics",
+                        correlation_id = %correlation_id,
+                        bridge_request_ms = bridge_request_start.elapsed().as_secs_f64() * 1000.0,
+                        "completion failed before response: {}",
+                        e
+                    );
+                }
                 tracing::warn!("completion failed: {}", e);
                 Ok(None)
             }
@@ -1962,6 +2096,8 @@ impl LanguageServer for KotlinLanguageServer {
     }
 
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        self.note_interactive_request();
+
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
@@ -2028,6 +2164,8 @@ impl LanguageServer for KotlinLanguageServer {
         &self,
         params: GotoDefinitionParams,
     ) -> LspResult<Option<GotoDefinitionResponse>> {
+        self.note_interactive_request();
+
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let method = {
@@ -2077,6 +2215,8 @@ impl LanguageServer for KotlinLanguageServer {
         &self,
         params: GotoImplementationParams,
     ) -> LspResult<Option<GotoImplementationResponse>> {
+        self.note_interactive_request();
+
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let kind = {
@@ -2127,6 +2267,8 @@ impl LanguageServer for KotlinLanguageServer {
     }
 
     async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
+        self.note_interactive_request();
+
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let method = {
@@ -2253,6 +2395,8 @@ impl LanguageServer for KotlinLanguageServer {
         &self,
         params: SignatureHelpParams,
     ) -> LspResult<Option<SignatureHelp>> {
+        self.note_interactive_request();
+
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
