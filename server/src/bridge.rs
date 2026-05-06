@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tokio::time;
 
 use crate::config::Config;
-use crate::error::{BridgeError, Error};
+use crate::error::{BridgeError, Error, SupersededStage};
 use crate::jsonrpc::{self, Request, Response, SidecarMessage};
 use crate::runtime::SidecarRuntime;
 
@@ -34,6 +35,26 @@ pub enum SidecarState {
 struct PendingRequest {
     id: u64,
     response_tx: oneshot::Sender<Result<Value, Error>>,
+}
+
+/// Identifies a request that may be superseded by a newer one for the same bucket.
+/// `bucket` is typically a document URI; `seq` is monotonically increasing per bucket.
+#[derive(Debug, Clone)]
+struct SupersessionTag {
+    bucket: String,
+    seq: u64,
+}
+
+/// Message enqueued on the internal writer channel.
+/// `Plain` requests are written to stdin unconditionally; `Supersedable` requests
+/// are dropped before stdin write when a newer request for the same bucket has
+/// been registered, saving sidecar CPU and reducing user-visible queue wait.
+enum QueuedMessage {
+    Plain(Request),
+    Supersedable {
+        request: Request,
+        tag: SupersessionTag,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,7 +88,14 @@ pub struct Bridge {
     state_watch_rx: watch::Receiver<SidecarState>,
     request_id: AtomicU64,
     pending: Arc<Mutex<Vec<PendingRequest>>>,
-    request_tx: Mutex<mpsc::Sender<Request>>,
+    request_tx: Mutex<mpsc::Sender<QueuedMessage>>,
+    /// Tracks the latest supersession seq per bucket (URI for completion).
+    /// When a newer request arrives, queued older requests are dropped before stdin write.
+    latest_supersession_seq: Arc<Mutex<HashMap<String, u64>>>,
+    /// Counts of completion requests skipped before sidecar work due to supersession.
+    superseded_before_send_count: Arc<AtomicU64>,
+    /// Counts of completion responses discarded after sidecar work due to supersession.
+    superseded_in_flight_count: Arc<AtomicU64>,
     runtime: SidecarRuntime,
     java_path: PathBuf,
     config: Arc<Mutex<Config>>,
@@ -101,7 +129,7 @@ impl Bridge {
             runtime,
             java_path
         );
-        let (request_tx, _request_rx) = mpsc::channel(32);
+        let (request_tx, _request_rx) = mpsc::channel::<QueuedMessage>(32);
         let (state_watch_tx, state_watch_rx) = watch::channel(SidecarState::Stopped);
 
         Self {
@@ -111,6 +139,9 @@ impl Bridge {
             request_id: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(Vec::new())),
             request_tx: Mutex::new(request_tx),
+            latest_supersession_seq: Arc::new(Mutex::new(HashMap::new())),
+            superseded_before_send_count: Arc::new(AtomicU64::new(0)),
+            superseded_in_flight_count: Arc::new(AtomicU64::new(0)),
             runtime,
             java_path,
             config: Arc::new(Mutex::new(config)),
@@ -143,7 +174,7 @@ impl Bridge {
     /// Starts the health check heartbeat for the sidecar.
     fn start_health_check(
         bridge: Arc<Bridge>,
-        request_tx: mpsc::Sender<Request>,
+        request_tx: mpsc::Sender<QueuedMessage>,
         request_id: &AtomicU64,
     ) {
         let state = Arc::clone(&bridge.state);
@@ -184,7 +215,7 @@ impl Bridge {
                             pending_requests.push(PendingRequest { id, response_tx });
                         }
 
-                        if request_tx.send(request).await.is_err() {
+                        if request_tx.send(QueuedMessage::Plain(request)).await.is_err() {
                             tracing::warn!("health check: request channel closed");
                             Self::set_state(&state, &state_watch_tx, SidecarState::Degraded).await;
                             should_restart = true;
@@ -404,7 +435,7 @@ impl Bridge {
         });
 
         // Create a new request channel for this sidecar instance
-        let (tx, mut rx) = mpsc::channel::<Request>(32);
+        let (tx, mut rx) = mpsc::channel::<QueuedMessage>(32);
 
         // Swap in the live sender so request()/notify()/shutdown() use it
         {
@@ -414,9 +445,23 @@ impl Bridge {
 
         let stdin = Arc::new(Mutex::new(stdin));
         let stdin_clone = Arc::clone(&stdin);
+        let writer_pending = Arc::clone(&self.pending);
+        let writer_supersession = Arc::clone(&self.latest_supersession_seq);
+        let writer_skip_count = Arc::clone(&self.superseded_before_send_count);
 
         tokio::spawn(async move {
-            while let Some(request) = rx.recv().await {
+            while let Some(message) = rx.recv().await {
+                let request = match Self::filter_queued_message(
+                    message,
+                    &writer_pending,
+                    &writer_supersession,
+                    &writer_skip_count,
+                )
+                .await
+                {
+                    Some(req) => req,
+                    None => continue, // dropped (superseded)
+                };
                 let mut writer = stdin_clone.lock().await;
                 if let Err(e) = jsonrpc::write_message(&mut writer, &request).await {
                     tracing::error!("failed to write to sidecar: {}", e);
@@ -445,7 +490,7 @@ impl Bridge {
             tracing::debug!("Added pending request with id {}", id);
         }
 
-        tx.send(request)
+        tx.send(QueuedMessage::Plain(request))
             .await
             .map_err(|_| BridgeError::Crashed("request channel closed".into()))?;
         tracing::debug!("initialize request sent to sidecar, waiting for response");
@@ -622,7 +667,7 @@ impl Bridge {
         self.request_tx
             .lock()
             .await
-            .send(request)
+            .send(QueuedMessage::Plain(request))
             .await
             .map_err(|_| BridgeError::Crashed("request channel closed".into()))?;
         let enqueue_send_ms = elapsed_ms(enqueue_start.elapsed());
@@ -649,6 +694,118 @@ impl Bridge {
         }
     }
 
+    /// Sends a request that may be superseded by a newer request for the same `bucket`.
+    ///
+    /// When this is called:
+    /// - The latest seq for `bucket` is bumped atomically; the new seq is `my_seq`.
+    /// - If a newer request arrives before this one is written to stdin, it is
+    ///   dropped from the writer queue and the response future resolves with
+    ///   [`BridgeError::Superseded`] with `stage = BeforeSend` — saving sidecar work.
+    /// - If a newer request arrives after this one's response was received but
+    ///   before `request_with_supersession` returns, the response is discarded
+    ///   and the function returns [`BridgeError::Superseded`] with `stage = InFlight`.
+    ///
+    /// This is used by the completion handler to avoid wasting sidecar CPU on
+    /// completions the user no longer cares about (typing burst → only the latest
+    /// position matters).
+    ///
+    /// Returns `(value, timing, my_seq)` on success.
+    pub async fn request_with_supersession(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+        bucket: &str,
+    ) -> Result<(Value, BridgeRequestTiming, u64), Error> {
+        let total_start = Instant::now();
+
+        let ready_start = Instant::now();
+        self.wait_for_ready(Duration::from_secs(30)).await?;
+        let ready_wait_ms = elapsed_ms(ready_start.elapsed());
+
+        let enqueue_start = Instant::now();
+        let id = self.next_id();
+        let request = Request::new(id, method, params);
+
+        // Bump the per-bucket seq; later registrations see a strictly greater seq.
+        let my_seq = {
+            let mut map = self.latest_supersession_seq.lock().await;
+            let entry = map.entry(bucket.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            pending.push(PendingRequest { id, response_tx });
+        }
+
+        let tag = SupersessionTag {
+            bucket: bucket.to_string(),
+            seq: my_seq,
+        };
+        self.request_tx
+            .lock()
+            .await
+            .send(QueuedMessage::Supersedable { request, tag })
+            .await
+            .map_err(|_| BridgeError::Crashed("request channel closed".into()))?;
+        let enqueue_send_ms = elapsed_ms(enqueue_start.elapsed());
+
+        let response_start = Instant::now();
+        let outcome = match time::timeout(timeout, response_rx).await {
+            Ok(Ok(result)) => {
+                let response_wait_ms = elapsed_ms(response_start.elapsed());
+                let total_ms = elapsed_ms(total_start.elapsed());
+                let timing = BridgeRequestTiming {
+                    ready_wait_ms,
+                    enqueue_send_ms,
+                    response_wait_ms,
+                    total_ms,
+                };
+                result.map(|value| (value, timing))
+            }
+            Ok(Err(_)) => Err(BridgeError::Crashed("response channel dropped".into()).into()),
+            Err(_) => Err(BridgeError::Timeout(timeout.as_millis() as u64).into()),
+        };
+
+        match outcome {
+            Ok((value, timing)) => {
+                // In-flight supersession: a newer request was registered while we
+                // were waiting for the sidecar response. The result is now stale.
+                let latest = {
+                    let map = self.latest_supersession_seq.lock().await;
+                    map.get(bucket).copied().unwrap_or(0)
+                };
+                if my_seq < latest {
+                    self.superseded_in_flight_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(BridgeError::Superseded {
+                        bucket: bucket.to_string(),
+                        my_seq,
+                        latest_seq: latest,
+                        stage: SupersededStage::InFlight,
+                    }
+                    .into())
+                } else {
+                    Ok((value, timing, my_seq))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Returns the number of requests skipped before stdin write due to supersession.
+    pub fn superseded_before_send_count(&self) -> u64 {
+        self.superseded_before_send_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of responses discarded after sidecar work due to supersession.
+    pub fn superseded_in_flight_count(&self) -> u64 {
+        self.superseded_in_flight_count.load(Ordering::Relaxed)
+    }
+
     /// Sends a JSON-RPC notification (no response expected).
     /// Waits for sidecar readiness before sending.
     pub async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), Error> {
@@ -659,7 +816,7 @@ impl Bridge {
         self.request_tx
             .lock()
             .await
-            .send(notification)
+            .send(QueuedMessage::Plain(notification))
             .await
             .map_err(|_| BridgeError::Crashed("request channel closed".into()))?;
         Ok(())
@@ -779,7 +936,11 @@ impl Bridge {
             .request_tx
             .lock()
             .await
-            .send(Request::new(self.next_id(), "shutdown", None))
+            .send(QueuedMessage::Plain(Request::new(
+                self.next_id(),
+                "shutdown",
+                None,
+            )))
             .await;
 
         Self::set_state(&self.state, &self.state_watch_tx, SidecarState::Stopped).await;
@@ -795,6 +956,56 @@ impl Bridge {
 
     fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Resolves a queued message for the writer task: returns `Some(Request)` to write
+    /// to stdin, or `None` if the request was superseded and should be dropped. When a
+    /// request is dropped, the matching pending entry is removed and resolved with
+    /// [`BridgeError::Superseded`] (`BeforeSend` stage), and the skip-count metric is
+    /// incremented.
+    async fn filter_queued_message(
+        message: QueuedMessage,
+        pending: &Mutex<Vec<PendingRequest>>,
+        latest_supersession_seq: &Mutex<HashMap<String, u64>>,
+        skip_count: &AtomicU64,
+    ) -> Option<Request> {
+        match message {
+            QueuedMessage::Plain(request) => Some(request),
+            QueuedMessage::Supersedable { request, tag } => {
+                let latest = {
+                    let map = latest_supersession_seq.lock().await;
+                    map.get(&tag.bucket).copied().unwrap_or(0)
+                };
+                if tag.seq >= latest {
+                    return Some(request);
+                }
+                let id_opt = request.id;
+                tracing::debug!(
+                    target: "completion_supersession",
+                    bucket = %tag.bucket,
+                    my_seq = tag.seq,
+                    latest_seq = latest,
+                    request_id = ?id_opt,
+                    "dropping superseded request before stdin write"
+                );
+                skip_count.fetch_add(1, Ordering::Relaxed);
+                if let Some(id) = id_opt {
+                    let mut pending = pending.lock().await;
+                    if let Some(pos) = pending.iter().position(|p| p.id == id) {
+                        let req = pending.remove(pos);
+                        let _ = req.response_tx.send(Err(Error::Bridge(
+                            BridgeError::Superseded {
+                                bucket: tag.bucket.clone(),
+                                my_seq: tag.seq,
+                                latest_seq: latest,
+                                stage: SupersededStage::BeforeSend,
+                            },
+                        )));
+                    }
+                }
+                None
+            }
+        }
     }
 
     async fn dispatch_response(pending: &Mutex<Vec<PendingRequest>>, response: Response) {
@@ -1017,5 +1228,221 @@ mod tests {
         );
 
         assert_eq!(bridge.runtime, runtime);
+    }
+
+    /// Helper: build the shared state (`pending`, `latest_supersession_seq`,
+    /// skip-counter) the writer task uses, plus a registered pending entry whose
+    /// response future is returned so a test can await its resolution.
+    async fn make_writer_state(
+        request_id: u64,
+    ) -> (
+        Arc<Mutex<Vec<PendingRequest>>>,
+        Arc<Mutex<HashMap<String, u64>>>,
+        Arc<AtomicU64>,
+        oneshot::Receiver<Result<Value, Error>>,
+    ) {
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let latest = Arc::new(Mutex::new(HashMap::new()));
+        let skip_count = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut p = pending.lock().await;
+            p.push(PendingRequest {
+                id: request_id,
+                response_tx: tx,
+            });
+        }
+        (pending, latest, skip_count, rx)
+    }
+
+    #[tokio::test]
+    async fn filter_passes_plain_messages_through() {
+        let (pending, latest, skip_count, _rx) = make_writer_state(1).await;
+        let msg = QueuedMessage::Plain(Request::new(1, "ping", None));
+
+        let result = Bridge::filter_queued_message(msg, &pending, &latest, &skip_count).await;
+
+        assert!(result.is_some(), "Plain messages should pass through");
+        assert_eq!(skip_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn filter_passes_supersedable_when_seq_is_latest() {
+        let (pending, latest, skip_count, _rx) = make_writer_state(7).await;
+        // Bucket has not yet been registered → latest defaults to 0; seq=1 is fresh.
+        let msg = QueuedMessage::Supersedable {
+            request: Request::new(7, "completion", None),
+            tag: SupersessionTag {
+                bucket: "file:///a.kt".into(),
+                seq: 1,
+            },
+        };
+
+        let result = Bridge::filter_queued_message(msg, &pending, &latest, &skip_count).await;
+
+        assert!(result.is_some(), "fresh supersedable should be written");
+        assert_eq!(skip_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn filter_drops_superseded_request_and_resolves_pending_with_error() {
+        let (pending, latest, skip_count, rx) = make_writer_state(42).await;
+        // Simulate a newer registration arriving before the writer drained the queue.
+        {
+            let mut map = latest.lock().await;
+            map.insert("file:///a.kt".into(), 5);
+        }
+        let msg = QueuedMessage::Supersedable {
+            request: Request::new(42, "completion", None),
+            tag: SupersessionTag {
+                bucket: "file:///a.kt".into(),
+                seq: 3,
+            },
+        };
+
+        let result = Bridge::filter_queued_message(msg, &pending, &latest, &skip_count).await;
+
+        assert!(result.is_none(), "superseded message should be dropped");
+        assert_eq!(skip_count.load(Ordering::Relaxed), 1);
+        assert!(
+            pending.lock().await.is_empty(),
+            "pending entry should have been removed"
+        );
+
+        let received = rx.await.expect("response_tx was dropped without sending");
+        match received {
+            Err(Error::Bridge(BridgeError::Superseded {
+                bucket,
+                my_seq,
+                latest_seq,
+                stage,
+            })) => {
+                assert_eq!(bucket, "file:///a.kt");
+                assert_eq!(my_seq, 3);
+                assert_eq!(latest_seq, 5);
+                assert_eq!(stage, SupersededStage::BeforeSend);
+            }
+            other => panic!("expected BridgeError::Superseded BeforeSend, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn filter_does_not_drop_when_other_bucket_advances() {
+        let (pending, latest, skip_count, _rx) = make_writer_state(9).await;
+        // A different bucket has a higher seq — must not affect this request.
+        {
+            let mut map = latest.lock().await;
+            map.insert("file:///other.kt".into(), 99);
+        }
+        let msg = QueuedMessage::Supersedable {
+            request: Request::new(9, "completion", None),
+            tag: SupersessionTag {
+                bucket: "file:///a.kt".into(),
+                seq: 1,
+            },
+        };
+
+        let result = Bridge::filter_queued_message(msg, &pending, &latest, &skip_count).await;
+
+        assert!(
+            result.is_some(),
+            "supersession is per-bucket; other buckets should not drop us"
+        );
+        assert_eq!(skip_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn filter_drops_typing_burst_keeping_only_latest() {
+        // Simulate the user-visible scenario: 3 completions queued for the same
+        // file. Only the newest should reach stdin; the other two are dropped
+        // and their pending oneshots resolve with Superseded.
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let latest = Arc::new(Mutex::new(HashMap::new()));
+        let skip_count = Arc::new(AtomicU64::new(0));
+        let bucket = "file:///burst.kt".to_string();
+
+        let mut receivers = Vec::new();
+        for (id, seq) in [(1u64, 1u64), (2, 2), (3, 3)] {
+            let (tx, rx) = oneshot::channel();
+            pending.lock().await.push(PendingRequest {
+                id,
+                response_tx: tx,
+            });
+            receivers.push((id, seq, rx));
+            // Register the seq globally as if `request_with_supersession` had run.
+            latest
+                .lock()
+                .await
+                .insert(bucket.clone(), seq);
+        }
+
+        // Now the writer drains the channel in FIFO order.
+        let mut wrote_to_stdin = Vec::new();
+        for (id, seq, _) in &receivers {
+            let msg = QueuedMessage::Supersedable {
+                request: Request::new(*id, "completion", None),
+                tag: SupersessionTag {
+                    bucket: bucket.clone(),
+                    seq: *seq,
+                },
+            };
+            if let Some(req) =
+                Bridge::filter_queued_message(msg, &pending, &latest, &skip_count).await
+            {
+                wrote_to_stdin.push(req.id.unwrap());
+            }
+        }
+
+        assert_eq!(
+            wrote_to_stdin,
+            vec![3],
+            "only the newest completion should be written to stdin"
+        );
+        assert_eq!(skip_count.load(Ordering::Relaxed), 2);
+
+        // The two older requests' response futures must resolve with Superseded.
+        for (id, seq, rx) in receivers.into_iter().take(2) {
+            let received = rx.await.expect("dropped response_tx");
+            match received {
+                Err(Error::Bridge(BridgeError::Superseded {
+                    my_seq, latest_seq, stage, ..
+                })) => {
+                    assert_eq!(my_seq, seq, "request id={} should report its own seq", id);
+                    assert_eq!(latest_seq, 3);
+                    assert_eq!(stage, SupersededStage::BeforeSend);
+                }
+                other => panic!("request {} expected Superseded, got {:?}", id, other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_with_supersession_assigns_strictly_increasing_seq_per_bucket() {
+        let (bridge, _rx) = test_bridge();
+        // Bump twice for the same bucket; second seq must be greater.
+        let bucket = "file:///a.kt";
+        let first = {
+            let mut map = bridge.latest_supersession_seq.lock().await;
+            let entry = map.entry(bucket.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        let second = {
+            let mut map = bridge.latest_supersession_seq.lock().await;
+            let entry = map.entry(bucket.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+
+        // Different bucket starts independently.
+        let other = {
+            let mut map = bridge.latest_supersession_seq.lock().await;
+            let entry = map.entry("file:///b.kt".to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        assert_eq!(other, 1);
     }
 }

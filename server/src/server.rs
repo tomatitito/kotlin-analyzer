@@ -19,6 +19,7 @@ use tower_lsp::lsp_types;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::bridge::{Bridge, SidecarNotification, SidecarState};
+use crate::error::{BridgeError, Error};
 use crate::config::{Config, FormattingTool};
 use crate::project;
 use crate::runtime;
@@ -499,10 +500,20 @@ impl KotlinLanguageServer {
         self.interactive_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn completion_metrics_enabled() -> bool {
-        std::env::var("KOTLIN_ANALYZER_COMPLETION_METRICS")
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
+    async fn completion_metrics_enabled(&self) -> bool {
+        let enabled_by_env = std::env::var("KOTLIN_ANALYZER_COMPLETION_METRICS")
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        if enabled_by_env {
+            return true;
+        }
+
+        self.config.lock().await.completion_metrics
     }
 
     fn next_completion_correlation_id(&self) -> String {
@@ -1994,7 +2005,7 @@ impl LanguageServer for KotlinLanguageServer {
         let request_received_at = Instant::now();
         self.note_interactive_request();
         let correlation_id = self.next_completion_correlation_id();
-        let metrics_enabled = Self::completion_metrics_enabled();
+        let metrics_enabled = self.completion_metrics_enabled().await;
 
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
@@ -2020,7 +2031,7 @@ impl LanguageServer for KotlinLanguageServer {
 
         let bridge_request_start = Instant::now();
         let result = bridge
-            .request_with_timeout_timed(
+            .request_with_supersession(
                 "completion",
                 Some(serde_json::json!({
                     "uri": uri.as_str(),
@@ -2035,11 +2046,12 @@ impl LanguageServer for KotlinLanguageServer {
                         .unwrap_or_default(),
                 })),
                 Duration::from_secs(60),
+                uri.as_str(),
             )
             .await;
 
         match result {
-            Ok((result, bridge_timing)) => {
+            Ok((result, bridge_timing, my_seq)) => {
                 let conversion_start = Instant::now();
                 let items = self.parse_completion_items(&result);
                 let conversion_ms = conversion_start.elapsed().as_secs_f64() * 1000.0;
@@ -2060,6 +2072,9 @@ impl LanguageServer for KotlinLanguageServer {
                         bridge_total_ms = bridge_timing.total_ms,
                         response_conversion_ms = conversion_ms,
                         rust_total_ms = request_received_at.elapsed().as_secs_f64() * 1000.0,
+                        supersession_seq = my_seq,
+                        superseded_before_send_total = bridge.superseded_before_send_count(),
+                        superseded_in_flight_total = bridge.superseded_in_flight_count(),
                         sidecar = %sidecar_metrics,
                         "completion timing"
                     );
@@ -2078,6 +2093,35 @@ impl LanguageServer for KotlinLanguageServer {
                     );
                 }
                 Ok(Some(CompletionResponse::Array(items)))
+            }
+            Err(Error::Bridge(BridgeError::Superseded {
+                bucket,
+                my_seq,
+                latest_seq,
+                stage,
+            })) => {
+                if metrics_enabled {
+                    tracing::info!(
+                        target: "completion_metrics",
+                        correlation_id = %correlation_id,
+                        uri = %uri,
+                        bucket = %bucket,
+                        supersession_seq = my_seq,
+                        latest_seq,
+                        stage = ?stage,
+                        rust_total_ms = request_received_at.elapsed().as_secs_f64() * 1000.0,
+                        superseded_before_send_total = bridge.superseded_before_send_count(),
+                        superseded_in_flight_total = bridge.superseded_in_flight_count(),
+                        "completion superseded"
+                    );
+                }
+                tracing::debug!(
+                    "completion superseded: stage={:?} my_seq={} latest_seq={}",
+                    stage,
+                    my_seq,
+                    latest_seq,
+                );
+                Ok(None)
             }
             Err(e) => {
                 if metrics_enabled {

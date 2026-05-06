@@ -10,6 +10,7 @@ pub struct Config {
     pub formatting_path: Option<String>,
     pub sidecar_max_memory: String,
     pub trace_server: TraceLevel,
+    pub completion_metrics: bool,
 }
 
 impl Default for Config {
@@ -22,6 +23,7 @@ impl Default for Config {
             formatting_path: None,
             sidecar_max_memory: "512m".into(),
             trace_server: TraceLevel::Off,
+            completion_metrics: false,
         }
     }
 }
@@ -77,7 +79,8 @@ mod tests {
             "formattingTool": "ktlint",
             "formattingStyle": "android",
             "sidecarMaxMemory": "1g",
-            "traceServer": "verbose"
+            "traceServer": "verbose",
+            "completionMetrics": true
         }"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.java_home, Some("/usr/lib/jvm/java-17".into()));
@@ -86,6 +89,7 @@ mod tests {
         assert_eq!(config.formatting_style, "android");
         assert_eq!(config.sidecar_max_memory, "1g");
         assert_eq!(config.trace_server, TraceLevel::Verbose);
+        assert!(config.completion_metrics);
     }
 
     #[test]

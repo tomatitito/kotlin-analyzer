@@ -150,16 +150,90 @@ bridge maps between the two to support cancellation and response routing.
 ## 4. Backpressure
 
 Outbound requests from Rust to the JVM flow through a bounded `tokio::sync::mpsc`
-channel. When the channel is full, the bridge applies supersession: it drops the
-oldest pending request of the same method type.
+channel with a small fixed capacity (32). This provides natural backpressure without
+blocking the Rust process: if the channel fills, the calling handler awaits room.
 
-For example, if a new `completion` request arrives while an older `completion` request
-is still queued, the older one is removed and its corresponding LSP request receives a
-`RequestCancelled` error. This prevents a slow JVM from creating unbounded request
-queues while keeping the LSP event loop responsive.
+Completion requests additionally use **latest-wins supersession** (section 4.1) so
+that typing-burst behavior in the editor does not pile stale work on the sidecar.
 
-The channel capacity is set to a small fixed value (e.g., 32). This provides natural
-backpressure without blocking the Rust process.
+### 4.1 Latest-Wins Supersession (Completion)
+
+Zed (and other editors) often emit several `textDocument/completion` requests in rapid
+succession during typing — one per keystroke. Without intervention, the sidecar
+processes them one by one and the popup the user actually wants waits behind older
+requests for cursor positions they've already typed past. Real-project measurements
+showed `bridge_response_wait_ms` of 1300–1500 ms during typing bursts, dominated by
+the queue, not by the sidecar's own completion work.
+
+The bridge addresses this with a per-URI supersession sequence. When the LSP completion
+handler calls `bridge.request_with_supersession(uri, ...)`:
+
+1. The bridge atomically bumps `latest_seq[uri]` and assigns this request `my_seq`.
+2. The request is registered in the pending map and pushed onto the writer task's
+   channel as a `QueuedMessage::Supersedable`.
+
+The request then has to pass two checkpoints to be returned to the editor:
+
+#### Checkpoint 1 — `BeforeSend`
+
+The writer task pulls the message off the channel and re-checks `latest_seq[uri]` just
+before writing to the sidecar's stdin. If `my_seq < latest_seq[uri]` (a newer request
+has been registered while this one was sitting in the channel), the writer drops the
+message. The pending oneshot resolves with `BridgeError::Superseded { stage: BeforeSend }`,
+the LSP handler returns `Ok(None)`, and the counter `superseded_before_send` increments.
+**The sidecar never sees this request — full sidecar CPU is saved.**
+
+#### Checkpoint 2 — `InFlight`
+
+If the writer wins the race and writes to stdin, the sidecar processes the request
+(typically 50–170 ms of analysis work). When the response arrives, the bridge re-checks
+`latest_seq[uri]` one more time. If `my_seq < latest_seq[uri]` (a newer request was
+issued while we were waiting for the sidecar), the response is discarded and the bridge
+returns `BridgeError::Superseded { stage: InFlight }`. The LSP handler returns
+`Ok(None)`, and `superseded_in_flight` increments. **The sidecar already paid the
+CPU cost, but the user is spared seeing stale completion items.**
+
+#### Summary
+
+| Stage | What got saved |
+|-------|---------------|
+| `BeforeSend` | Sidecar CPU + user-visible latency |
+| `InFlight` | User-visible latency only (sidecar already did the work) |
+
+#### The invariant
+
+For a tight burst of N completions on the same URI (each request issued before the
+previous returned), exactly **one** request — the latest, with `my_seq == N == latest_seq[uri]`
+— passes both checkpoints and returns items. The other **N-1** are caught at one of
+the two checkpoints:
+
+```
+superseded_before_send + superseded_in_flight = N - 1
+```
+
+The split between the two stages depends on timing — fast writer drains the channel
+between requests so older ones reach the sidecar (caught at `InFlight`); slow writer
+keeps multiple requests queued so the supersession check in the writer drops them
+(caught at `BeforeSend`). Real-project measurement under tight bursts (5 ms inter-request
+gap) saw all supersessions land in `InFlight` because the writer task is fast enough
+to drain between each request. This is fine — the user-visible latency improvement
+is identical (the latest request returns in ~100 ms instead of waiting ~1.3 s behind
+stale work).
+
+#### Scope
+
+Latest-wins is currently scoped to `completion` requests; other methods (`hover`,
+`definition`, `references`, etc.) use plain queueing through `bridge.request()`. The
+"bucket" that defines what supersedes what is the URI — supersession is per-document,
+so a typing burst in `Foo.kt` does not affect a completion request in `Bar.kt`.
+
+#### Observability
+
+When `completionMetrics` is enabled, every completion request — including superseded
+ones — emits a structured log under `target=completion_metrics` with `supersession_seq`,
+`superseded_before_send_total`, and `superseded_in_flight_total`. This makes the
+supersession effect directly visible in `KOTLIN_ANALYZER_COMPLETION_METRICS=1` runs
+and is what the `completion-burst` sensor (ka-g342) consumes.
 
 ## 5. Cancellation
 
@@ -276,23 +350,25 @@ Configuration is received via `workspace/didChangeConfiguration` and the
 
 ```json
 {
-  "kotlin.javaHome": "/path/to/jdk",
-  "kotlin.compiler.flags": ["-Xcontext-parameters"],
-  "kotlin.formatting.tool": "ktfmt",
-  "kotlin.formatting.style": "google",
-  "kotlin.sidecar.maxMemory": "512m",
-  "kotlin.trace.server": "verbose"
+  "javaHome": "/path/to/jdk",
+  "compilerFlags": ["-Xcontext-parameters"],
+  "formattingTool": "ktfmt",
+  "formattingStyle": "google",
+  "sidecarMaxMemory": "512m",
+  "traceServer": "verbose",
+  "completionMetrics": true
 }
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `kotlin.javaHome` | `string` | `$JAVA_HOME` | Path to the JDK used for the sidecar and for resolving JDK classes. |
-| `kotlin.compiler.flags` | `string[]` | `[]` | Additional compiler flags passed to `KotlinCoreEnvironment`. Typically extracted automatically from `build.gradle.kts`, but can be overridden here. |
-| `kotlin.formatting.tool` | `string` | `"ktfmt"` | Formatting backend: `"ktfmt"` or `"ktlint"`. |
-| `kotlin.formatting.style` | `string` | `"google"` | Formatting style (ktfmt: `"google"`, `"kotlinlang"`, `"meta"`; ktlint: `"standard"`, `"android"`). |
-| `kotlin.sidecar.maxMemory` | `string` | `"512m"` | Maximum heap size for the JVM sidecar (`-Xmx` flag). |
-| `kotlin.trace.server` | `string` | `"off"` | Log verbosity: `"off"`, `"messages"` (INFO), `"verbose"` (TRACE with full JSON-RPC bodies). |
+| `javaHome` | `string` | `$JAVA_HOME` | Path to the JDK used for the sidecar and for resolving JDK classes. |
+| `compilerFlags` | `string[]` | `[]` | Additional compiler flags passed to `KotlinCoreEnvironment`. Typically extracted automatically from `build.gradle.kts`, but can be overridden here. |
+| `formattingTool` | `string` | `"ktfmt"` | Formatting backend: `"ktfmt"` or `"ktlint"`. |
+| `formattingStyle` | `string` | `"google"` | Formatting style (ktfmt: `"google"`, `"kotlinlang"`, `"meta"`; ktlint: `"standard"`, `"android"`). |
+| `sidecarMaxMemory` | `string` | `"512m"` | Maximum heap size for the JVM sidecar (`-Xmx` flag). |
+| `traceServer` | `string` | `"off"` | Log verbosity: `"off"`, `"messages"` (INFO), `"verbose"` (TRACE with full JSON-RPC bodies). |
+| `completionMetrics` | `boolean` | `false` | Emit structured completion timing logs for real-project profiling. |
 
 The configuration struct uses `serde` with `#[serde(default)]` to provide sensible
 defaults:
@@ -307,6 +383,7 @@ pub struct Config {
     pub formatting_style: String,
     pub sidecar_max_memory: String,
     pub trace_server: TraceLevel,
+    pub completion_metrics: bool,
 }
 
 impl Default for Config {
@@ -318,6 +395,7 @@ impl Default for Config {
             formatting_style: "google".into(),
             sidecar_max_memory: "512m".into(),
             trace_server: TraceLevel::Off,
+            completion_metrics: false,
         }
     }
 }

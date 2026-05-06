@@ -31,6 +31,23 @@ pub enum BridgeError {
 
     #[error("spawn failed: {0}")]
     SpawnFailed(String),
+
+    #[error("request superseded by newer request for bucket={bucket} (my_seq={my_seq}, latest_seq={latest_seq}, stage={stage:?})")]
+    Superseded {
+        bucket: String,
+        my_seq: u64,
+        latest_seq: u64,
+        stage: SupersededStage,
+    },
+}
+
+/// Where the supersession was detected — useful for metrics and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersededStage {
+    /// Detected before the request was written to the sidecar; sidecar work skipped entirely.
+    BeforeSend,
+    /// Detected after the sidecar response arrived; the result is discarded.
+    InFlight,
 }
 
 #[derive(Debug, Error)]
