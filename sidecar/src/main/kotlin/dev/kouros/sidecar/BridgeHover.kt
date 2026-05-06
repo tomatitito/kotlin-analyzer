@@ -18,20 +18,7 @@ import org.jetbrains.kotlin.types.Variance
 
 internal fun BridgeContext.hover(uri: String, line: Int, character: Int): JsonObject {
     val perfStart = System.currentTimeMillis()
-    var result = hoverOnce(uri, line, character)
-
-    if (!result.has("contents") && sessionDirty) {
-        val currentReason = result.get("reason")?.asString ?: "no explicit reason"
-        System.err.println("CompilerBridge: hover($uri) — retrying after rebuild (reason=$currentReason)")
-        try {
-            ensureSessionCurrent()
-            result = hoverOnce(uri, line, character)
-        } catch (e: Throwable) {
-            val retryFailure = JsonObject()
-            retryFailure.addProperty("reason", "hover retry failed: ${e.javaClass.name}: ${e.message}")
-            result = retryFailure
-        }
-    }
+    val result = hoverOnce(uri, line, character)
 
     System.err.println("[PERF] method=hover uri=$uri elapsed=${System.currentTimeMillis() - perfStart}ms")
     return result

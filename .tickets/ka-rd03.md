@@ -1,6 +1,6 @@
 ---
 id: ka-rd03
-status: open
+status: in_progress
 deps: [ka-rd02, ka-rw1x]
 links: [ka-kyvv]
 created: 2026-05-05T20:32:00Z
@@ -140,3 +140,15 @@ Refinement: the prototype should follow the Kotlin LSP / Analysis API dangling-f
 **2026-05-06T05:28:29Z**
 
 Decision refinement: default to `KaDanglingFileResolutionMode.IGNORE_SELF`; keep `PREFER_SELF` easy to test but do not implement automatic dual-mode behavior unless needed. Do not require removing the PSI validation bypass for this prototype. Fallback should be quiet by default and visible through metrics. Keep benchmark validation fixture-local; `ka-j4dc` owns real-project execution. Add direct no-rebuild assertions using completion metrics where practical.
+
+**2026-05-06T05:34:40Z**
+
+Implemented completion-only dangling PSI prototype: existing session files with changed editor text now use KtPsiFactory.createFile, originalFile/contextModule, and analyzeCopy with KaDanglingFileResolutionMode.IGNORE_SELF. Completion metrics expose completionFileMode, danglingAnalysisMode, danglingFallback, and fallback reason. Fallback remains the existing findKtFile/LightVirtualFile path, quiet unless metrics are enabled/requested. The existing PSI validation bypass remains enabled; docs/sidecar-file-session-lifecycle.md records this limitation.
+
+**2026-05-06T05:36:29Z**
+
+Fixture-local completion sensor run: cd sidecar && ./gradlew benchmark --args='--warmups 1 --iterations 2 --jsonl-output build/ka-rd03-completion-sensor.jsonl'. After-edit scenario reported counts.sessionRebuilt=0, counts.danglingFallback=0, no session_refresh stage, fields.completionFileMode=existing_session_source_with_editor_overlay, fields.danglingAnalysisMode=IGNORE_SELF, and dangling_analysis_api_analyze_copy_block around 3.3-3.6ms. Gradle task succeeded; IntelliJ background executor still emitted the existing kotlinx.coroutines.internal.intellij.IntellijCoroutines classpath warning during benchmark startup.
+
+**2026-05-06T05:37:54Z**
+
+Final verification after adding explicit dangling_file_creation timing: cd sidecar && ./gradlew test passed. Benchmark JSONL now retains fields and after-edit samples still show sessionRebuilt=0, danglingFallback=0, completionFileMode=existing_session_source_with_editor_overlay, danglingAnalysisMode=IGNORE_SELF, dangling_file_creation stage, dangling_analysis_api_analyze_copy_block stage, and no session_refresh stage.

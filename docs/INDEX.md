@@ -10,6 +10,9 @@ The project also includes a Zed extension (Rust/WASM) that registers Kotlin lang
 |----------|-------------|
 | [Architecture](architecture.md) | Rust + JVM sidecar design, process lifecycle, state machine, shutdown/restart, error handling, logging |
 | [Compiler Integration](compiler-integration.md) | Analysis API (K2/FIR), compiler flag extraction, incremental analysis, Compose/KAPT/KSP, Java interop, memory estimates |
+| [Language Server Performance Research](language-server-performance-research.md) | Kotlin LSP and rust-analyzer research behind the sidecar file/session lifecycle redesign |
+| [Sidecar File and Session Lifecycle](sidecar-file-session-lifecycle.md) | Intended editor-text, PSI, shadow-root, session freshness, rebuild, and diagnostics lifecycle model |
+| [Sensors](sensors.md) | Runnable observability probes, intended `sensors run` UX, table output, and raw result model |
 | [LSP Protocol](lsp-protocol.md) | LSP framework choice, feature phases, bridge protocol schema, backpressure, cancellation, document sync, configuration |
 | [Command Code Actions](command-code-actions.md) | Analyzer-owned command contract for command-bearing code actions |
 | [Distribution](distribution.md) | Cross-platform builds, JVM requirement, JAR bundling, Zed extension packaging, CI/CD pipeline |

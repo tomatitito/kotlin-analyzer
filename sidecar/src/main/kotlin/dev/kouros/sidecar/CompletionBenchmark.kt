@@ -62,6 +62,7 @@ private data class ScenarioSample(
     val itemCount: Int,
     val counts: Map<String, Int>,
     val stagesMs: Map<String, Double>,
+    val fields: Map<String, String>,
 )
 
 fun main(args: Array<String>) {
@@ -233,6 +234,7 @@ private fun runScenario(
             itemCount = result.getAsJsonArray("items")?.size() ?: 0,
             counts = result.getAsJsonObject("metrics")?.getAsJsonObject("counts")?.intMap().orEmpty(),
             stagesMs = result.getAsJsonObject("metrics")?.getAsJsonObject("stages")?.doubleMap().orEmpty(),
+            fields = result.getAsJsonObject("metrics")?.getAsJsonObject("fields")?.stringMap().orEmpty(),
         )
         samples += sample
         rawOutput?.appendText(Gson().toJson(sample) + "\n")
@@ -259,7 +261,10 @@ private fun runScenario(
         avgMs = elapsed.average(),
         p95Ms = percentile(sorted, 0.95),
         maxMs = sorted.last(),
-        sidecarAvgMs = samples.mapNotNull { it.stagesMs["analysis_api_analyze_block"] }.averageOrZero(),
+        sidecarAvgMs = samples.mapNotNull {
+            it.stagesMs["analysis_api_analyze_block"]
+                ?: it.stagesMs["dangling_analysis_api_analyze_copy_block"]
+        }.averageOrZero(),
         stageAveragesMs = stageAverages,
     )
 }
@@ -347,6 +352,9 @@ private fun JsonObject.intMap(): Map<String, Int> =
 
 private fun JsonObject.doubleMap(): Map<String, Double> =
     entrySet().associate { it.key to it.value.asDouble }
+
+private fun JsonObject.stringMap(): Map<String, String> =
+    entrySet().associate { it.key to it.value.asString }
 
 private fun List<Double>.averageOrZero(): Double =
     if (isEmpty()) 0.0 else average()

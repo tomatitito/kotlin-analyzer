@@ -1,6 +1,6 @@
 ---
 id: ka-kyvv
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-05T15:25:25Z
