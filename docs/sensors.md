@@ -95,6 +95,14 @@ KOTLIN_ANALYZER_COMPLETION_METRICS=1 cargo run -- --log-level info
 
 When enabled, each Rust completion request sends a correlation id to the sidecar. Rust logs include request receipt, document lookup, bridge enqueue/send, bridge response wait, response conversion, and total timing. Sidecar metrics include dispatch/queue timing when observable plus completion implementation stages and candidate counts.
 
+### Per-session metrics log files (ka-wkai)
+
+When `KOTLIN_ANALYZER_COMPLETION_METRICS=1` is set (the Zed extension exports it automatically when `completionMetrics: true` is in LSP settings), the LSP server writes the structured `target=completion_metrics` lines to a fresh per-session file under `<kotlin-analyzer-repo>/logs/`. Each file is named `kotlin-analyzer-<UTC-timestamp>.log` (`YYYY-MM-DDTHH-MM-SSZ`) so that runs sort chronologically and survive across sessions for perf-history review.
+
+- Only the `completion_metrics` target lands in the file. General LSP logs continue to go to stderr (or the `--log-file` path, if any).
+- The repo root is discovered by canonicalising the running binary's path and walking upward until a directory containing `extension.toml` is found. Release artefacts installed outside the source tree silently skip file creation; the server keeps running and structured metrics still appear on stderr.
+- Files accumulate; there is no automatic rotation. The `logs/` directory is committed to git (via `.gitkeep`) so the perf history is visible in PRs.
+
 ## Output Model
 
 Sensors should produce two layers of output:

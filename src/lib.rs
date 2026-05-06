@@ -69,13 +69,7 @@ impl zed::Extension for KotlinAnalyzerExtension {
         if completion_metrics {
             Self::set_env_var(&mut env, COMPLETION_METRICS_ENV, "1");
         }
-        let log_file = "/tmp/kotlin-analyzer-server.log";
-        let base_args = vec![
-            "--log-level".into(),
-            "info".into(),
-            "--log-file".into(),
-            log_file.into(),
-        ];
+        let base_args = vec!["--log-level".into(), "info".into()];
 
         eprintln!(
             "kotlin-analyzer: PATH visible to extension: {}",
