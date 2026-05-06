@@ -76,7 +76,8 @@ Configure via Zed's settings (`settings.json`):
         "formattingTool": "ktfmt",
         "formattingStyle": "google",
         "formattingPath": "/path/to/ktfmt",
-        "sidecarMaxMemory": "512m"
+        "sidecarMaxMemory": "512m",
+        "completionMetrics": false
       }
     }
   }
@@ -93,6 +94,7 @@ Configure via Zed's settings (`settings.json`):
 | `formattingStyle` | `string` | `"google"` | Formatting style (ktfmt: `"google"`, `"kotlinlang"`, `"meta"`) |
 | `formattingPath` | `string` | PATH lookup | Custom path to formatter binary |
 | `sidecarMaxMemory` | `string` | `"512m"` | JVM max heap size for the analysis sidecar |
+| `completionMetrics` | `boolean` | `false` | Emit structured completion timing logs from Rust and the JVM sidecar |
 
 ### Manual Project Configuration
 

@@ -1,5 +1,7 @@
 use zed_extension_api::{self as zed, LanguageServerId, Result};
 
+const COMPLETION_METRICS_ENV: &str = "KOTLIN_ANALYZER_COMPLETION_METRICS";
+
 struct KotlinAnalyzerExtension {
     cached_binary_path: Option<String>,
 }
@@ -17,6 +19,30 @@ impl KotlinAnalyzerExtension {
         (e.g. ~/.local/bin/kotlin-analyzer) or build from source with: \
         cargo build && ln -sf $(pwd)/server/target/debug/kotlin-analyzer ~/.local/bin/"
             .into()
+    }
+
+    fn lsp_settings(worktree: &zed::Worktree) -> Option<zed::serde_json::Value> {
+        zed::settings::LspSettings::for_worktree("kotlin-analyzer", worktree)
+            .ok()
+            .and_then(|s| s.settings)
+    }
+
+    fn completion_metrics_requested(worktree: &zed::Worktree) -> bool {
+        Self::lsp_settings(worktree)
+            .and_then(|settings| {
+                settings
+                    .get("completionMetrics")
+                    .and_then(|value| value.as_bool())
+            })
+            .unwrap_or(false)
+    }
+
+    fn set_env_var(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+        if let Some((_, existing)) = env.iter_mut().find(|(k, _)| k == key) {
+            *existing = value.into();
+        } else {
+            env.push((key.into(), value.into()));
+        }
     }
 }
 
@@ -38,7 +64,11 @@ impl zed::Extension for KotlinAnalyzerExtension {
             zed::LanguageServerInstallationStatus::CheckingForUpdate,
         );
 
-        let env = worktree.shell_env();
+        let mut env = worktree.shell_env();
+        let completion_metrics = Self::completion_metrics_requested(worktree);
+        if completion_metrics {
+            Self::set_env_var(&mut env, COMPLETION_METRICS_ENV, "1");
+        }
         let log_file = "/tmp/kotlin-analyzer-server.log";
         let base_args = vec![
             "--log-level".into(),
@@ -53,6 +83,14 @@ impl zed::Extension for KotlinAnalyzerExtension {
                 .find(|(k, _)| k == "PATH")
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("<not set>")
+        );
+        eprintln!(
+            "kotlin-analyzer: completion metrics {}",
+            if completion_metrics {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
 
         // 1) Check if kotlin-analyzer is on PATH (dev override or system install).
@@ -118,11 +156,7 @@ impl zed::Extension for KotlinAnalyzerExtension {
         _server_id: &LanguageServerId,
         worktree: &zed::Worktree,
     ) -> Result<Option<zed::serde_json::Value>> {
-        let settings = zed::settings::LspSettings::for_worktree("kotlin-analyzer", worktree)
-            .ok()
-            .and_then(|s| s.settings);
-
-        Ok(settings)
+        Ok(Self::lsp_settings(worktree))
     }
 }
 
