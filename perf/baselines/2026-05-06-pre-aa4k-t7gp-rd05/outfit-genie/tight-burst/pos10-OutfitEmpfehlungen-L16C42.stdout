@@ -1,0 +1,9 @@
+Scenario        N bursts latest_p50 latest_p95 bf_send in_flight  sc_queue_p95 sc_compute_p95
+tight-burst     5     10       5.3ms       8.9ms       0        34         4.9ms          4.1ms
+
+
+Scenario tight-burst — bursts=10 burst_size=5 latest_count=10
+  latest latency  min=3.5ms  avg=5.8ms  p50=5.3ms  p95=8.9ms  max=8.9ms
+  supersession  BeforeSend=0  InFlight=34
+  sidecar_queue_wait  p50=1.6ms  p95=4.9ms
+  sidecar_compute     p50=3.0ms  p95=4.1ms

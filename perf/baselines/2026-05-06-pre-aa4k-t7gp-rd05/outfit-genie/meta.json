@@ -1,0 +1,16 @@
+{
+    "tag": "2026-05-06-pre-aa4k-t7gp-rd05",
+    "project_name": "outfit-genie",
+    "project_root": "/Volumes/sourcecode/meta-breuninger/entdecken/reco/outfit-genie",
+    "project_git_sha": "e0f9074d883cb8a19262521bada3047a2cb6edaf",
+    "kotlin_analyzer_git_sha": "1ed8397d01c49d03fc21fd083621d24d33dd735c",
+    "kotlin_analyzer_dirty_files": 3,
+    "positions_count": 12,
+    "positions_seed": "kotlin-analyzer-perf-baseline",
+    "burst_count": 10,
+    "warmup_bursts": 1,
+    "scenarios": ["tight-burst", "medium-burst", "loose-burst"],
+    "host": "MCBK0468",
+    "os": "Darwin-25.4.0",
+    "ran_at_utc": "2026-05-06T19:42:58Z"
+}

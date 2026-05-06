@@ -1,0 +1,4 @@
+[completion-burst] using LSP binary /Volumes/sourcecode/personal/kotlin-analyzer/server/target/release/kotlin-analyzer
+[completion-burst] scenario=medium-burst burst_size=5 burst_count=10 inter_request_gap_ms=25 inter_burst_gap_ms=2000 warmup_bursts=1
+[completion-burst] readiness warmup latency=103.5ms
+[completion-burst] wrote 10 per-burst records to /Volumes/sourcecode/personal/kotlin-analyzer/perf/baselines/2026-05-06-pre-aa4k-t7gp-rd05/outfit-genie/medium-burst/pos10-OutfitEmpfehlungen-L16C42.jsonl
