@@ -1,6 +1,6 @@
 ---
 id: ka-rd03
-status: in_progress
+status: closed
 deps: [ka-rd02, ka-rw1x]
 links: [ka-kyvv]
 created: 2026-05-05T20:32:00Z
@@ -152,3 +152,7 @@ Fixture-local completion sensor run: cd sidecar && ./gradlew benchmark --args='-
 **2026-05-06T05:37:54Z**
 
 Final verification after adding explicit dangling_file_creation timing: cd sidecar && ./gradlew test passed. Benchmark JSONL now retains fields and after-edit samples still show sessionRebuilt=0, danglingFallback=0, completionFileMode=existing_session_source_with_editor_overlay, danglingAnalysisMode=IGNORE_SELF, dangling_file_creation stage, dangling_analysis_api_analyze_copy_block stage, and no session_refresh stage.
+
+**2026-05-06T09:07:21Z**
+
+Close audit: current code satisfies the completion-only dangling PSI prototype. Evidence: BridgeContext.selectKtFileForCompletion classifies existing overlays, new virtual files, and missing/no-session; existing source overlays use KtPsiFactory.createFile with originalFile/contextModule and BridgeCompletion analyzes them with analyzeCopy using KaDanglingFileResolutionMode.IGNORE_SELF. Completion metrics expose completionFileMode, psiValidationBypass, danglingAnalysisMode, sessionRebuilt, danglingFallback, and fallback reason. Tests cover after-edit local completion with sessionRebuilt=0/no session_refresh, edited member completion, import/scope completion, stale disk avoidance, new virtual file classification, duplicate label guard, and PSI validation bypass disabled. Verification run: cd sidecar && ./gradlew test --tests dev.kouros.sidecar.CompilerBridgeIntegrationTest; cd sidecar && ./gradlew benchmark --args='--warmups 1 --iterations 2 --jsonl-output build/ka-rd03-close-audit-completion-sensor.jsonl'; cd sidecar && ./gradlew test. Benchmark after-edit samples showed sessionRebuilt=0, danglingFallback=0, completionFileMode=existing_session_source_with_editor_overlay, danglingAnalysisMode=IGNORE_SELF, dangling_file_creation and dangling_analysis_api_analyze_copy_block stages, and no session_refresh stage. The existing IntelliJ kotlinx.coroutines.internal.intellij.IntellijCoroutines warning still appears during benchmark startup but the task succeeds; it is not new to this ticket. Remaining lifecycle work stays in ka-rd04/ka-rd05; real-project benchmarking stays in ka-j4dc/ka-xjd7.
