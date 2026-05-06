@@ -711,7 +711,7 @@ class CompilerBridgeIntegrationTest {
     }
 
     @Test
-    fun `completion - dirty on-disk local member completion retries after rebuild`() {
+    fun `completion - dirty on-disk local member completion without session rebuild`() {
         val uri = "file://$testSourceDir/Completion.kt"
         val content = """
             class MyClass {
@@ -732,6 +732,129 @@ class CompilerBridgeIntegrationTest {
             labels.any { it == "length" || it == "uppercase" || it == "isEmpty" },
             "dirty on-disk member completion should include String members, got: ${labels.take(20)} (reason=${result.get("reason")?.asString})"
         )
+    }
+
+    @Test
+    fun `completion - existing file overlay uses dangling PSI and does not rebuild`() {
+        val uri = "file://$testSourceDir/Completion.kt"
+        val content = """
+            class MyClass {
+                fun test() {
+                    val localEditedValue = 41
+                    localEd
+                }
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.completion(
+            uri = uri,
+            line = 4,
+            character = 15,
+            includeMetrics = true,
+        )
+
+        val items = result.getAsJsonArray("items")
+        assertNotNull(items, "completion items array should be present")
+        val labels = items.map { it.asJsonObject.get("label")?.asString ?: "" }
+        assertTrue(
+            labels.contains("localEditedValue"),
+            "completion should use current editor text and include localEditedValue, got: ${labels.take(20)} (reason=${result.get("reason")?.asString})"
+        )
+
+        val metrics = result.getAsJsonObject("metrics")
+        assertNotNull(metrics, "completion metrics should be present")
+        val counts = metrics.getAsJsonObject("counts")
+        val stages = metrics.getAsJsonObject("stages")
+        val fields = metrics.getAsJsonObject("fields")
+
+        assertEquals(0, counts.get("sessionRebuilt")?.asInt, "ordinary existing-file completion must not rebuild")
+        assertTrue(!stages.has("session_refresh"), "ordinary existing-file completion must not include session_refresh")
+        assertTrue(stages.has("dangling_file_creation"), "dangling completion should record creation timing")
+        assertEquals(
+            "existing_session_source_with_editor_overlay",
+            fields.get("completionFileMode")?.asString,
+            "completion should select the existing source overlay path",
+        )
+        assertEquals(
+            COMPLETION_DANGLING_FILE_RESOLUTION_MODE_NAME,
+            fields.get("danglingAnalysisMode")?.asString,
+            "completion should use the configured dangling Analysis API mode",
+        )
+        assertEquals(0, counts.get("danglingFallback")?.asInt, "dangling completion should not fall back for this regression")
+    }
+
+    @Test
+    fun `completion - existing file overlay works with PSI validation enabled`() {
+        bridge.shutdown()
+
+        val priorBypass = System.getProperty(PSI_VALIDATION_BYPASS_PROPERTY)
+        System.setProperty(PSI_VALIDATION_BYPASS_PROPERTY, "false")
+        bridge = CompilerBridge()
+        try {
+            bridge.initialize(
+                projectRoot = testSourceDir,
+                classpath = emptyList(),
+                compilerFlags = emptyList(),
+                jdkHome = "",
+                sourceRoots = listOf(testSourceDir),
+            )
+
+            val uri = "file://$testSourceDir/Completion.kt"
+            val content = """
+                class MyClass {
+                    fun test() {
+                        val validationEnabledValue = 41
+                        validationEn
+                    }
+                }
+            """.trimIndent()
+            bridge.updateFile(uri, content)
+
+            val result = bridge.completion(
+                uri = uri,
+                line = 4,
+                character = 20,
+                includeMetrics = true,
+            )
+
+            val items = result.getAsJsonArray("items")
+            assertNotNull(items, "completion items array should be present")
+            val labels = items.map { it.asJsonObject.get("label")?.asString ?: "" }
+            assertTrue(
+                labels.contains("validationEnabledValue"),
+                "dangling completion should work with PSI validation enabled, got: ${labels.take(20)} (reason=${result.get("reason")?.asString})"
+            )
+
+            val metrics = result.getAsJsonObject("metrics")
+            assertNotNull(metrics, "completion metrics should be present")
+            val counts = metrics.getAsJsonObject("counts")
+            val fields = metrics.getAsJsonObject("fields")
+
+            assertEquals(
+                "false",
+                fields.get("psiValidationBypass")?.asString,
+                "test must run with the global PSI validation bypass disabled",
+            )
+            assertEquals(
+                "existing_session_source_with_editor_overlay",
+                fields.get("completionFileMode")?.asString,
+                "completion should still use dangling PSI for editor overlay content",
+            )
+            assertEquals(
+                COMPLETION_DANGLING_FILE_RESOLUTION_MODE_NAME,
+                fields.get("danglingAnalysisMode")?.asString,
+                "completion should use the configured dangling Analysis API mode",
+            )
+            assertEquals(0, counts.get("sessionRebuilt")?.asInt, "validation-enabled dangling completion must not rebuild")
+            assertEquals(0, counts.get("danglingFallback")?.asInt, "validation-enabled dangling completion must not fall back")
+        } finally {
+            if (priorBypass == null) {
+                System.clearProperty(PSI_VALIDATION_BYPASS_PROPERTY)
+            } else {
+                System.setProperty(PSI_VALIDATION_BYPASS_PROPERTY, priorBypass)
+            }
+        }
     }
 
     // --- Signature Help ---

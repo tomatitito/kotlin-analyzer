@@ -6,10 +6,13 @@ import com.intellij.openapi.util.Disposer
 import com.intellij.psi.PsiComment
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiWhiteSpace
+import com.intellij.psi.impl.source.PsiFileImpl
 import com.intellij.psi.util.PsiTreeUtil
 import org.jetbrains.kotlin.analysis.api.analyze
 import org.jetbrains.kotlin.analysis.api.platform.projectStructure.KotlinProjectStructureProvider
+import org.jetbrains.kotlin.analysis.api.projectStructure.KaDanglingFileResolutionMode
 import org.jetbrains.kotlin.analysis.api.projectStructure.KaModule
+import org.jetbrains.kotlin.analysis.api.projectStructure.contextModule
 import org.jetbrains.kotlin.analysis.api.standalone.StandaloneAnalysisAPISession
 import org.jetbrains.kotlin.analysis.api.standalone.buildStandaloneAnalysisAPISession
 import org.jetbrains.kotlin.analysis.api.symbols.*
@@ -29,6 +32,20 @@ import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+
+internal const val COMPLETION_DANGLING_FILE_RESOLUTION_MODE_NAME = "IGNORE_SELF"
+internal val COMPLETION_DANGLING_FILE_RESOLUTION_MODE: KaDanglingFileResolutionMode =
+    KaDanglingFileResolutionMode.IGNORE_SELF
+
+internal const val PSI_VALIDATION_BYPASS_PROPERTY = "kotlin.analyzer.psi.validation.bypass"
+internal const val PSI_VALIDATION_BYPASS_ENV = "KOTLIN_ANALYZER_PSI_VALIDATION_BYPASS"
+
+internal data class CompletionFileSelection(
+    val ktFile: KtFile?,
+    val mode: String,
+    val danglingResolutionMode: KaDanglingFileResolutionMode? = null,
+    val fallbackReason: String? = null,
+)
 
 class BridgeContext {
     // --- State fields ---
@@ -56,6 +73,7 @@ class BridgeContext {
     internal var initJdkHome = ""
     internal var initSourceRoots = emptyList<String>()
     internal val lightFileCache = mutableMapOf<String, Pair<String, KtFile>>()
+    internal var psiValidationBypassEnabled = true
 
     // --- Session lifecycle methods ---
 
@@ -226,7 +244,7 @@ class BridgeContext {
         newFilesPendingInSession = false
 
         registerVirtualFileModuleProvider()
-        disablePsiValidation()
+        applyPsiValidationBypassPolicy()
 
         val elapsed = System.currentTimeMillis() - startTime
         System.err.println("CompilerBridge: session created in ${elapsed}ms")
@@ -395,6 +413,72 @@ class BridgeContext {
                 val path = it.virtualFile.path
                 path == filePath || it.name == filePath || shadowPathMapping[path] == filePath
             }
+    }
+
+    internal fun selectKtFileForCompletion(
+        session: StandaloneAnalysisAPISession,
+        uri: String,
+        metrics: CompletionMetrics? = null,
+    ): CompletionFileSelection {
+        val sessionFile = findKtFileInSession(session, uri)
+        val virtualEntry = getVirtualFileEntry(uri)
+        val virtualContent = virtualEntry?.second
+
+        if (sessionFile == null) {
+            return CompletionFileSelection(
+                ktFile = findKtFile(session, uri),
+                mode = if (virtualContent == null) {
+                    "missing_or_no_session"
+                } else {
+                    "new_virtual_source_not_in_session"
+                },
+            )
+        }
+
+        if (virtualContent == null || sessionFile.text == virtualContent) {
+            return CompletionFileSelection(
+                ktFile = sessionFile,
+                mode = "existing_session_source_without_editor_overlay",
+            )
+        }
+
+        return try {
+            val danglingFile = metrics?.stage("dangling_file_creation") {
+                createCompletionDanglingFile(session, uri, virtualContent, sessionFile)
+            } ?: createCompletionDanglingFile(session, uri, virtualContent, sessionFile)
+
+            CompletionFileSelection(
+                ktFile = danglingFile,
+                mode = "existing_session_source_with_editor_overlay",
+                danglingResolutionMode = COMPLETION_DANGLING_FILE_RESOLUTION_MODE,
+            )
+        } catch (e: Throwable) {
+            CompletionFileSelection(
+                ktFile = findKtFile(session, uri),
+                mode = "fallback_light_virtual_file",
+                fallbackReason = "dangling-create-failed:${e.javaClass.name}:${e.message ?: ""}",
+            )
+        }
+    }
+
+    private fun createCompletionDanglingFile(
+        session: StandaloneAnalysisAPISession,
+        uri: String,
+        virtualContent: String,
+        sessionFile: KtFile,
+    ): KtFile {
+        val fileName = uriToPath(uri).substringAfterLast('/')
+        val danglingFile = KtPsiFactory(session.project).createFile(fileName, virtualContent)
+        (danglingFile as? PsiFileImpl)?.setOriginalFile(sessionFile)
+        moduleForSessionFile(session, sessionFile)?.let { danglingFile.contextModule = it }
+        return danglingFile
+    }
+
+    private fun moduleForSessionFile(session: StandaloneAnalysisAPISession, ktFile: KtFile): KaModule? {
+        return session.modulesWithFiles.entries
+            .firstOrNull { (_, files) -> files.any { it === ktFile } }
+            ?.key
+            ?: sourceModule
     }
 
     internal fun findKtFile(session: StandaloneAnalysisAPISession, uri: String): KtFile? {
@@ -807,14 +891,15 @@ class BridgeContext {
         System.err.println("CompilerBridge: updateFile($uri) — stored in virtualFiles (${text.length} chars)")
     }
 
-    // The standalone Analysis API rejects LightVirtualFile-backed PSI elements
-    // via a registry-guarded check in KaBaseIllegalPsiExceptionKt.checkValidity().
-    // Disabling this allows completion and hover to analyze in-memory file content
-    // (from updateFile) without rebuilding the entire session on every keystroke.
-    private fun disablePsiValidation() {
+    // The standalone Analysis API rejects legacy LightVirtualFile-backed PSI
+    // through KaBaseIllegalPsiExceptionKt.checkValidity(). Keep the legacy bypass
+    // on by default for non-completion paths, but allow tests and sidecar runs to
+    // force validation back on while dangling completion is exercised.
+    private fun applyPsiValidationBypassPolicy() {
+        psiValidationBypassEnabled = psiValidationBypassRequested()
         try {
             com.intellij.openapi.util.registry.Registry
-                .get("kotlin.analysis.validate.psi.input").setValue(false)
+                .get("kotlin.analysis.validate.psi.input").setValue(!psiValidationBypassEnabled)
         } catch (_: Exception) {}
         try {
             val field = Class.forName(
@@ -822,10 +907,20 @@ class BridgeContext {
             ).getDeclaredField("allowIllegalPsiAccess")
             field.isAccessible = true
             @Suppress("UNCHECKED_CAST")
-            (field.get(null) as ThreadLocal<Boolean>).set(true)
+            (field.get(null) as ThreadLocal<Boolean>).set(psiValidationBypassEnabled)
         } catch (e: Exception) {
-            System.err.println("CompilerBridge: could not disable PSI validation: ${e.message}")
+            System.err.println("CompilerBridge: could not apply PSI validation policy: ${e.message}")
         }
+        System.err.println(
+            "CompilerBridge: PSI validation bypass ${if (psiValidationBypassEnabled) "enabled" else "disabled"}"
+        )
+    }
+
+    private fun psiValidationBypassRequested(): Boolean {
+        val configured = System.getProperty(PSI_VALIDATION_BYPASS_PROPERTY)
+            ?: System.getenv(PSI_VALIDATION_BYPASS_ENV)
+            ?: return true
+        return configured.lowercase() in setOf("1", "true", "yes", "on")
     }
 
     // --- Session infrastructure ---

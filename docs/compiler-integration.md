@@ -18,6 +18,90 @@ kotlin-analyzer targets the **Kotlin Analysis API** with the **FIR (K2) backend*
 | `KtType` | Represents resolved types |
 | `KtDiagnostic` | Compiler diagnostics (errors, warnings) from resolution |
 
+### PSI, FIR, and Editor-Text File Models
+
+Contributors reading the sidecar code need to keep two compiler models separate:
+
+- **PSI** is the IntelliJ parsed source representation. Kotlin source text becomes a `KtFile`; declarations, expressions, references, and the token under the cursor are `KtElement` / PSI nodes. Sidecar features use PSI for file lookup, offset-to-element lookup, syntax walks, and deciding which element should be analyzed.
+- **FIR** is Kotlin K2's semantic frontend representation. The Analysis API uses the FIR-backed model to answer semantic questions about symbols, types, scopes, diagnostics, and resolution.
+
+The normal request path is:
+
+```text
+editor/disk text
+      |
+      v
+Kotlin parser / IntelliJ PSI
+      |
+      v
+KtFile / KtElement at cursor
+      |
+      v
+Analysis API analyze(...) block
+      |
+      v
+FIR-backed semantic model
+      |
+      v
+symbols, types, diagnostics, completion data
+```
+
+The PSI file variants relevant to kotlin-analyzer are:
+
+| Variant | What it means | Main risk |
+|---------|---------------|-----------|
+| Physical/on-disk project PSI | A normal project source file known to the Analysis API session through a source root. | May be older than the editor buffer if the user has unsaved edits. |
+| In-memory editor text/PSI | Current text held by the Rust server or sidecar, optionally parsed into a temporary `KtFile`, instead of read from the saved disk file. | The text can diverge from the FIR-visible session file. |
+| Shadow-root/session PSI | A sidecar-managed copy of project sources used to rebuild a coherent standalone Analysis API session with open-buffer overrides applied. | Editor-facing responses must not leak shadow paths. |
+| LightVirtualFile-backed PSI | A temporary IntelliJ virtual file representation used when parsing editor content outside the saved file. | If it is visible to FIR alongside the real file, duplicate declarations can appear. |
+| Dangling PSI | A temporary PSI file that is not registered as a normal source-root member, but is resolved in the context of a real module/file. | The context mapping must avoid making FIR see a second real copy of the same source file. |
+
+**In-memory** and **dangling** describe different dimensions. In-memory is about where the text or PSI comes from and lives: current editor/server memory rather than the saved disk file. Dangling is about how that PSI participates in analysis: it is not a normal member of the project source set, but it can resolve against the module context of a real project file.
+
+For latency-sensitive interactive requests, the desired model is:
+
+```text
+current editor text
+      |
+      v
+temporary in-memory KtFile
+      |
+      v
+dangling resolution against real Foo.kt's module
+      |
+      v
+completion / hover / signature help
+```
+
+The variants interact like this:
+
+```text
+workspace Foo.kt on disk
+      |
+      | session initialization / structural rebuild
+      v
+FIR-visible session file
+      |
+      | shadow rebuild with open-buffer override
+      v
+shadow-root Foo.kt  ----------------------+
+                                          |
+editor buffer Foo.kt -- in-memory text ---+--> temporary KtFile
+                                                |
+                                                +--> LightVirtualFile-backed PSI
+                                                |
+                                                +--> dangling PSI resolved against Foo.kt's module
+
+duplicate/stale risks:
+  * FIR sees both stale session Foo.kt and fresh virtual/dangling Foo.kt
+  * a request reads disk/shadow text while the editor has newer text
+  * a response maps a shadow/temp path back to the editor incorrectly
+```
+
+This terminology is central to the performance work. Ordinary text edits should not automatically imply a full project/session rebuild. Completion, hover, and signature help are good candidates for current in-memory/dangling PSI against a stable module context, because they need the latest editor text but should not make FIR index a second real source file. Full session rebuilds should be reserved for structural changes such as new or deleted source files, source-root changes, classpath changes, compiler flag changes, Kotlin runtime changes, or project model reloads.
+
+The sidecar still keeps the legacy PSI validation bypass enabled by default for non-completion paths that can fall back to LightVirtualFile-backed PSI. Completion for existing session files now uses dangling PSI (`analyzeCopy` with `IGNORE_SELF`) for editor overlays and is covered with `kotlin.analyzer.psi.validation.bypass=false`, which leaves Kotlin Analysis API PSI input validation enabled and verifies that this path does not rebuild the session or fall back to the LightVirtualFile path.
+
 ### Target Artifacts
 
 > **Validated by spike:** The standalone Analysis API has been proven to work outside IntelliJ. See [spike/analysis-api/FINDINGS.md](../spike/analysis-api/FINDINGS.md) for full results and the working project at `spike/analysis-api/`.

@@ -11,6 +11,7 @@ internal fun completionMetricsEnabledByEnv(): Boolean =
 internal class CompletionMetrics(private val correlationId: String) {
     private val stagesNanos = linkedMapOf<String, Long>()
     private val counts = linkedMapOf<String, Int>()
+    private val fields = linkedMapOf<String, String>()
     private val startedAtNanos = System.nanoTime()
 
     fun <T> stage(name: String, block: () -> T): T {
@@ -24,6 +25,10 @@ internal class CompletionMetrics(private val correlationId: String) {
 
     fun count(name: String, value: Int) {
         counts[name] = value
+    }
+
+    fun field(name: String, value: String) {
+        fields[name] = value
     }
 
     fun toJson(): JsonObject {
@@ -42,6 +47,12 @@ internal class CompletionMetrics(private val correlationId: String) {
             countJson.addProperty(name, value)
         }
         json.add("counts", countJson)
+
+        val fieldJson = JsonObject()
+        for ((name, value) in fields) {
+            fieldJson.addProperty(name, value)
+        }
+        json.add("fields", fieldJson)
         return json
     }
 

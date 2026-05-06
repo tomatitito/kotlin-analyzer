@@ -5,6 +5,7 @@ import com.google.gson.JsonObject
 import com.intellij.psi.PsiElement
 import com.intellij.psi.util.PsiTreeUtil
 import org.jetbrains.kotlin.analysis.api.analyze
+import org.jetbrains.kotlin.analysis.api.analyzeCopy
 import org.jetbrains.kotlin.analysis.api.renderer.types.impl.KaTypeRendererForSource
 import org.jetbrains.kotlin.analysis.api.symbols.*
 import org.jetbrains.kotlin.analysis.api.symbols.markers.KaDeclarationContainerSymbol
@@ -93,7 +94,23 @@ private fun BridgeContext.completionOnce(
         result.add("items", itemsArray)
         return result
     }
-    val ktFile = metrics?.stage("file_lookup") { findKtFile(currentSession, uri) } ?: findKtFile(currentSession, uri)
+    val fileSelection = metrics?.stage("file_lookup") {
+        selectKtFileForCompletion(currentSession, uri, metrics)
+    } ?: selectKtFileForCompletion(currentSession, uri)
+    metrics?.field("completionFileMode", fileSelection.mode)
+    metrics?.field("psiValidationBypass", psiValidationBypassEnabled.toString())
+    metrics?.field(
+        "danglingAnalysisMode",
+        fileSelection.danglingResolutionMode?.name ?: "none",
+    )
+    if (fileSelection.fallbackReason != null) {
+        metrics?.count("danglingFallback", 1)
+        metrics?.field("danglingFallbackReason", fileSelection.fallbackReason)
+    } else {
+        metrics?.count("danglingFallback", 0)
+    }
+
+    val ktFile = fileSelection.ktFile
     if (ktFile == null) {
         setFailureReason("file-not-found")
         result.add("items", itemsArray)
@@ -102,21 +119,11 @@ private fun BridgeContext.completionOnce(
     val context = this
 
     try {
-        metrics?.stage("analysis_api_analyze_block") {
-            analyze(ktFile) {
-                completeInsideAnalysis(
-                    context = context,
-                    ktFile = ktFile,
-                    line = line,
-                    character = character,
-                    triggerCharacter = triggerCharacter,
-                    result = result,
-                    itemsArray = itemsArray,
-                    setFailureReason = setFailureReason,
-                    metrics = metrics,
-                )
-            }
-        } ?: analyze(ktFile) {
+        runCompletionAnalysis(
+            ktFile = ktFile,
+            fileSelection = fileSelection,
+            metrics = metrics,
+        ) {
             completeInsideAnalysis(
                 context = context,
                 ktFile = ktFile,
@@ -126,18 +133,81 @@ private fun BridgeContext.completionOnce(
                 result = result,
                 itemsArray = itemsArray,
                 setFailureReason = setFailureReason,
-                metrics = null,
+                metrics = metrics,
             )
         }
     } catch (e: Throwable) {
-        val reason = "completion failed: ${e.javaClass.name}: ${e.message}"
-        setFailureReason(reason)
-        System.err.println("CompilerBridge: $reason")
+        val fallbackReason = "dangling-analysis-failed:${e.javaClass.name}:${e.message ?: ""}"
+        val fallbackFile = if (fileSelection.danglingResolutionMode != null) {
+            metrics?.count("danglingFallback", 1)
+            metrics?.field("danglingFallbackReason", fallbackReason)
+            metrics?.stage("fallback_file_lookup") { findKtFile(currentSession, uri) } ?: findKtFile(currentSession, uri)
+        } else {
+            null
+        }
+
+        if (fallbackFile != null && fallbackFile !== ktFile) {
+            try {
+                metrics?.stage("fallback_analysis_api_analyze_block") {
+                    analyze(fallbackFile) {
+                        completeInsideAnalysis(
+                            context = context,
+                            ktFile = fallbackFile,
+                            line = line,
+                            character = character,
+                            triggerCharacter = triggerCharacter,
+                            result = result,
+                            itemsArray = itemsArray,
+                            setFailureReason = setFailureReason,
+                            metrics = metrics,
+                        )
+                    }
+                } ?: analyze(fallbackFile) {
+                    completeInsideAnalysis(
+                        context = context,
+                        ktFile = fallbackFile,
+                        line = line,
+                        character = character,
+                        triggerCharacter = triggerCharacter,
+                        result = result,
+                        itemsArray = itemsArray,
+                        setFailureReason = setFailureReason,
+                        metrics = null,
+                    )
+                }
+            } catch (fallbackError: Throwable) {
+                val reason = "completion failed: ${fallbackError.javaClass.name}: ${fallbackError.message}"
+                setFailureReason(reason)
+                System.err.println("CompilerBridge: $reason")
+            }
+        } else {
+            val reason = "completion failed: ${e.javaClass.name}: ${e.message}"
+            setFailureReason(reason)
+            System.err.println("CompilerBridge: $reason")
+        }
     }
 
     metrics?.count("finalItems", itemsArray.size())
     result.add("items", metrics?.stage("json_item_assembly") { itemsArray } ?: itemsArray)
     return result
+}
+
+private fun runCompletionAnalysis(
+    ktFile: KtFile,
+    fileSelection: CompletionFileSelection,
+    metrics: CompletionMetrics?,
+    action: org.jetbrains.kotlin.analysis.api.KaSession.() -> Unit,
+) {
+    val danglingMode = fileSelection.danglingResolutionMode
+    if (danglingMode != null) {
+        metrics?.stage("dangling_analysis_api_analyze_copy_block") {
+            analyzeCopy(ktFile, danglingMode) { action() }
+        } ?: analyzeCopy(ktFile, danglingMode) { action() }
+    } else {
+        metrics?.stage("analysis_api_analyze_block") {
+            analyze(ktFile) { action() }
+        } ?: analyze(ktFile) { action() }
+    }
 }
 
 private fun org.jetbrains.kotlin.analysis.api.KaSession.completeInsideAnalysis(
