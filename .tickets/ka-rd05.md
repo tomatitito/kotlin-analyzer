@@ -2,7 +2,7 @@
 id: ka-rd05
 status: open
 deps: [ka-rd02, ka-rd03]
-links: [ka-hexa, ka-rd06, ka-slua]
+links: [ka-hexa, ka-rd06, ka-slua, ka-aa4k, ka-t7gp, ka-rr3u, ka-xjd7]
 created: 2026-05-05T20:32:00Z
 type: task
 priority: 1

@@ -2,7 +2,7 @@
 id: ka-aa4k
 status: open
 deps: [ka-kyvv]
-links: []
+links: [ka-rd05, ka-t7gp, ka-rr3u, ka-xjd7]
 created: 2026-05-05T15:25:36Z
 type: task
 priority: 1

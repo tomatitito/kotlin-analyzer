@@ -2,7 +2,7 @@
 id: ka-xjd7
 status: open
 deps: [ka-rw1x, ka-j4dc]
-links: []
+links: [ka-aa4k, ka-rd05, ka-t7gp, ka-rr3u, ka-g342]
 created: 2026-05-05T19:51:54Z
 type: task
 priority: 1

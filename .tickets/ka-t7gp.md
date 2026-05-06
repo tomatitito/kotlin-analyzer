@@ -2,7 +2,7 @@
 id: ka-t7gp
 status: open
 deps: [ka-kyvv]
-links: []
+links: [ka-aa4k, ka-rd05, ka-rr3u, ka-xjd7]
 created: 2026-05-05T15:25:51Z
 type: task
 priority: 1
