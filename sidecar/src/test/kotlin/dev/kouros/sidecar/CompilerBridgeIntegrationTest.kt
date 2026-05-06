@@ -785,6 +785,87 @@ class CompilerBridgeIntegrationTest {
     }
 
     @Test
+    fun `completion - existing file overlay does not expose duplicate local declarations`() {
+        val uri = "file://$testSourceDir/Completion.kt"
+        val content = """
+            class MyClass {
+                fun test() {
+                    val overlayOnlyCandidate = 41
+                    overlayOnly
+                }
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.completion(
+            uri = uri,
+            line = 4,
+            character = 19,
+            includeMetrics = true,
+        )
+
+        val items = result.getAsJsonArray("items")
+        assertNotNull(items, "completion items array should be present")
+        val labels = items.labels()
+        val matchingLabels = labels.filter { it == "overlayOnlyCandidate" }
+        assertEquals(
+            listOf("overlayOnlyCandidate"),
+            matchingLabels,
+            "completion should expose the overlay declaration exactly once, got: ${labels.take(30)} (reason=${result.get("reason")?.asString})",
+        )
+
+        val metrics = result.getAsJsonObject("metrics")
+        assertNotNull(metrics, "completion metrics should be present")
+        val counts = metrics.getAsJsonObject("counts")
+        val fields = metrics.getAsJsonObject("fields")
+        assertEquals(
+            "existing_session_source_with_editor_overlay",
+            fields.get("completionFileMode")?.asString,
+            "duplicate guard must exercise the existing source overlay path",
+        )
+        assertEquals(0, counts.get("sessionRebuilt")?.asInt, "duplicate guard must not rebuild the session")
+        assertEquals(0, counts.get("danglingFallback")?.asInt, "duplicate guard must not fall back to LightVirtualFile")
+    }
+
+    @Test
+    fun `completion - new virtual file is not classified as existing session overlay`() {
+        val uri = "file://$testSourceDir/scratch/NewVirtualOverlaySource.kt"
+        val content = """
+            package scratch
+
+            fun newVirtualUsage() {
+                val newVirtualCandidate = 41
+                newVirtual
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.completion(
+            uri = uri,
+            line = 5,
+            character = 14,
+            includeMetrics = true,
+        )
+
+        val items = result.getAsJsonArray("items")
+        assertNotNull(items, "completion items array should be present")
+        val labels = items.labels()
+        assertTrue(
+            labels.contains("newVirtualCandidate"),
+            "completion should analyze the new virtual file content, got: ${labels.take(30)} (reason=${result.get("reason")?.asString})",
+        )
+
+        val metrics = result.getAsJsonObject("metrics")
+        assertNotNull(metrics, "completion metrics should be present")
+        val fields = metrics.getAsJsonObject("fields")
+        assertEquals(
+            "new_virtual_source_not_in_session",
+            fields.get("completionFileMode")?.asString,
+            "new virtual files must not masquerade as existing session editor overlays",
+        )
+    }
+
+    @Test
     fun `completion - existing file overlay works with PSI validation enabled`() {
         bridge.shutdown()
 
@@ -925,6 +1006,67 @@ class CompilerBridgeIntegrationTest {
     }
 
     @Test
+    fun `updateFile - diagnostics report edited text for requested version`() {
+        val uri = "file://$testSourceDir/Clean.kt"
+        val content = """
+            class Greeter(val name: String)
+
+            fun main() {
+                val editedNumber: Int = "not an int"
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.analyze(uri, version = 42)
+
+        assertEquals(42, result.get("version")?.asInt, "analyze should echo the requested editor version")
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        assertNotNull(diagnostics, "diagnostics array should be present")
+        val errors = diagnostics.errors()
+        assertTrue(
+            errors.any { diagnostic ->
+                val message = diagnostic.get("message")?.asString ?: ""
+                val code = diagnostic.get("code")?.asString ?: ""
+                code == "INITIALIZER_TYPE_MISMATCH" ||
+                    message.contains("String", ignoreCase = false) && message.contains("Int", ignoreCase = false)
+            },
+            "diagnostics must represent the edited type mismatch, not stale clean session text. Got: $errors",
+        )
+    }
+
+    @Test
+    fun `updateFile - duplicate declaration diagnostics do not come from stale and overlay files together`() {
+        val uri = "file://$testSourceDir/Clean.kt"
+        val content = """
+            class Greeter(val name: String) {
+                fun greet(): String = name
+            }
+
+            fun main() {
+                val greeter = Greeter("World")
+                println(greeter.greet())
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.analyze(uri)
+
+        val diagnostics = result.getAsJsonArray("diagnostics")
+        assertNotNull(diagnostics, "diagnostics array should be present")
+        val redeclarations = diagnostics.errors().filter { diagnostic ->
+            val code = diagnostic.get("code")?.asString ?: ""
+            val message = diagnostic.get("message")?.asString ?: ""
+            code.contains("REDECLARATION", ignoreCase = true) ||
+                message.contains("redeclaration", ignoreCase = true)
+        }
+        assertEquals(
+            emptyList(),
+            redeclarations,
+            "an unchanged overlay declaration must not be analyzed together with stale session PSI as a duplicate",
+        )
+    }
+
+    @Test
     fun `updateFile - hover reflects edited content`() {
         val uri = "file://$testSourceDir/Clean.kt"
 
@@ -941,6 +1083,34 @@ class CompilerBridgeIntegrationTest {
         assertTrue(
             contents.contains("computeSum") || contents.contains("Int"),
             "hover should reflect the injected content, got: $contents"
+        )
+    }
+
+    @Test
+    fun `definition - dirty existing file maps local overlay targets back to editor URI`() {
+        val uri = "file://$testSourceDir/Clean.kt"
+        val content = """
+            fun main() {
+                val overlayTarget = 41
+                println(overlayTarget)
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        val result = bridge.definition(uri, line = 3, character = 14)
+
+        val locations = result.getAsJsonArray("locations")
+        assertNotNull(locations, "locations array should be present")
+        assertTrue(locations.size() > 0, "dirty local reference should resolve to its overlay declaration")
+        val returnedUris = locations.map { it.asJsonObject.get("uri")?.asString ?: "" }
+        assertEquals(
+            listOf(uri),
+            returnedUris.distinct(),
+            "editor-facing locations must use the original file URI, not shadow/temp/internal paths. Got: $returnedUris",
+        )
+        assertTrue(
+            returnedUris.none { it.contains("shadow") || it.contains("kotlin-analyzer-virtual-files") || it.contains("/tmp/") },
+            "definition URI must not leak internal shadow/temp paths. Got: $returnedUris",
         )
     }
 
@@ -2366,6 +2536,13 @@ class CompilerBridgeIntegrationTest {
 
     private fun JsonArray.titles(): List<String> =
         (0 until size()).map { get(it).asJsonObject.get("title")?.asString ?: "" }
+
+    private fun JsonArray.labels(): List<String> =
+        (0 until size()).map { get(it).asJsonObject.get("label")?.asString ?: "" }
+
+    private fun JsonArray.errors(): List<JsonObject> =
+        (0 until size()).map { get(it).asJsonObject }
+            .filter { it.get("severity")?.asString == "ERROR" }
 
     private fun JsonArray.findByTitle(title: String): JsonObject =
         (0 until size()).map { get(it).asJsonObject }.first { it.get("title")?.asString == title }
