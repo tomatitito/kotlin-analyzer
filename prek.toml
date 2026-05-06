@@ -56,4 +56,28 @@ hooks = [
       entry = "bash -c 'cd sidecar && ./gradlew test'",
       files = "sidecar/.*\\.(kt|kts|gradle\\.kts)$",
       pass_filenames = false },
+
+    # --- Sensors crate (tools/sensors) ---
+    # The sensors crate is a separate Cargo package outside the workspace
+    # the root cargo-test hook covers, so it needs its own gates.
+    { id = "sensors-fmt",
+      name = "sensors cargo fmt --check",
+      language = "system",
+      entry = "bash -c 'cd tools/sensors && cargo fmt --check'",
+      files = "tools/sensors/.*\\.rs$",
+      pass_filenames = false },
+
+    { id = "sensors-clippy",
+      name = "sensors cargo clippy",
+      language = "system",
+      entry = "bash -c 'cd tools/sensors && cargo clippy --all-targets -- -D warnings'",
+      files = "tools/sensors/.*\\.rs$",
+      pass_filenames = false },
+
+    { id = "sensors-test",
+      name = "sensors cargo test",
+      language = "system",
+      entry = "bash -c 'cd tools/sensors && cargo test'",
+      files = "tools/sensors/.*\\.rs$",
+      pass_filenames = false },
 ]

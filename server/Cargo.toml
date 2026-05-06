@@ -23,6 +23,7 @@ anyhow = "1"
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
 tempfile = "3"
+kotlin-analyzer-sensors = { path = "../tools/sensors" }
 
 [features]
 integration = []

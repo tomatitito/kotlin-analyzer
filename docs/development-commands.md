@@ -31,6 +31,17 @@ cd sidecar && ./gradlew benchmark
 cd sidecar && ./gradlew benchmark --args="--warmups 3 --iterations 30 --jsonl-output build/completion-sensor.jsonl"
 ```
 
+The Rust-based `completion-burst` sensor (ka-g342) lives at `tools/sensors/`:
+
+```bash
+cargo run --manifest-path tools/sensors/Cargo.toml -- completion-burst --help
+cargo run --manifest-path tools/sensors/Cargo.toml -- completion-burst \
+    --project-root /path/to/project --target-file /path/to/project/src/Foo.kt \
+    --line 42 --character 8 --scenario tight-burst --regression-guard
+```
+
+See [docs/sensors.md](sensors.md) for scenario presets and output shape.
+
 Editor completion timing logs are quiet by default. Enable structured Rust and sidecar completion timing with:
 
 ```bash

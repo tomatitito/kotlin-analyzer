@@ -33,6 +33,60 @@ cd sidecar && ./gradlew benchmark
 cd sidecar && ./gradlew benchmark --args="--warmups 3 --iterations 30 --jsonl-output build/completion-sensor.jsonl"
 ```
 
+### completion-burst (ka-g342)
+
+`completion-burst` is the first Rust-based sensor and lives at `tools/sensors/`. It drives the real `kotlin-analyzer` LSP binary over stdin/stdout (the same path Zed uses) with configurable typing-burst loads and reports the user-visible completion latency under supersession pressure introduced by ka-rr3u.
+
+The sensor enables `completionMetrics` via `initializationOptions`, parses the LSP server's `tracing` stderr for `target=completion_metrics` lines, and emits per-burst JSONL plus a terminal table summary. Output is two layers: a one-line per-scenario table summary, and (if `--jsonl-output` is set) one JSON object per measured burst written to disk.
+
+#### Building
+
+Run from the repository root:
+
+```bash
+# 1) Build the LSP server once. The sensor auto-discovers this binary.
+(cd server && cargo build --release)
+
+# 2a) Quickest invocation — runs cargo each time:
+cargo run --manifest-path tools/sensors/Cargo.toml -- completion-burst --help
+
+# 2b) Or build the sensor binary once and call it directly:
+(cd tools/sensors && cargo build --release)
+./tools/sensors/target/release/sensors completion-burst --help
+```
+
+#### Running against a real Kotlin file
+
+```bash
+./tools/sensors/target/release/sensors completion-burst \
+    --project-root /path/to/your/kotlin/project \
+    --target-file  /path/to/your/kotlin/project/src/main/kotlin/Foo.kt \
+    --line 42 --character 8 \
+    --scenario tight-burst \
+    --jsonl-output /tmp/tight-burst.jsonl
+```
+
+`--line` and `--character` are 0-based (LSP convention). Pick a position where completion is meaningful — typically just after a `.` on an expression.
+
+#### Useful flags
+
+| Flag | What it does |
+|------|-------------|
+| `--scenario tight-burst\|medium-burst\|loose-burst` | Named preset. Tight = 5 ms gap (queues faster than the writer drains), medium = 25 ms, loose = 200 ms. |
+| `--burst-size N` / `--burst-count M` / `--inter-request-gap-ms` / `--inter-burst-gap-ms` | Ad-hoc scenario knobs (mutually exclusive with `--scenario`). |
+| `--warmup-bursts N` | Bursts to run before measurement (default 1). A single readiness-warmup completion always fires regardless. |
+| `--jsonl-output PATH` | Per-burst raw records, one JSON object per line. |
+| `--regression-guard` | Asserts the tight-burst invariant (`burst_size - 1` supersessions per burst); exits non-zero on violation. |
+| `--lsp-binary PATH` | Override the LSP binary. Otherwise uses `KA_BIN` env var, then `<repo>/server/target/release/kotlin-analyzer` (built on demand). |
+
+Run `... completion-burst --help` for the full list.
+
+#### LSP binary discovery order
+
+1. `--lsp-binary <path>` flag
+2. `KA_BIN` environment variable
+3. `<repo>/server/target/release/kotlin-analyzer` (built on demand via `cargo build --release` in `server/` if missing)
+
 Structured editor-run completion metrics are opt-in:
 
 ```bash
