@@ -95,13 +95,33 @@ KOTLIN_ANALYZER_COMPLETION_METRICS=1 cargo run -- --log-level info
 
 When enabled, each Rust completion request sends a correlation id to the sidecar. Rust logs include request receipt, document lookup, bridge enqueue/send, bridge response wait, response conversion, and total timing. Sidecar metrics include dispatch/queue timing when observable plus completion implementation stages and candidate counts.
 
-### Per-session metrics log files (ka-wkai)
+### Per-session metrics log files (ka-wkai, ka-dhkx)
 
-When `KOTLIN_ANALYZER_COMPLETION_METRICS=1` is set (the Zed extension exports it automatically when `completionMetrics: true` is in LSP settings), the LSP server writes the structured `target=completion_metrics` lines to a fresh per-session file under `<kotlin-analyzer-repo>/logs/`. Each file is named `kotlin-analyzer-<UTC-timestamp>.log` (`YYYY-MM-DDTHH-MM-SSZ`) so that runs sort chronologically and survive across sessions for perf-history review.
+When `completionMetrics` is enabled, the LSP server can write the structured `target=completion_metrics` lines to a fresh per-session file. The destination is configured explicitly — there is no auto-discovery — and is resolved in this order:
+
+1. `KOTLIN_ANALYZER_METRICS_DIR` environment variable (wins if set in the inherited shell environment).
+2. The Zed LSP setting `completionMetricsDir` (sibling of `completionMetrics`). The extension expands a leading `~` to `$HOME` and exports the result as `KOTLIN_ANALYZER_METRICS_DIR`, but only when `completionMetrics: true` is also set. Setting the directory without enabling `completionMetrics` is a no-op.
+
+If neither is set, no file is written and the server runs normally. Each session writes to `<dir>/kotlin-analyzer-<UTC-timestamp>.log` with `YYYY-MM-DDTHH-MM-SSZ` so runs sort chronologically.
+
+```jsonc
+// Zed settings.json
+{
+  "lsp": {
+    "kotlin-analyzer": {
+      "initialization_options": {
+        "completionMetrics": true,
+        "completionMetricsDir": "~/code/kotlin-analyzer/logs"
+      }
+    }
+  }
+}
+```
 
 - Only the `completion_metrics` target lands in the file. General LSP logs continue to go to stderr (or the `--log-file` path, if any).
-- The repo root is discovered by canonicalising the running binary's path and walking upward until a directory containing `extension.toml` is found. Release artefacts installed outside the source tree silently skip file creation; the server keeps running and structured metrics still appear on stderr.
-- Files accumulate; there is no automatic rotation. The `logs/` directory is committed to git (via `.gitkeep`) so the perf history is visible in PRs.
+- Missing intermediate directories under the configured path are created via `std::fs::create_dir_all`. If creation fails (permissions, read-only filesystem, typo), the server logs `metrics file disabled: cannot create <path>: <reason>` once at info level and keeps running. There is no fallback path — typos surface this way instead of being silently rerouted.
+- Files accumulate; there is no automatic rotation. The repo's `logs/` directory remains a sensible default that the user opts into via the setting, not via auto-discovery; `.gitkeep` keeps the path stable.
+- **Multi-worktree caveat**: a single LSP server process can serve multiple worktrees. If two worktrees configure different `completionMetricsDir` values, the value from whichever worktree initialised the server first wins for the rest of the process lifetime.
 
 ## Output Model
 

@@ -1,6 +1,7 @@
 use zed_extension_api::{self as zed, LanguageServerId, Result};
 
 const COMPLETION_METRICS_ENV: &str = "KOTLIN_ANALYZER_COMPLETION_METRICS";
+const METRICS_DIR_ENV: &str = "KOTLIN_ANALYZER_METRICS_DIR";
 
 struct KotlinAnalyzerExtension {
     cached_binary_path: Option<String>,
@@ -37,12 +38,56 @@ impl KotlinAnalyzerExtension {
             .unwrap_or(false)
     }
 
+    fn completion_metrics_dir_setting(worktree: &zed::Worktree) -> Option<String> {
+        let raw = Self::lsp_settings(worktree)?
+            .get("completionMetricsDir")?
+            .as_str()?
+            .trim()
+            .to_string();
+        if raw.is_empty() {
+            None
+        } else {
+            Some(raw)
+        }
+    }
+
+    fn home_from_env(env: &[(String, String)]) -> Option<&str> {
+        env.iter()
+            .find(|(k, _)| k == "HOME")
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Expand a leading `~` or `~/` to `$HOME`. Other path forms (absolute,
+    /// relative, or with `~` not at the start) pass through unchanged. No
+    /// further variable interpolation is performed.
+    fn expand_tilde(path: &str, home: Option<&str>) -> String {
+        if path == "~" {
+            return home.unwrap_or("~").to_string();
+        }
+        if let Some(rest) = path.strip_prefix("~/") {
+            if let Some(h) = home {
+                let trimmed = h.trim_end_matches('/');
+                return format!("{trimmed}/{rest}");
+            }
+        }
+        path.to_string()
+    }
+
     fn set_env_var(env: &mut Vec<(String, String)>, key: &str, value: &str) {
         if let Some((_, existing)) = env.iter_mut().find(|(k, _)| k == key) {
             *existing = value.into();
         } else {
             env.push((key.into(), value.into()));
         }
+    }
+
+    /// Like `set_env_var`, but does not overwrite an existing entry. Used for
+    /// settings that should defer to an explicit shell-exported env var.
+    fn set_env_var_if_absent(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+        if env.iter().any(|(k, _)| k == key) {
+            return;
+        }
+        env.push((key.into(), value.into()));
     }
 }
 
@@ -68,6 +113,10 @@ impl zed::Extension for KotlinAnalyzerExtension {
         let completion_metrics = Self::completion_metrics_requested(worktree);
         if completion_metrics {
             Self::set_env_var(&mut env, COMPLETION_METRICS_ENV, "1");
+            if let Some(raw_dir) = Self::completion_metrics_dir_setting(worktree) {
+                let expanded = Self::expand_tilde(&raw_dir, Self::home_from_env(&env));
+                Self::set_env_var_if_absent(&mut env, METRICS_DIR_ENV, &expanded);
+            }
         }
         let base_args = vec!["--log-level".into(), "info".into()];
 

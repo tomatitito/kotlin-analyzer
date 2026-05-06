@@ -1,6 +1,6 @@
 ---
 id: ka-wkai
-status: in_progress
+status: closed
 deps: []
 links: [ka-rr3u, ka-g342, ka-dhkx]
 created: 2026-05-06T20:28:51Z
