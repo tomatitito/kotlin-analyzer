@@ -42,6 +42,23 @@ cargo run --manifest-path tools/sensors/Cargo.toml -- completion-burst \
 
 See [docs/sensors.md](sensors.md) for scenario presets and output shape.
 
+For before/after performance baselines against a real Kotlin project,
+the driver script captures all three burst scenarios across a
+deterministically-sampled set of completion positions and writes the
+results under `perf/baselines/<tag>/<project>/`:
+
+```bash
+# Capture once before touching kotlin-analyzer.
+scripts/sensor-baseline.sh /path/to/project project-name --tag 2026-05-06-pre-aa4k
+
+# Re-run with the same project + the same --positions-seed (default
+# kotlin-analyzer-perf-baseline) after a perf-affecting change to get a
+# directly-comparable after-baseline.
+scripts/sensor-baseline.sh /path/to/project project-name --tag 2026-05-06-post-aa4k
+```
+
+See [perf/baselines/README.md](../perf/baselines/README.md) for layout, comparison hints, and the full flag list.
+
 Editor completion timing logs are quiet by default. Enable structured Rust and sidecar completion timing with:
 
 ```bash

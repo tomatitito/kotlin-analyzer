@@ -41,10 +41,39 @@ scripts/sensor-baseline.sh \
     --positions 12
 ```
 
-Re-run with the **same project name and the same `--positions-seed`**
-(default `kotlin-analyzer-perf-baseline`) to sample exactly the same
-positions for a fair before/after comparison. The seed is recorded in
-`meta.json` so you can verify it.
+Wall clock: ~22 min for 12 positions × 3 scenarios on outfit-genie (cold
+JVM sidecar startup per run dominates). Reduce `--positions` or use
+`--burst-count 5 --inter-burst-gap-ms 500` for a quicker but noisier run.
+
+### Before/after one-liner
+
+To produce a directly-comparable "after" baseline once a perf-affecting
+change lands, re-run with **the same `<project-name>` and the same
+`--positions-seed`** (default `kotlin-analyzer-perf-baseline`, recorded
+in `meta.json`). Only the `--tag` should change.
+
+```bash
+# Before — capture once, before touching kotlin-analyzer.
+scripts/sensor-baseline.sh \
+    /Volumes/sourcecode/meta-breuninger/entdecken/reco/outfit-genie \
+    outfit-genie \
+    --tag 2026-05-06-pre-aa4k
+
+# (… land the kotlin-analyzer change …)
+
+# After — same command, only --tag changes.
+scripts/sensor-baseline.sh \
+    /Volumes/sourcecode/meta-breuninger/entdecken/reco/outfit-genie \
+    outfit-genie \
+    --tag 2026-05-06-post-aa4k
+```
+
+Same project + same seed → the picker emits exactly the same 12
+positions, so the resulting JSONL files line up 1:1 between
+`perf/baselines/<pre-tag>/` and `perf/baselines/<post-tag>/`. A quick
+eyeball comparison is `diff <(jq -r '.latest.latency_ms' <pre>/.../*.jsonl)
+<(jq -r '.latest.latency_ms' <post>/.../*.jsonl)`; a richer comparison
+helper can land alongside the first real before/after pair.
 
 If you want to lock in a specific position set independent of the
 sampler, edit the generated `positions.tsv` after the first run, then
