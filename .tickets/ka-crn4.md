@@ -1,6 +1,6 @@
 ---
 id: ka-crn4
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-04-02T10:15:38Z
@@ -45,3 +45,9 @@ Likely root-cause areas:
 - Completion works in a real Gradle or Maven workspace, not only in isolated integration tests.
 - Failures are logged with an explicit reason instead of silently returning empty completion results.
 - At least one regression test covers the identified failure mode.
+
+## Notes
+
+**2026-05-06T12:45:48Z**
+
+Closing as outdated. Completion popup now appears in Zed; the original symptom (no popup at all) no longer reproduces. Remaining issue is latency/quality of completions, which is tracked under the ka-36lk performance epic (ka-rr3u, ka-aa4k, ka-t7gp, ka-rd05, ka-xjd7). If a 'no popup ever' regression resurfaces, file fresh.
