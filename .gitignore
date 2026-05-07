@@ -37,3 +37,6 @@ tests/fixtures/**/.gradle/
 # Sidecar test artifacts
 sidecar/.jqwik-database
 sidecar/org/
+
+# Per-session completion_metrics log files (KOTLIN_ANALYZER_METRICS_DIR target)
+.logs/
