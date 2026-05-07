@@ -407,6 +407,14 @@ and [§4.2](lsp-protocol.md#42-background-analyze-supersession) for the
 wire-level details and the observability surface
 (`analyze_pending_cancelled_total` on the per-completion metrics line).
 
+A second supersession checkpoint runs inside the sidecar's `AnalysisServer`
+dispatch loop (introduced in ser-leba) — it short-circuits stale completions
+already past Rust's writer-side `BeforeSend` check before they reach the
+Analysis API. The sidecar uses the same `"<uri>"` bucket convention so the
+checkpoints compose cleanly. See
+[lsp-protocol.md §4.1, Checkpoint 2](lsp-protocol.md#41-latest-wins-supersession-completion)
+for the rationale and the new `metrics.counts.supersededAtDispatch` counter.
+
 ### 8.4 What is deliberately not addressed
 
 Mid-flight cancellation of an `analyze` already running inside the sidecar is

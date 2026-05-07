@@ -1,6 +1,6 @@
 ---
 id: ser-leba
-status: open
+status: in_progress
 deps: []
 links: [ka-rr3u, ka-hexa, ka-aa4k, ka-t7gp]
 created: 2026-05-07T14:53:42Z
@@ -65,3 +65,35 @@ The wire protocol does not need to change. Rust already includes the bridge supe
 - ka-hexa [in_progress] Prioritize interactive requests over background analysis
 - ka-aa4k [open] Implement completionItem/resolve for lazy detail computation
 - ka-t7gp [open] Pass name predicates to Analysis API scope queries
+
+## Notes
+
+**2026-05-07T15:18:43Z**
+
+Implementation landed. Code-side acceptance criteria met:
+
+- Sidecar's AnalysisServer dispatch loop now runs Checkpoint 2 before
+  invoking BridgeCompletion. Per-bucket latestSeenSeq is bumped at read
+  time during a lookahead-drain pass, so older requests in a typing burst
+  are short-circuited with reason="superseded-at-dispatch" + superseded=true.
+- New cumulative counter sidecar.metrics.counts.supersededAtDispatch is
+  emitted on every completion-metrics record (alongside Rust's
+  superseded_in_flight_total inside the sidecar=... log field).
+- Wire protocol unchanged for inbound; superseded responses add only
+  additive fields (reason, superseded, metrics.counts/fields) — Rust
+  ignores unknown fields and the InFlight check still composes correctly.
+- 3 new JUnit5 tests in AnalysisServerTest cover stale → superseded path
+  (BridgeCompletion not invoked, distinguished via no-active-session
+  reason on the latest request), single-request fresh-dispatch path,
+  and per-URI bucket isolation.
+- Rust bridge tests (18 tests under bridge::tests) all still pass —
+  Rust contract unchanged.
+- docs/lsp-protocol.md §4.1 updated with Checkpoint 2 +
+  three-checkpoint summary table; architecture.md §8.3 cross-links the
+  new sidecar-side check.
+
+Remaining acceptance work that requires a real Zed session against
+outfit-genie (cannot be done from inside a coding session):
+- Capture real-Zed sidecar_queue_wait p95 < 300 ms warm into
+  perf/manual-evidence/2026-05-07-post-ser-leba.log.
+- Confirm supersededAtDispatch / superseded_in_flight_total ratio > 5x.

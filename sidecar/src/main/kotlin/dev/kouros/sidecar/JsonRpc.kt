@@ -43,6 +43,18 @@ class JsonRpcTransport(
     private val gson = Gson()
 
     /**
+     * Returns true if there are bytes already buffered or available on the
+     * underlying input stream. Used by the dispatch loop to lookahead at
+     * pipelined requests (e.g. typing-burst completions piling up in the
+     * stdin pipe) without blocking.
+     *
+     * Best-effort: a `true` result does not guarantee a complete framed
+     * request is available — callers must tolerate `readRequest()` blocking
+     * briefly to finish a partial frame.
+     */
+    fun hasBufferedData(): Boolean = bufferedInput.available() > 0
+
+    /**
      * Reads a single JSON-RPC request from the input stream.
      * Returns null on EOF.
      */

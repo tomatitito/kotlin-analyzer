@@ -183,42 +183,72 @@ message. The pending oneshot resolves with `BridgeError::Superseded { stage: Bef
 the LSP handler returns `Ok(None)`, and the counter `superseded_before_send` increments.
 **The sidecar never sees this request — full sidecar CPU is saved.**
 
-#### Checkpoint 2 — `InFlight`
+#### Checkpoint 2 — sidecar `SupersededAtDispatch`
 
-If the writer wins the race and writes to stdin, the sidecar processes the request
-(typically 50–170 ms of analysis work). When the response arrives, the bridge re-checks
+If the writer wins the race and the request reaches the sidecar's stdin, the sidecar
+runs a second supersession check before invoking the heavy Analysis API call. The
+sidecar's dispatch loop reads completion requests from stdin, assigns each a
+sidecar-local seq, and bumps `latestSeenSeq[bucket]` immediately at read time. When
+multiple completions for the same URI pile up in the stdin buffer (the typing-burst
+case the writer-side check rarely catches — see ka-rr3u's notes on why), the dispatcher
+*lookahead-drains* the buffer so the latest seq is recorded before any of the older
+requests in the burst is dispatched. Just before calling `BridgeCompletion.completion(...)`
+the sidecar checks: if `my_seq < latestSeenSeq[bucket]`, it short-circuits with an
+empty response carrying `reason="superseded-at-dispatch"` and `superseded=true`, and
+the cumulative counter `metrics.counts.supersededAtDispatch` increments. **The sidecar
+saves the Analysis API call entirely.** The Rust bridge's InFlight check (Checkpoint 3
+below) still runs on this short-circuited response — it's cheap and harmless.
+
+This is the second checkpoint after the writer-task `BeforeSend` and is the one that
+catches the bursts ka-rr3u's `BeforeSend` cannot — by the time the writer would re-check
+`latest_seq[uri]`, the older request is already past it; only a sidecar-side check sees
+the newer arrivals.
+
+The check happens at a safe point — between requests, before the Analysis API call —
+so the single-threaded contract of the K2 Analysis API is preserved. Mid-flight
+cancellation of an in-progress `KaSession` call remains out of scope (see §5).
+
+The sidecar's dispatcher uses the same bucket convention as Rust (`"<uri>"` for
+completion, disjoint from `"analyze:<uri>"`), so the two supersession streams do not
+interfere with each other.
+
+#### Checkpoint 3 — Rust `InFlight`
+
+When the response arrives back at the bridge (whether it's the real result or the
+sidecar's short-circuited `superseded-at-dispatch` shape), the bridge re-checks
 `latest_seq[uri]` one more time. If `my_seq < latest_seq[uri]` (a newer request was
 issued while we were waiting for the sidecar), the response is discarded and the bridge
 returns `BridgeError::Superseded { stage: InFlight }`. The LSP handler returns
-`Ok(None)`, and `superseded_in_flight` increments. **The sidecar already paid the
-CPU cost, but the user is spared seeing stale completion items.**
+`Ok(None)`, and `superseded_in_flight` increments. **The user is spared seeing stale
+completion items even if the sidecar's Checkpoint 2 also let one through.**
 
 #### Summary
 
 | Stage | What got saved |
 |-------|---------------|
-| `BeforeSend` | Sidecar CPU + user-visible latency |
-| `InFlight` | User-visible latency only (sidecar already did the work) |
+| `BeforeSend` (Rust writer) | Sidecar CPU + user-visible latency |
+| `SupersededAtDispatch` (sidecar) | Sidecar Analysis API CPU + user-visible latency |
+| `InFlight` (Rust bridge) | User-visible latency only |
 
 #### The invariant
 
 For a tight burst of N completions on the same URI (each request issued before the
 previous returned), exactly **one** request — the latest, with `my_seq == N == latest_seq[uri]`
-— passes both checkpoints and returns items. The other **N-1** are caught at one of
-the two checkpoints:
+— passes all three checkpoints and returns items. The other **N-1** are caught at one
+of the three checkpoints:
 
 ```
-superseded_before_send + superseded_in_flight = N - 1
+superseded_before_send + supersededAtDispatch + superseded_in_flight = N - 1
 ```
 
-The split between the two stages depends on timing — fast writer drains the channel
-between requests so older ones reach the sidecar (caught at `InFlight`); slow writer
-keeps multiple requests queued so the supersession check in the writer drops them
-(caught at `BeforeSend`). Real-project measurement under tight bursts (5 ms inter-request
-gap) saw all supersessions land in `InFlight` because the writer task is fast enough
-to drain between each request. This is fine — the user-visible latency improvement
-is identical (the latest request returns in ~100 ms instead of waiting ~1.3 s behind
-stale work).
+The split between stages depends on timing. Real-project measurement before ser-leba
+landed under tight bursts (5 ms inter-request gap) saw all supersessions land in
+`InFlight` because the writer task is fast enough to drain between each request and
+the sidecar had no Checkpoint 2. ser-leba moves the bulk of those `InFlight` cases
+to `SupersededAtDispatch` — same user-visible latency improvement, but the sidecar
+no longer wastes Analysis API CPU on stale completions (ratio
+`supersededAtDispatch / superseded_in_flight` is expected to be > 5x in typical
+typing bursts).
 
 #### Scope
 
@@ -231,9 +261,15 @@ so a typing burst in `Foo.kt` does not affect a completion request in `Bar.kt`.
 
 When `completionMetrics` is enabled, every completion request — including superseded
 ones — emits a structured log under `target=completion_metrics` with `supersession_seq`,
-`superseded_before_send_total`, and `superseded_in_flight_total`. This makes the
-supersession effect directly visible in `KOTLIN_ANALYZER_COMPLETION_METRICS=1` runs
-and is what the `completion-burst` sensor (ka-g342) consumes.
+`superseded_before_send_total`, and `superseded_in_flight_total`. The sidecar's
+dispatcher Checkpoint 2 is surfaced as a cumulative counter
+`metrics.counts.supersededAtDispatch` on every record (visible inside the
+`sidecar=...` field of the Rust log line). Short-circuited responses additionally
+carry `metrics.fields.supersededAtDispatch="true"` and
+`metrics.fields.sidecarSeq` / `sidecarLatestSeq` so the per-request decision is
+visible in the log. This makes the supersession effect directly visible in
+`KOTLIN_ANALYZER_COMPLETION_METRICS=1` runs and is what the `completion-burst`
+sensor (ka-g342) consumes.
 
 ### 4.2 Background Analyze Supersession
 
