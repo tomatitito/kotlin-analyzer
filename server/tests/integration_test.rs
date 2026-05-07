@@ -223,7 +223,10 @@ fn test_execute_command_open_target_uses_zed_cli_for_zed_clients() {
     std::env::remove_var("KOTLIN_ANALYZER_ZED_CLI");
 
     let (response, requests) = result;
-    assert!(requests.is_empty(), "Zed CLI navigation should not emit showDocument");
+    assert!(
+        requests.is_empty(),
+        "Zed CLI navigation should not emit showDocument"
+    );
     assert_eq!(response["result"]["shown"], json!(true));
 }
 
@@ -415,8 +418,7 @@ object FallbackService : Service {
 
     std::fs::write(&service_path, service_text).expect("failed to write interface");
     std::fs::write(&primary_path, primary_text).expect("failed to write primary implementation");
-    std::fs::write(&fallback_path, fallback_text)
-        .expect("failed to write fallback implementation");
+    std::fs::write(&fallback_path, fallback_text).expect("failed to write fallback implementation");
 
     let root_uri = format!("file://{}", workspace.path().display());
     let service_uri = format!("file://{}", service_path.display());
@@ -453,7 +455,9 @@ object FallbackService : Service {
         .map(|location| {
             (
                 location["uri"].as_str().unwrap_or_default().to_string(),
-                location["range"]["start"]["line"].as_u64().unwrap_or_default(),
+                location["range"]["start"]["line"]
+                    .as_u64()
+                    .unwrap_or_default(),
             )
         })
         .collect::<Vec<_>>();
@@ -496,8 +500,7 @@ object FallbackService : Service {
 
     std::fs::write(&service_path, service_text).expect("failed to write interface");
     std::fs::write(&primary_path, primary_text).expect("failed to write primary implementation");
-    std::fs::write(&fallback_path, fallback_text)
-        .expect("failed to write fallback implementation");
+    std::fs::write(&fallback_path, fallback_text).expect("failed to write fallback implementation");
 
     let root_uri = format!("file://{}", workspace.path().display());
     let service_uri = format!("file://{}", service_path.display());

@@ -43,8 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let general_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
 
-    let general_layer: Box<dyn Layer<Registry> + Send + Sync> = if let Some(ref log_path) =
-        log_file
+    let general_layer: Box<dyn Layer<Registry> + Send + Sync> = if let Some(ref log_path) = log_file
     {
         let file = std::fs::OpenOptions::new()
             .create(true)

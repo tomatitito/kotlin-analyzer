@@ -122,8 +122,7 @@ pub async fn read_message(
         let params = raw.get("params").cloned();
         Ok(Some(SidecarMessage::Notification { method, params }))
     } else {
-        let response: Response =
-            serde_json::from_value(raw).map_err(ProtocolError::JsonParse)?;
+        let response: Response = serde_json::from_value(raw).map_err(ProtocolError::JsonParse)?;
         Ok(Some(SidecarMessage::Response(response)))
     }
 }

@@ -993,14 +993,14 @@ impl Bridge {
                     let mut pending = pending.lock().await;
                     if let Some(pos) = pending.iter().position(|p| p.id == id) {
                         let req = pending.remove(pos);
-                        let _ = req.response_tx.send(Err(Error::Bridge(
-                            BridgeError::Superseded {
+                        let _ = req
+                            .response_tx
+                            .send(Err(Error::Bridge(BridgeError::Superseded {
                                 bucket: tag.bucket.clone(),
                                 my_seq: tag.seq,
                                 latest_seq: latest,
                                 stage: SupersededStage::BeforeSend,
-                            },
-                        )));
+                            })));
                     }
                 }
                 None
@@ -1322,7 +1322,10 @@ mod tests {
                 assert_eq!(latest_seq, 5);
                 assert_eq!(stage, SupersededStage::BeforeSend);
             }
-            other => panic!("expected BridgeError::Superseded BeforeSend, got {:?}", other),
+            other => panic!(
+                "expected BridgeError::Superseded BeforeSend, got {:?}",
+                other
+            ),
         }
     }
 
@@ -1370,10 +1373,7 @@ mod tests {
             });
             receivers.push((id, seq, rx));
             // Register the seq globally as if `request_with_supersession` had run.
-            latest
-                .lock()
-                .await
-                .insert(bucket.clone(), seq);
+            latest.lock().await.insert(bucket.clone(), seq);
         }
 
         // Now the writer drains the channel in FIFO order.
@@ -1405,7 +1405,10 @@ mod tests {
             let received = rx.await.expect("dropped response_tx");
             match received {
                 Err(Error::Bridge(BridgeError::Superseded {
-                    my_seq, latest_seq, stage, ..
+                    my_seq,
+                    latest_seq,
+                    stage,
+                    ..
                 })) => {
                     assert_eq!(my_seq, seq, "request id={} should report its own seq", id);
                     assert_eq!(latest_seq, 3);
