@@ -235,6 +235,47 @@ ones — emits a structured log under `target=completion_metrics` with `superses
 supersession effect directly visible in `KOTLIN_ANALYZER_COMPLETION_METRICS=1` runs
 and is what the `completion-burst` sensor (ka-g342) consumes.
 
+### 4.2 Background Analyze Supersession
+
+Background analyze requests (the debounced diagnostics path triggered by
+`textDocument/didChange`) are now also supersedable through a bucket-based
+cancellation mechanism. Unlike completion's latest-wins supersession, analyze
+supersession is invoked explicitly by interactive request handlers.
+
+When the user triggers an interactive request (e.g., completion), the Rust LSP
+server calls `bridge.cancel_pending("analyze:{uri}")` immediately after resetting
+the interactive debounce timer. This signals the bridge writer task to drop any
+pending analyze request for that URI if it's still in the queue (i.e., hasn't been
+sent to the sidecar yet).
+
+The `analyze:{uri}` bucket convention ensures that each URI's background diagnostics
+can be cancelled independently. Future expansion may add similar `cancel_pending`
+calls for other request types (hover, definition, etc.) using their own bucket names.
+
+#### Two Layers of Defence
+
+The ka-hexa implementation provides two layers to reduce wasted sidecar CPU during
+interactive bursts:
+
+| Failure mode | Covered by |
+|---|---|
+| Analyze about to be scheduled when user types | Layer 1: interactive cooldown in the debouncer (300 ms delay resets on interactive request) |
+| Analyze already in writer queue, not yet sent | Layer 2: `cancel_pending` in the completion handler (drops queued analyze before it reaches sidecar stdin) |
+| Analyze already mid-`collectDiagnostics` | Out of scope (no mid-flight cancellation) |
+
+**Mid-flight cancellation is explicitly not implemented.** The sidecar runs analysis
+on a single thread with no checkpoint hooks in the Kotlin Analysis API. Cancelling
+an in-flight analyze would require threading interruption state through the compiler,
+which is brittle and offers marginal benefit — the interactive cooldown and
+queue-based cancellation already cover the high-value cases.
+
+#### Observability
+
+The observable signal for this mechanism is the `analyze_pending_cancelled_total`
+field on the `target=completion_metrics` log line. This cumulative counter increments
+each time the bridge writer task drops a queued analyze request due to
+`cancel_pending`. It resets only on bridge restart.
+
 ## 5. Cancellation
 
 When the editor sends `$/cancelRequest(id)`:

@@ -842,7 +842,6 @@ impl Bridge {
     /// Returns the number of pending analyze requests dropped at the
     /// writer-task checkpoint due to `cancel_pending` calls.
     /// Cumulative; resets only on bridge restart.
-    #[allow(dead_code)] // Will be used in Phase 3 for metrics logging
     pub fn pending_cancelled_count(&self) -> u64 {
         self.pending_cancelled_count.load(Ordering::Relaxed)
     }

@@ -93,7 +93,7 @@ Structured editor-run completion metrics are opt-in:
 KOTLIN_ANALYZER_COMPLETION_METRICS=1 cargo run -- --log-level info
 ```
 
-When enabled, each Rust completion request sends a correlation id to the sidecar. Rust logs include request receipt, document lookup, bridge enqueue/send, bridge response wait, response conversion, and total timing. Sidecar metrics include dispatch/queue timing when observable plus completion implementation stages and candidate counts.
+When enabled, each Rust completion request sends a correlation id to the sidecar. Rust logs include request receipt, document lookup, bridge enqueue/send, bridge response wait, response conversion, and total timing. Sidecar metrics include dispatch/queue timing when observable plus completion implementation stages and candidate counts. The `analyze_pending_cancelled_total` cumulative counter is included in each completion timing record to track how often the ka-hexa cancel-pending path fires in real Zed sessions.
 
 ### Per-session metrics log files (ka-wkai, ka-dhkx)
 

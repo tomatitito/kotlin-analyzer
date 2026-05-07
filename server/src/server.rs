@@ -2117,6 +2117,7 @@ impl LanguageServer for KotlinLanguageServer {
                 let conversion_ms = conversion_start.elapsed().as_secs_f64() * 1000.0;
                 if metrics_enabled {
                     let sidecar_metrics = result.get("metrics").cloned().unwrap_or(Value::Null);
+                    let analyze_pending_cancelled_total = bridge.pending_cancelled_count();
                     tracing::info!(
                         target: "completion_metrics",
                         correlation_id = %correlation_id,
@@ -2135,6 +2136,7 @@ impl LanguageServer for KotlinLanguageServer {
                         supersession_seq = my_seq,
                         superseded_before_send_total = bridge.superseded_before_send_count(),
                         superseded_in_flight_total = bridge.superseded_in_flight_count(),
+                        analyze_pending_cancelled_total,
                         sidecar = %sidecar_metrics,
                         "completion timing"
                     );
@@ -2161,6 +2163,7 @@ impl LanguageServer for KotlinLanguageServer {
                 stage,
             })) => {
                 if metrics_enabled {
+                    let analyze_pending_cancelled_total = bridge.pending_cancelled_count();
                     tracing::info!(
                         target: "completion_metrics",
                         correlation_id = %correlation_id,
@@ -2172,6 +2175,7 @@ impl LanguageServer for KotlinLanguageServer {
                         rust_total_ms = request_received_at.elapsed().as_secs_f64() * 1000.0,
                         superseded_before_send_total = bridge.superseded_before_send_count(),
                         superseded_in_flight_total = bridge.superseded_in_flight_count(),
+                        analyze_pending_cancelled_total,
                         "completion superseded"
                     );
                 }
