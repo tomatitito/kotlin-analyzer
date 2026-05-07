@@ -90,6 +90,19 @@ async fn main() -> anyhow::Result<()> {
         args
     );
 
+    // Stamp the metrics log with the source revision that built this binary
+    // so .sensors/log-analysis can attribute each session to a commit.
+    // Lives on the metrics target so it lands in the per-session log file
+    // without polluting general-level logs.
+    tracing::info!(
+        target: METRICS_TARGET,
+        version = env!("CARGO_PKG_VERSION"),
+        commit = env!("GIT_COMMIT_HASH"),
+        dirty = env!("GIT_DIRTY"),
+        pid = std::process::id(),
+        "kotlin-analyzer session start"
+    );
+
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
