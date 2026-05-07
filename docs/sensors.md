@@ -6,27 +6,30 @@ The first planned sensor is the completion latency sensor from `ka-rw1x`.
 
 ## Command Shape
 
-The intended developer entrypoint is:
+The developer entrypoint is the `sensors` binary built from `tools/sensors/`. Two flavours of sensor live under it:
+
+- **Rust sensors** are subcommands of the binary (currently `completion-burst`, see below). Run as `sensors <name> [flags]`.
+- **Script sensors** live as Python files under `<repo-root>/.sensors/<name>.py` and are dispatched by `sensors run <name>`. The `Run` subcommand walks up from cwd to find `.sensors/`, then shells out to `python3` with any trailing args forwarded verbatim. Override the discovered root with `--repo-root`.
 
 ```bash
-sensors run
+sensors completion-burst --help            # Rust sensor
+sensors run log-analysis                   # script sensor
+sensors run log-analysis --json            # trailing args forward to the script
 ```
 
-Future implementations may support selecting a specific sensor:
+The binary needs to be on `PATH`. Symlink it the same way as the LSP server:
 
 ```bash
-sensors run completion-latency
+ln -sf "$(pwd)/tools/sensors/target/release/sensors" ~/.local/bin/sensors
 ```
 
-and selecting an input project:
+Until the symlink is in place, run via cargo:
 
 ```bash
-sensors run completion-latency --project-root /path/to/project
+cargo run --release --manifest-path tools/sensors/Cargo.toml -- run log-analysis
 ```
 
-The command should be easy to run from the repository root. It may delegate to Gradle, Cargo, or a small wrapper binary internally, but the user-facing vocabulary should remain "sensor" rather than "benchmark script" once the CLI exists.
-
-The current implementation exposes the completion latency sensor through Gradle until a top-level `sensors` binary exists:
+A legacy Gradle entrypoint also exists for the older Kotlin-based completion benchmark:
 
 ```bash
 cd sidecar && ./gradlew benchmark
@@ -122,6 +125,94 @@ If neither is set, no file is written and the server runs normally. Each session
 - Missing intermediate directories under the configured path are created via `std::fs::create_dir_all`. If creation fails (permissions, read-only filesystem, typo), the server logs `metrics file disabled: cannot create <path>: <reason>` once at info level and keeps running. There is no fallback path — typos surface this way instead of being silently rerouted.
 - Files accumulate; there is no automatic rotation. The repo's `logs/` directory remains a sensible default that the user opts into via the setting, not via auto-discovery; `.gitkeep` keeps the path stable.
 - **Multi-worktree caveat**: a single LSP server process can serve multiple worktrees. If two worktrees configure different `completionMetricsDir` values, the value from whichever worktree initialised the server first wins for the rest of the process lifetime.
+
+### log-analysis (ser-8btk)
+
+`log-analysis` is a script-based sensor that aggregates the per-session metrics log files produced by the section above. It is the read side of `completionMetrics` — the tool you run after typing in Zed to see what the supersession machinery actually did. Lives at `.sensors/log-analysis.py`, dispatched via the `sensors run` wrapper added in the same ticket.
+
+#### Invocation
+
+```bash
+sensors run log-analysis                   # aggregate every .logs/*.log, latest first
+sensors run log-analysis --json            # same data, machine-readable
+sensors run log-analysis --path FILE       # original single-session view
+sensors run log-analysis --path FILE -v    # adds the per-record trace
+sensors run log-analysis --path FILE --json
+```
+
+The default mode reads every non-empty `kotlin-analyzer-*.log` under `<repo-root>/.logs/`. Pass `--repo-root` to point at a different `.logs/` location (the wrapper auto-discovers `.sensors/` by walking up from cwd, so most users never need this).
+
+The script is stdlib-only Python 3 — no `pip install` step. The wrapper shells out to `python3` from `PATH`.
+
+#### Aggregate-mode output
+
+```
+runs: 8 log file(s) (latest at top)
+commit annotations: '+' = dirty tree at build, '~' = approximate (git mtime fallback)
+  2026-05-07T15-38-46Z  commit=59633a9bdcfc+   records=   8  (kotlin-analyzer-...log)
+  ...
+
+=== bridge_response_wait_ms ===
+  run                   commit              min       avg     median       max       p99
+  --------------------------------------------------------------------------------------
+  2026-05-07T15-38-46Z  59633a9bdcfc+    140.8↓   646.9↓    234.6↓    1862↓    1862↓
+  2026-05-07T15-35-08Z  ~6947b02          2599↑    2599↑     2599↑    2599↑    2599↑
+  ...
+```
+
+One table per metric. Rows are runs (latest at top); columns are `min`, `avg`, `median`, `max`, `p99` over the per-record values within that run. Each cell carries an arrow comparing it to the same cell in the row below (the next-older run): `↑` higher, `↓` lower, blank if equal or if either side has no value.
+
+The commit column distinguishes three sources:
+- `<sha>` or `<sha>+` — the binary self-stamped via `server/build.rs` on startup. Trustworthy. `+` means the build tree was dirty (uncommitted edits at compile time).
+- `~<sha>` — fallback from `git -C <repo> log --before=<file mtime> -1 --format=%h`. **Approximate**: it picks the latest commit that existed when the log file was last written, which is wrong if you ran an old binary against newer code or forgot to rebuild. Useful for historical logs that predate the `build.rs` stamp.
+- `unknown` — neither path produced a commit.
+
+#### Metric legend
+
+| Metric | Layer | What "up" means | Direction-of-good |
+|---|---|---|---|
+| `bridge_response_wait_ms` | Rust LSP | User-visible latency from request to response | down |
+| `sidecar_queue_wait_ms` | Sidecar | Time the request sat in the OS pipe before dispatch | down |
+| `superseded_before_send_total` † | Rust writer | Cumulative requests dropped before stdin write | up = better (cheap catch) |
+| `supersededAtDispatch` † | Sidecar dispatcher | Cumulative requests short-circuited before the K2 Analysis API call (ser-leba Checkpoint 2) | up = better (saves ~150 ms each) |
+| `superseded_in_flight_total` † | Rust bridge | Cumulative responses discarded after the sidecar already did the work | down = better (less wasted CPU) |
+| `analyze_pending_cancelled_total` † | Rust bridge | Cumulative background analyze requests cancelled by interactive bursts (ka-hexa) | neutral — depends on typing |
+
+† marks cumulative counters; their `max` within a row ≈ the session total. `min` / `avg` / `median` describe the growth curve and are mostly useful for spotting which point in the session the counter jumped.
+
+For the supersession story end-to-end, see [`docs/lsp-protocol.md` §4.1](lsp-protocol.md#41-latest-wins-supersession-completion). The three counters together budget every typing-burst keystroke that gets dropped: each goes through exactly one of the three checkpoints, and the three counters sum to "total requests dropped per bucket".
+
+#### Single-session output (`--path FILE`)
+
+The original per-session summary: cumulative totals at the last record, per-URI activity breakdown (returned vs. dropped), and warm-vs-queued latency split (the `WARM_QUEUE_WAIT_MS_THRESHOLD = 50 ms` constant in the script defines the boundary). Add `-v` for a per-record trace that shows when each cumulative counter advanced.
+
+Use this when you want to dig into a specific run; use the default aggregate mode when you want trend lines across runs.
+
+#### JSON output
+
+`--json` is supported in both modes. Aggregate mode emits:
+
+```jsonc
+{
+  "runs": [{"timestamp": "...", "commit": "...", "commit_source": "embedded|git-mtime|unknown", "commit_dirty": true, "record_count": 8, ...}, ...],
+  "metrics": {
+    "bridge_response_wait_ms": {
+      "cumulative": false,
+      "rows": [
+        {
+          "run": "2026-05-07T15-38-46Z",
+          "stats": {"min": 140.8, "avg": 646.9, "median": 234.6, "max": 1861.8, "p99": 1861.8},
+          "delta_from_previous": {"min": "down", "avg": "down", ...}
+        },
+        ...
+      ]
+    },
+    ...
+  }
+}
+```
+
+Single-session mode emits the original shape (per-URI map, session totals, latency stats split by warm/queued).
 
 ## Output Model
 

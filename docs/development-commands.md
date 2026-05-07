@@ -20,29 +20,32 @@ cd sidecar && ./gradlew test               # unit tests
 
 ## Sensors
 
-Sensors are runnable observability probes. The intended top-level entrypoint is:
+Sensors are runnable observability probes. The CLI is the `sensors` binary built from `tools/sensors/`. Two flavours coexist: Rust subcommands (e.g. `completion-burst`) and Python script sensors under `.sensors/` invoked via `sensors run <name>`.
 
 ```bash
-sensors run
+# Symlink onto PATH (one-time, mirrors the kotlin-analyzer symlink dance):
+ln -sf "$(pwd)/tools/sensors/target/release/sensors" ~/.local/bin/sensors
+
+# Read the metrics logs Zed wrote since you last looked:
+sensors run log-analysis
+sensors run log-analysis --json
+sensors run log-analysis --path .logs/kotlin-analyzer-2026-05-07T15-38-46Z.log -v
+
+# Drive the LSP with a synthetic typing burst:
+sensors completion-burst --help
+sensors completion-burst \
+    --project-root /path/to/project --target-file /path/to/project/src/Foo.kt \
+    --line 42 --character 8 --scenario tight-burst --regression-guard
 ```
 
-Until the sensor CLI exists, run the completion latency sensor through Gradle:
+A legacy Gradle entrypoint also exists for the older Kotlin benchmark:
 
 ```bash
 cd sidecar && ./gradlew benchmark
 cd sidecar && ./gradlew benchmark --args="--warmups 3 --iterations 30 --jsonl-output build/completion-sensor.jsonl"
 ```
 
-The Rust-based `completion-burst` sensor (ka-g342) lives at `tools/sensors/`:
-
-```bash
-cargo run --manifest-path tools/sensors/Cargo.toml -- completion-burst --help
-cargo run --manifest-path tools/sensors/Cargo.toml -- completion-burst \
-    --project-root /path/to/project --target-file /path/to/project/src/Foo.kt \
-    --line 42 --character 8 --scenario tight-burst --regression-guard
-```
-
-See [docs/sensors.md](sensors.md) for scenario presets and output shape.
+See [docs/sensors.md](sensors.md) for the per-sensor reference (including the metric legend and commit-stamp annotations used by `log-analysis`).
 
 For before/after performance baselines against a real Kotlin project,
 the driver script captures all three burst scenarios across a
