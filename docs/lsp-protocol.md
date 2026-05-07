@@ -259,9 +259,14 @@ interactive bursts:
 
 | Failure mode | Covered by |
 |---|---|
-| Analyze about to be scheduled when user types | Layer 1: interactive cooldown in the debouncer (300 ms delay resets on interactive request) |
-| Analyze already in writer queue, not yet sent | Layer 2: `cancel_pending` in the completion handler (drops queued analyze before it reaches sidecar stdin) |
+| Analyze about to be scheduled when user types | Layer 1: post-interactive cooldown in the debouncer (`POST_INTERACTIVE_QUIET_WINDOW = 500 ms`, capped by `MAX_DEFER = 5 s`). Built on the `interactive_epoch` and `last_interactive_at` signals. |
+| Analyze already in writer queue, not yet sent | Layer 2: `Bridge::cancel_pending("analyze:{uri}")` in the completion handler (drops queued analyze before it reaches sidecar stdin) |
 | Analyze already mid-`collectDiagnostics` | Out of scope (no mid-flight cancellation) |
+
+The full mechanism behind Layer 1 — the `interactive_epoch` sentinel, the cooldown
+timing, and the relationship to the project-wide background analysis loop — is
+documented in [architecture.md §8](architecture.md#8-interactive-vs-background-request-scheduling).
+This section covers only the wire-level consequences for `analyze` requests.
 
 **Mid-flight cancellation is explicitly not implemented.** The sidecar runs analysis
 on a single thread with no checkpoint hooks in the Kotlin Analysis API. Cancelling

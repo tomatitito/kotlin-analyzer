@@ -294,3 +294,125 @@ An optional `--log-file <path>` flag redirects log output to a file.
 
 The default level is `INFO`. This can be overridden via the `--log-level` CLI flag or
 the `kotlin.trace.server` configuration setting (`"off"`, `"messages"`, `"verbose"`).
+
+## 8. Interactive vs Background Request Scheduling
+
+The Kotlin Analysis API requires single-threaded access — every `KaSession` call
+must execute on the same thread. The JVM sidecar therefore runs a strictly serial
+dispatch loop (`AnalysisServer.run()`), and parallelism is not available as a
+performance lever. The lever the Rust LSP server pulls instead is **ordering**:
+keep interactive requests (completion, hover, definition, references, code actions)
+ahead of background work (debounced `analyze` for diagnostics, project-wide
+analysis on open).
+
+Two cooperating signals on `KotlinLanguageServer` make this possible. They are
+the foundation that the supersession mechanisms in
+[lsp-protocol.md §4.1](lsp-protocol.md#41-latest-wins-supersession-completion)
+and [lsp-protocol.md §4.2](lsp-protocol.md#42-background-analyze-supersession)
+build on top of.
+
+### 8.1 The `interactive_epoch` sentinel
+
+```rust
+struct KotlinLanguageServer {
+    interactive_epoch: Arc<AtomicU64>,   // monotonically increasing
+    last_interactive_at: Arc<Mutex<Option<Instant>>>,
+    // …
+}
+```
+
+Every interactive request handler calls `note_interactive_request()` on entry,
+which atomically increments `interactive_epoch` and writes the current `Instant`
+into `last_interactive_at`. The bumps happen in the same async call so the two
+signals stay consistent.
+
+The numeric value of `interactive_epoch` carries no meaning. Only the **change**
+between two snapshots matters. Background work captures the value when it begins
+waiting and reads it again before doing the expensive thing — if the value
+changed, an interactive request happened in between, and the background task
+defers or aborts.
+
+A monotonically increasing counter is used instead of a boolean because every
+interactive request must be observable as a unique tick. With a boolean the
+reset would itself race with new interactive requests; with a counter no reset
+is needed. `Ordering::Relaxed` is sufficient — a stale read at worst causes one
+extra background cycle that the next check cancels.
+
+The signal has two consumers today:
+
+1. **The debounced `analyze` loop** (`start_debounce_loop`) captures the epoch
+   when a `didChange` schedules an analyze, then re-checks just before
+   dispatch. If different → defer to the next cycle.
+2. **The project-wide background analysis loop** captures the epoch at the
+   start of a multi-file scan, re-checks between files, and aborts the whole
+   scan if the user starts interacting partway through.
+
+### 8.2 Post-interactive cooldown
+
+The epoch check answers "did anyone interactive happen *during* my wait?" but
+not "was there interactive activity *recently*?" — a completion that arrived
+just before the debouncer's epoch snapshot leaves the epoch unchanged at
+dispatch time, so an analyze fires immediately even though the user is clearly
+still active.
+
+The cooldown closes that hole. After the epoch check passes, the debouncer also
+consults `last_interactive_at`:
+
+```text
+const POST_INTERACTIVE_QUIET_WINDOW: Duration = Duration::from_millis(500);
+const MAX_DEFER: Duration = Duration::from_secs(5);
+```
+
+If `since_last_interactive < POST_INTERACTIVE_QUIET_WINDOW`, the loop sleeps for
+the remaining window, then re-reads `interactive_epoch` once more. If the user
+kept typing during the sleep, the epoch will have moved and the cycle defers as
+normal. The `MAX_DEFER` ceiling caps the cumulative delay so non-stop typing
+cannot starve diagnostics indefinitely; under sustained interaction analyze
+still fires within ~5.3 s of the first activity.
+
+```text
+t=0     didChange (no epoch bump — only request handlers bump)
+        schedule debouncer for t=300 with epoch_at_schedule=N
+
+t=200   completion request
+        epoch → N+1, last_interactive_at → 200
+
+t=300   debouncer wakes; epoch N+1 ≠ N → DEFER (existing behaviour)
+        reschedule with epoch_at_schedule = N+1
+
+t=600   debouncer wakes; epoch matches N+1
+        BUT since_last_interactive = 400 ms < 500 ms
+        → sleep 100 ms, then re-check epoch
+
+t=700   epoch still N+1 → fire analyze
+        (user has been quiet 500 ms — likely an actual pause)
+```
+
+### 8.3 Bridge-level supersession
+
+Even with the cooldown, an `analyze` can already be sitting in the bridge
+writer channel by the time a completion request arrives. The bridge layer
+provides `Bridge::cancel_pending(bucket)` for this case: it bumps the
+per-bucket supersession sequence so the writer task drops the queued message
+before stdin. The completion handler invokes
+`cancel_pending("analyze:{uri}")` immediately after `note_interactive_request()`
+to flush any analyze still pending for the same file.
+
+This is the same machinery completion supersession uses (introduced in
+ka-rr3u), generalised to be invokable explicitly from anywhere in the server.
+Disjoint bucket namespaces (`"<uri>"` for completion, `"analyze:<uri>"` for
+analyze) keep the two supersession streams from interfering. See
+[lsp-protocol.md §4.1](lsp-protocol.md#41-latest-wins-supersession-completion)
+and [§4.2](lsp-protocol.md#42-background-analyze-supersession) for the
+wire-level details and the observability surface
+(`analyze_pending_cancelled_total` on the per-completion metrics line).
+
+### 8.4 What is deliberately not addressed
+
+Mid-flight cancellation of an `analyze` already running inside the sidecar is
+out of scope. The Kotlin Analysis API exposes no cooperative cancellation
+hooks inside `collectDiagnostics`, and hard-killing the analysis thread would
+corrupt the session. If the JetBrains team adds checkpoint hooks to the K2
+Analysis API in a future release, this becomes feasible; until then the
+two-layer Rust-side defence (cooldown + queue-level supersession) is the
+ceiling of what we can do without sidecar architectural changes.
