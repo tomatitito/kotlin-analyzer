@@ -16,6 +16,8 @@ cd sidecar && ./gradlew assembleRuntimePayloads   # build launcher + versioned r
 cd sidecar && ./gradlew test               # unit tests
 ```
 
+`assembleRuntimePayloads` writes the `launcher/` + `payload/` layout under `sidecar/build/runtime/<kotlin-version>/` that the Rust LSP launches as its JVM subprocess. See [Distribution → Runtime Layout](distribution.md#runtime-layout-launcher--payload) for the layout and [Distribution → What `assembleRuntimePayloads` does](distribution.md#what-assembleruntimepayloads-does) for the step-by-step. Re-run this task after any change under `sidecar/src/` — `./gradlew jar` alone updates `build/libs/`, which the Rust LSP does not read.
+
 ## Sensors
 
 Sensors are runnable observability probes. The intended top-level entrypoint is:

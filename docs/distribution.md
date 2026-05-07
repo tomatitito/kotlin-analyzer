@@ -32,7 +32,7 @@ kotlin-analyzer-0.1.0-aarch64-apple-darwin/
     └── 2.3.20/
 ```
 
-Each runtime directory contains a `manifest.json`, a small launcher jar, and a payload classpath with the sidecar implementation plus the Kotlin compiler and Analysis API artifacts for that Kotlin line. Build this layout with `./gradlew assembleRuntimePayloads`.
+Each runtime directory contains a `manifest.json`, a small launcher jar, and a payload classpath with the sidecar implementation plus the Kotlin compiler and Analysis API artifacts for that Kotlin line. Build this layout with `./gradlew assembleRuntimePayloads` (see [Runtime Layout](#runtime-layout-launcher--payload) for what the task does).
 
 The runtime manifest now also records:
 
@@ -47,6 +47,43 @@ The runtime manifest now also records:
 `validatedSameMinor` lists the Kotlin major.minor lines for which same-minor patch fallback has been explicitly validated. If a manifest does not declare validation for the requested line, runtime selection skips same-minor fallback and moves on to the cross-minor bundled fallback path instead.
 
 Do **not** embed the runtime payloads inside the Rust binary via `include_bytes!()`. They are large and versioned independently; embedding them would bloat the binary, slow compilation, and prevent runtime selection per project. Ship them alongside the binary in the archive.
+
+### Runtime Layout (launcher + payload)
+
+Each `<kotlin-version>/` runtime directory is laid out as:
+
+```
+sidecar/build/runtime/2.3.20/
+├── manifest.json              # bundle descriptor (see field list above)
+├── launcher/
+│   └── sidecar-launcher.jar   # Java-17, no Kotlin dep, holds `LauncherMain`
+└── payload/
+    ├── sidecar-impl.jar       # our Kotlin sidecar code (renamed from build/libs/sidecar-<version>.jar)
+    ├── kotlin-compiler-<v>.jar
+    ├── analysis-api-k2-for-ide-<v>.jar
+    ├── analysis-api-impl-base-for-ide-<v>.jar
+    └── …other third-party jars…
+```
+
+**Why launcher and payload are split.** They share a single JVM classpath at runtime — the Rust LSP joins every entry from `manifest.classpath` with the platform separator and runs `java -cp <all-jars> <manifest.mainClass>`. There is no in-process classloader isolation between launcher and payload. The split exists because:
+
+- The launcher is the **stable entry point**. `manifest.mainClass` always points at `dev.kouros.sidecar.launcher.LauncherMain` in the launcher jar; payload jars vary per Kotlin version. Keeping the entry-point class in a path that doesn't change makes the manifest contract stable across versions.
+- The launcher is **Java-only**, so it loads before any Kotlin runtime class. That makes it a safe place for future pre-Kotlin checks (JVM-flag validation, payload integrity probes, env-var diagnostics) that should run regardless of which payload is selected.
+- The launcher has its own `compileLauncherJava` task with `options.release.set(17)`, decoupling its bytecode level from the Kotlin-versioned payload.
+
+Cross-version isolation between Kotlin Analysis API lines exists, but at the **process** level — the Rust LSP picks one runtime per project and starts a JVM dedicated to it. Multiple projects served by the same LSP process result in separate JVM subprocesses, never overlapping classpaths.
+
+### What `assembleRuntimePayloads` does
+
+Defined in `sidecar/build.gradle.kts:152`. It is an umbrella task that fans out to one subtask per entry in `supportedRuntimeKotlinVersions` (today, just `2.3.20`). For each version, the subtask:
+
+1. Wipes `build/runtime/<version>/` clean.
+2. Copies `sidecar-launcher.jar` (built by `compileLauncherJava` + `launcherJar`) into `launcher/`.
+3. Copies the regular `jar` task output into `payload/`, renamed to `sidecar-impl.jar`.
+4. Resolves the runtime classpath for that Kotlin version (the project's own `runtimeClasspath` if it matches `kotlinVersion`, or a detached configuration with explicitly versioned dependencies for other supported lines) and copies every jar into `payload/`.
+5. Writes `manifest.json` listing `kotlinVersion`, `mainClass`, `analyzerVersion`, `targetPlatform`, `validatedSameMinor`, and the explicit classpath order (launcher first, then `payload/sidecar-impl.jar`, then the rest of the payload jars sorted by name).
+
+**Why you have to re-run it after sidecar source changes.** The standard `jar` task produces `sidecar/build/libs/sidecar-<version>.jar`, but the Rust LSP doesn't read that path. It loads `payload/sidecar-impl.jar` from the runtime directory. Without the re-copy, `cargo build && cd sidecar && ./gradlew jar` produces a fresh sidecar jar that the running LSP never sees. `assembleRuntimePayloads` is the step that makes new sidecar code visible at runtime.
 
 ### Runtime Cache
 
