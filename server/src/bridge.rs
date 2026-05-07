@@ -96,6 +96,9 @@ pub struct Bridge {
     superseded_before_send_count: Arc<AtomicU64>,
     /// Counts of completion responses discarded after sidecar work due to supersession.
     superseded_in_flight_count: Arc<AtomicU64>,
+    /// Counts of pending analyze requests dropped at the writer-task checkpoint due to
+    /// `cancel_pending` calls. Cumulative; resets only on bridge restart.
+    pending_cancelled_count: Arc<AtomicU64>,
     runtime: SidecarRuntime,
     java_path: PathBuf,
     config: Arc<Mutex<Config>>,
@@ -142,6 +145,7 @@ impl Bridge {
             latest_supersession_seq: Arc::new(Mutex::new(HashMap::new())),
             superseded_before_send_count: Arc::new(AtomicU64::new(0)),
             superseded_in_flight_count: Arc::new(AtomicU64::new(0)),
+            pending_cancelled_count: Arc::new(AtomicU64::new(0)),
             runtime,
             java_path,
             config: Arc::new(Mutex::new(config)),
@@ -448,6 +452,7 @@ impl Bridge {
         let writer_pending = Arc::clone(&self.pending);
         let writer_supersession = Arc::clone(&self.latest_supersession_seq);
         let writer_skip_count = Arc::clone(&self.superseded_before_send_count);
+        let writer_cancelled_count = Arc::clone(&self.pending_cancelled_count);
 
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
@@ -456,6 +461,7 @@ impl Bridge {
                     &writer_pending,
                     &writer_supersession,
                     &writer_skip_count,
+                    &writer_cancelled_count,
                 )
                 .await
                 {
@@ -806,6 +812,41 @@ impl Bridge {
         self.superseded_in_flight_count.load(Ordering::Relaxed)
     }
 
+    /// Bumps the per-bucket supersession seq, causing any
+    /// `QueuedMessage::Supersedable` for `bucket` still in the writer
+    /// channel to be dropped at `filter_queued_message`. Returns the
+    /// new latest seq.
+    ///
+    /// In-flight requests (already written to stdin) are not cancelled —
+    /// see `docs/lsp-protocol.md` §5 for why mid-flight Analysis API
+    /// cancellation is out of scope.
+    pub async fn cancel_pending(&self, bucket: &str) -> u64 {
+        let mut map = self.latest_supersession_seq.lock().await;
+        let entry = map.entry(bucket.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// Convenience wrapper: `request_with_supersession` with the
+    /// 60s default timeout used by `request`.
+    pub async fn request_supersedable(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        bucket: &str,
+    ) -> Result<(Value, BridgeRequestTiming, u64), Error> {
+        self.request_with_supersession(method, params, Duration::from_secs(60), bucket)
+            .await
+    }
+
+    /// Returns the number of pending analyze requests dropped at the
+    /// writer-task checkpoint due to `cancel_pending` calls.
+    /// Cumulative; resets only on bridge restart.
+    #[allow(dead_code)] // Will be used in Phase 3 for metrics logging
+    pub fn pending_cancelled_count(&self) -> u64 {
+        self.pending_cancelled_count.load(Ordering::Relaxed)
+    }
+
     /// Sends a JSON-RPC notification (no response expected).
     /// Waits for sidecar readiness before sending.
     pub async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), Error> {
@@ -968,6 +1009,7 @@ impl Bridge {
         pending: &Mutex<Vec<PendingRequest>>,
         latest_supersession_seq: &Mutex<HashMap<String, u64>>,
         skip_count: &AtomicU64,
+        cancelled_count: &AtomicU64,
     ) -> Option<Request> {
         match message {
             QueuedMessage::Plain(request) => Some(request),
@@ -980,14 +1022,29 @@ impl Bridge {
                     return Some(request);
                 }
                 let id_opt = request.id;
-                tracing::debug!(
-                    target: "completion_supersession",
-                    bucket = %tag.bucket,
-                    my_seq = tag.seq,
-                    latest_seq = latest,
-                    request_id = ?id_opt,
-                    "dropping superseded request before stdin write"
-                );
+
+                // Log and count analyze-bucket drops separately from completion drops
+                if tag.bucket.starts_with("analyze:") {
+                    tracing::debug!(
+                        target: "analyze_supersession",
+                        bucket = %tag.bucket,
+                        my_seq = tag.seq,
+                        latest_seq = latest,
+                        request_id = ?id_opt,
+                        "dropping superseded analyze request before stdin write"
+                    );
+                    cancelled_count.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    tracing::debug!(
+                        target: "completion_supersession",
+                        bucket = %tag.bucket,
+                        my_seq = tag.seq,
+                        latest_seq = latest,
+                        request_id = ?id_opt,
+                        "dropping superseded request before stdin write"
+                    );
+                }
+
                 skip_count.fetch_add(1, Ordering::Relaxed);
                 if let Some(id) = id_opt {
                     let mut pending = pending.lock().await;
@@ -1231,19 +1288,21 @@ mod tests {
     }
 
     /// Helper: build the shared state (`pending`, `latest_supersession_seq`,
-    /// skip-counter) the writer task uses, plus a registered pending entry whose
-    /// response future is returned so a test can await its resolution.
+    /// skip-counter, cancelled-counter) the writer task uses, plus a registered pending
+    /// entry whose response future is returned so a test can await its resolution.
     async fn make_writer_state(
         request_id: u64,
     ) -> (
         Arc<Mutex<Vec<PendingRequest>>>,
         Arc<Mutex<HashMap<String, u64>>>,
         Arc<AtomicU64>,
+        Arc<AtomicU64>,
         oneshot::Receiver<Result<Value, Error>>,
     ) {
         let pending = Arc::new(Mutex::new(Vec::new()));
         let latest = Arc::new(Mutex::new(HashMap::new()));
         let skip_count = Arc::new(AtomicU64::new(0));
+        let cancelled_count = Arc::new(AtomicU64::new(0));
         let (tx, rx) = oneshot::channel();
         {
             let mut p = pending.lock().await;
@@ -1252,15 +1311,17 @@ mod tests {
                 response_tx: tx,
             });
         }
-        (pending, latest, skip_count, rx)
+        (pending, latest, skip_count, cancelled_count, rx)
     }
 
     #[tokio::test]
     async fn filter_passes_plain_messages_through() {
-        let (pending, latest, skip_count, _rx) = make_writer_state(1).await;
+        let (pending, latest, skip_count, cancelled_count, _rx) = make_writer_state(1).await;
         let msg = QueuedMessage::Plain(Request::new(1, "ping", None));
 
-        let result = Bridge::filter_queued_message(msg, &pending, &latest, &skip_count).await;
+        let result =
+            Bridge::filter_queued_message(msg, &pending, &latest, &skip_count, &cancelled_count)
+                .await;
 
         assert!(result.is_some(), "Plain messages should pass through");
         assert_eq!(skip_count.load(Ordering::Relaxed), 0);
@@ -1268,7 +1329,7 @@ mod tests {
 
     #[tokio::test]
     async fn filter_passes_supersedable_when_seq_is_latest() {
-        let (pending, latest, skip_count, _rx) = make_writer_state(7).await;
+        let (pending, latest, skip_count, cancelled_count, _rx) = make_writer_state(7).await;
         // Bucket has not yet been registered → latest defaults to 0; seq=1 is fresh.
         let msg = QueuedMessage::Supersedable {
             request: Request::new(7, "completion", None),
@@ -1278,7 +1339,9 @@ mod tests {
             },
         };
 
-        let result = Bridge::filter_queued_message(msg, &pending, &latest, &skip_count).await;
+        let result =
+            Bridge::filter_queued_message(msg, &pending, &latest, &skip_count, &cancelled_count)
+                .await;
 
         assert!(result.is_some(), "fresh supersedable should be written");
         assert_eq!(skip_count.load(Ordering::Relaxed), 0);
@@ -1286,7 +1349,7 @@ mod tests {
 
     #[tokio::test]
     async fn filter_drops_superseded_request_and_resolves_pending_with_error() {
-        let (pending, latest, skip_count, rx) = make_writer_state(42).await;
+        let (pending, latest, skip_count, cancelled_count, rx) = make_writer_state(42).await;
         // Simulate a newer registration arriving before the writer drained the queue.
         {
             let mut map = latest.lock().await;
@@ -1300,7 +1363,9 @@ mod tests {
             },
         };
 
-        let result = Bridge::filter_queued_message(msg, &pending, &latest, &skip_count).await;
+        let result =
+            Bridge::filter_queued_message(msg, &pending, &latest, &skip_count, &cancelled_count)
+                .await;
 
         assert!(result.is_none(), "superseded message should be dropped");
         assert_eq!(skip_count.load(Ordering::Relaxed), 1);
@@ -1331,7 +1396,7 @@ mod tests {
 
     #[tokio::test]
     async fn filter_does_not_drop_when_other_bucket_advances() {
-        let (pending, latest, skip_count, _rx) = make_writer_state(9).await;
+        let (pending, latest, skip_count, cancelled_count, _rx) = make_writer_state(9).await;
         // A different bucket has a higher seq — must not affect this request.
         {
             let mut map = latest.lock().await;
@@ -1345,7 +1410,9 @@ mod tests {
             },
         };
 
-        let result = Bridge::filter_queued_message(msg, &pending, &latest, &skip_count).await;
+        let result =
+            Bridge::filter_queued_message(msg, &pending, &latest, &skip_count, &cancelled_count)
+                .await;
 
         assert!(
             result.is_some(),
@@ -1362,6 +1429,7 @@ mod tests {
         let pending = Arc::new(Mutex::new(Vec::new()));
         let latest = Arc::new(Mutex::new(HashMap::new()));
         let skip_count = Arc::new(AtomicU64::new(0));
+        let cancelled_count = Arc::new(AtomicU64::new(0));
         let bucket = "file:///burst.kt".to_string();
 
         let mut receivers = Vec::new();
@@ -1387,7 +1455,8 @@ mod tests {
                 },
             };
             if let Some(req) =
-                Bridge::filter_queued_message(msg, &pending, &latest, &skip_count).await
+                Bridge::filter_queued_message(msg, &pending, &latest, &skip_count, &cancelled_count)
+                    .await
             {
                 wrote_to_stdin.push(req.id.unwrap());
             }
@@ -1447,5 +1516,144 @@ mod tests {
             *entry
         };
         assert_eq!(other, 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_drops_queued_supersedable() {
+        let (pending, latest, skip_count, cancelled_count, rx) = make_writer_state(10).await;
+
+        // Register an analyze for file:///foo.kt with seq=1
+        {
+            let mut map = latest.lock().await;
+            map.insert("analyze:file:///foo.kt".to_string(), 1);
+        }
+        let msg = QueuedMessage::Supersedable {
+            request: Request::new(10, "analyze", None),
+            tag: SupersessionTag {
+                bucket: "analyze:file:///foo.kt".into(),
+                seq: 1,
+            },
+        };
+
+        // Simulate cancel_pending by bumping the seq to 2
+        {
+            let mut map = latest.lock().await;
+            let entry = map.entry("analyze:file:///foo.kt".to_string()).or_insert(0);
+            *entry += 1;
+        }
+
+        // Now filter the queued message — it should be dropped because seq=1 < latest=2
+        let result =
+            Bridge::filter_queued_message(msg, &pending, &latest, &skip_count, &cancelled_count)
+                .await;
+
+        assert!(result.is_none(), "analyze should be dropped");
+        assert_eq!(
+            cancelled_count.load(Ordering::Relaxed),
+            1,
+            "cancelled_count should be incremented"
+        );
+        assert_eq!(
+            skip_count.load(Ordering::Relaxed),
+            1,
+            "skip_count should also be incremented"
+        );
+
+        // The pending request should have been resolved with Superseded
+        let received = rx.await.expect("response_tx was dropped");
+        assert!(
+            matches!(received, Err(Error::Bridge(BridgeError::Superseded { .. }))),
+            "should receive Superseded error"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_no_op_for_unknown_bucket() {
+        let (bridge, _rx) = test_bridge();
+        // cancel_pending on a bucket that has never been registered should just bump to seq=1
+        let seq = bridge.cancel_pending("analyze:file:///unknown.kt").await;
+        assert_eq!(seq, 1, "first cancel_pending should return seq=1");
+
+        // Calling again bumps to seq=2
+        let seq2 = bridge.cancel_pending("analyze:file:///unknown.kt").await;
+        assert_eq!(seq2, 2, "second cancel_pending should return seq=2");
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_does_not_drop_other_buckets() {
+        let (bridge, _rx) = test_bridge();
+        let (pending, latest, skip_count, cancelled_count, _rx) = make_writer_state(20).await;
+
+        // Register a completion request for file:///bar.kt (bucket WITHOUT "analyze:" prefix)
+        {
+            let mut map = latest.lock().await;
+            map.insert("file:///bar.kt".to_string(), 1);
+        }
+        let msg = QueuedMessage::Supersedable {
+            request: Request::new(20, "completion", None),
+            tag: SupersessionTag {
+                bucket: "file:///bar.kt".into(),
+                seq: 1,
+            },
+        };
+
+        // Cancel the analyze bucket for the same URI — should NOT affect the completion bucket
+        let _ = bridge.cancel_pending("analyze:file:///bar.kt").await;
+
+        // Filter the completion message — it should NOT be dropped
+        let result =
+            Bridge::filter_queued_message(msg, &pending, &latest, &skip_count, &cancelled_count)
+                .await;
+
+        assert!(
+            result.is_some(),
+            "completion bucket should not be affected by analyze bucket cancel"
+        );
+        assert_eq!(
+            cancelled_count.load(Ordering::Relaxed),
+            0,
+            "cancelled_count should remain 0"
+        );
+        assert_eq!(
+            skip_count.load(Ordering::Relaxed),
+            0,
+            "skip_count should remain 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_and_completion_buckets_are_disjoint() {
+        let (pending, latest, skip_count, cancelled_count, _rx) = make_writer_state(30).await;
+
+        // Register a completion for foo.kt (bucket = "foo.kt")
+        {
+            let mut map = latest.lock().await;
+            map.insert("foo.kt".to_string(), 1);
+        }
+        let msg = QueuedMessage::Supersedable {
+            request: Request::new(30, "completion", None),
+            tag: SupersessionTag {
+                bucket: "foo.kt".into(),
+                seq: 1,
+            },
+        };
+
+        // Bump the analyze bucket for the same file (bucket = "analyze:foo.kt")
+        {
+            let mut map = latest.lock().await;
+            map.insert("analyze:foo.kt".to_string(), 10);
+        }
+
+        // Filter the completion message — should NOT be dropped because buckets are disjoint
+        let result =
+            Bridge::filter_queued_message(msg, &pending, &latest, &skip_count, &cancelled_count)
+                .await;
+
+        assert!(
+            result.is_some(),
+            "completion with bucket 'foo.kt' should not be affected by 'analyze:foo.kt'"
+        );
+        assert_eq!(cancelled_count.load(Ordering::Relaxed), 0);
+        assert_eq!(skip_count.load(Ordering::Relaxed), 0);
     }
 }

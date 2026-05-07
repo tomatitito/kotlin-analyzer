@@ -571,16 +571,17 @@ impl KotlinLanguageServer {
 
         // Request analysis
         match bridge
-            .request(
+            .request_supersedable(
                 "analyze",
                 Some(serde_json::json!({
                     "uri": uri.as_str(),
                     "version": version,
                 })),
+                &format!("analyze:{}", uri.as_str()),
             )
             .await
         {
-            Ok(result) => {
+            Ok((result, _timing, _my_seq)) => {
                 tracing::debug!(
                     "analyze_document: raw sidecar response for {}: {}",
                     uri,
@@ -609,6 +610,22 @@ impl KotlinLanguageServer {
                 self.client
                     .publish_diagnostics(uri.clone(), diagnostics, None)
                     .await;
+            }
+            Err(Error::Bridge(BridgeError::Superseded {
+                bucket,
+                my_seq,
+                latest_seq,
+                stage,
+            })) => {
+                tracing::debug!(
+                    target: "analyze_supersession",
+                    bucket = %bucket,
+                    my_seq,
+                    latest_seq,
+                    stage = ?stage,
+                    "analyze superseded for {}", uri
+                );
+                // Do NOT publish diagnostics on supersession — a newer analyze is pending
             }
             Err(e) => {
                 tracing::warn!("analyze_document: analysis failed for {}: {}", uri, e);
@@ -891,13 +908,28 @@ impl KotlinLanguageServer {
                                             continue;
                                         }
 
-                                        match bridge.request("analyze", Some(serde_json::json!({
-                                            "uri": uri.as_str(),
-                                            "version": version,
-                                        }))).await {
-                                            Ok(result) => {
+                                        match bridge.request_supersedable(
+                                            "analyze",
+                                            Some(serde_json::json!({
+                                                "uri": uri.as_str(),
+                                                "version": version,
+                                            })),
+                                            &format!("analyze:{}", uri.as_str()),
+                                        ).await {
+                                            Ok((result, _timing, _my_seq)) => {
                                                 let diagnostics = parse_diagnostics_static(&result);
                                                 client.publish_diagnostics(uri, diagnostics, None).await;
+                                            }
+                                            Err(Error::Bridge(BridgeError::Superseded { bucket, my_seq, latest_seq, stage })) => {
+                                                tracing::debug!(
+                                                    target: "analyze_supersession",
+                                                    bucket = %bucket,
+                                                    my_seq,
+                                                    latest_seq,
+                                                    stage = ?stage,
+                                                    "debounced analyze superseded"
+                                                );
+                                                // Do NOT publish diagnostics on supersession
                                             }
                                             Err(e) => {
                                                 tracing::warn!("debounced analysis failed: {}", e);
@@ -2029,6 +2061,13 @@ impl LanguageServer for KotlinLanguageServer {
         let metrics_enabled = self.completion_metrics_enabled().await;
 
         let uri = params.text_document_position.text_document.uri;
+
+        // Cancel any pending analyze for this URI to prioritize completion
+        if let Some(bridge) = self.get_bridge().await {
+            let _ = bridge
+                .cancel_pending(&format!("analyze:{}", uri.as_str()))
+                .await;
+        }
         let position = params.text_document_position.position;
         let trigger_character = params
             .context
