@@ -1,5 +1,6 @@
 import groovy.json.JsonOutput
 import org.gradle.api.artifacts.ExternalModuleDependency
+import org.gradle.api.file.FileCollection
 import org.gradle.api.tasks.compile.JavaCompile
 import org.gradle.jvm.tasks.Jar
 
@@ -158,10 +159,29 @@ supportedRuntimeKotlinVersions.forEach { runtimeKotlinVersion ->
     val taskName = "assembleRuntimePayload${runtimeKotlinVersion.runtimeTaskSuffix()}"
     val runtimeDir = layout.buildDirectory.dir("runtime/$runtimeKotlinVersion")
 
+    val runtimeClasspath: FileCollection = if (runtimeKotlinVersion == kotlinVersion) {
+        configurations.runtimeClasspath.get()
+    } else {
+        configurations.detachedConfiguration(
+            *versionedRuntimeDependencies(runtimeKotlinVersion).toTypedArray()
+        )
+    }
+
     val runtimeTask = tasks.register(taskName) {
         group = "build"
         description = "Assemble the sidecar runtime payload for Kotlin $runtimeKotlinVersion."
-        dependsOn(tasks.named("jar"), launcherJar)
+
+        inputs.file(tasks.named<Jar>("jar").flatMap { it.archiveFile })
+            .withPropertyName("sidecarJar")
+        inputs.file(launcherJar.flatMap { it.archiveFile })
+            .withPropertyName("launcherJar")
+        inputs.files(runtimeClasspath)
+            .withPropertyName("runtimeClasspath")
+        inputs.property("kotlinVersion", runtimeKotlinVersion)
+        inputs.property("mainClass", "dev.kouros.sidecar.launcher.LauncherMain")
+        inputs.property("analyzerVersion", project.version.toString())
+        inputs.property("targetPlatform", "any")
+        inputs.property("validatedSameMinor", listOf(kotlinVersionLine(runtimeKotlinVersion)))
         outputs.dir(runtimeDir)
 
         doLast {
@@ -184,13 +204,7 @@ supportedRuntimeKotlinVersions.forEach { runtimeKotlinVersion ->
                 rename { "sidecar-impl.jar" }
             }
 
-            val runtimeClasspathFiles = if (runtimeKotlinVersion == kotlinVersion) {
-                configurations.runtimeClasspath.get().resolve()
-            } else {
-                configurations
-                    .detachedConfiguration(*versionedRuntimeDependencies(runtimeKotlinVersion).toTypedArray())
-                    .resolve()
-            }.sortedBy { it.name }
+            val runtimeClasspathFiles = runtimeClasspath.files.sortedBy { it.name }
 
             copy {
                 from(runtimeClasspathFiles)
