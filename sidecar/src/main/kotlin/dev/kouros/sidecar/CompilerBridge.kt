@@ -9,7 +9,7 @@ import java.nio.file.Path
  * Delegates all feature logic to BridgeContext extension functions
  * defined in separate files.
  */
-class CompilerBridge {
+open class CompilerBridge {
     internal val ctx = BridgeContext()
 
     fun initialize(
@@ -39,7 +39,7 @@ class CompilerBridge {
     /**
      * Analyzes a file and returns diagnostics.
      */
-    fun analyze(uri: String, version: Int? = null): JsonObject =
+    open fun analyze(uri: String, version: Int? = null): JsonObject =
         ctx.analyze(uri, version)
 
     fun analyzeAll(): JsonObject =

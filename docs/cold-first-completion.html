@@ -1,0 +1,1014 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cold First Completion &mdash; Why the First Keystroke After a Pause Is Slow</title>
+<style>
+  :root {
+    --bg: #fafaf7;
+    --ink: #1d1f24;
+    --muted: #5a6068;
+    --rule: #d8d6cf;
+    --panel: #ffffff;
+
+    --rust:    #d97757;     /* Rust LSP process tint */
+    --rust-bg: #fbeee6;
+    --jvm:     #4a6fa5;     /* JVM sidecar process tint */
+    --jvm-bg:  #e6edf6;
+    --pipe:    #6b6b6b;
+    --pipe-fill:#ececec;
+
+    --cp-green:  #2f8f4e;   /* most saved */
+    --cp-amber:  #c98a18;
+    --cp-red:    #b53b3b;   /* wasted work */
+    --cp-green-bg: #e6f3ea;
+    --cp-amber-bg: #fbf2dc;
+    --cp-red-bg:   #f6e2e1;
+
+    /* timeline-specific accents */
+    --analyze:  #8c5fb3;    /* analyze (background) lane block */
+    --analyze-bg: #efe6f5;
+    --completion: #2c7a8a;  /* completion (interactive) lane block */
+    --completion-bg: #dff0f3;
+    --cancel-window: #b53b3b;
+    --cancel-window-bg: #f6e2e1;
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+
+  .page {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 40px 28px 80px;
+  }
+
+  header h1 {
+    font-size: 26px;
+    margin: 0 0 6px 0;
+    letter-spacing: -0.01em;
+  }
+  header .lede {
+    color: var(--muted);
+    max-width: 880px;
+    margin: 0 0 18px 0;
+  }
+  header .lede code { font-size: 13px; }
+
+  .crosslinks {
+    font-size: 12.5px;
+    color: var(--muted);
+    margin: 0 0 32px 0;
+  }
+  .crosslinks a {
+    color: var(--ink);
+    text-decoration: underline;
+    text-decoration-color: var(--rule);
+    text-underline-offset: 2px;
+  }
+  .crosslinks a:hover { text-decoration-color: var(--ink); }
+  .crosslinks .sep { margin: 0 8px; opacity: 0.5; }
+
+  h2 {
+    font-size: 18px;
+    margin: 36px 0 8px 0;
+    letter-spacing: -0.005em;
+  }
+  h3 {
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin: 24px 0 8px 0;
+  }
+  p { margin: 6px 0 10px 0; }
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+  }
+  code {
+    background: #efece4;
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  /* ============================================================== */
+  /* Section containers                                            */
+  /* ============================================================== */
+  .section {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 22px 22px 18px;
+    margin-bottom: 18px;
+  }
+  .section.tight { padding: 18px 22px 14px; }
+
+  .diagram svg { display: block; width: 100%; height: auto; }
+
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 22px;
+    align-items: start;
+  }
+  .two-col .prose { font-size: 13.5px; }
+  .two-col h3 { margin-top: 0; }
+
+  /* ============================================================== */
+  /* Symptom callout                                               */
+  /* ============================================================== */
+  .symptom {
+    background: #fff8e8;
+    border: 1px solid #e8d59a;
+    border-left: 4px solid var(--cp-amber);
+    border-radius: 6px;
+    padding: 14px 16px;
+    margin: 14px 0 0 0;
+  }
+  .symptom .keys {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    background: #1d1f24;
+    color: #fff;
+    padding: 2px 8px;
+    border-radius: 3px;
+    margin: 0 2px;
+  }
+
+  /* ============================================================== */
+  /* Comparison table                                              */
+  /* ============================================================== */
+  table.compare {
+    border-collapse: collapse;
+    width: 100%;
+    margin-top: 8px;
+    font-size: 13px;
+  }
+  table.compare th, table.compare td {
+    border: 1px solid var(--rule);
+    padding: 10px 12px;
+    vertical-align: top;
+    text-align: left;
+  }
+  table.compare thead th {
+    background: #f4f1e9;
+    font-weight: 600;
+  }
+  table.compare th.row {
+    background: #fbf9f3;
+    font-weight: 600;
+    width: 22%;
+    color: var(--muted);
+  }
+  table.compare td.leba { background: #fbf2dc; }
+  table.compare td.p741 { background: #e6f3ea; }
+  table.compare code { font-size: 12px; }
+
+  /* ============================================================== */
+  /* Metric table                                                  */
+  /* ============================================================== */
+  table.metric-table {
+    border-collapse: collapse;
+    width: 100%;
+    margin-top: 10px;
+    font-size: 13px;
+  }
+  table.metric-table th, table.metric-table td {
+    border: 1px solid var(--rule);
+    padding: 8px 10px;
+    text-align: left;
+  }
+  table.metric-table thead th {
+    background: #f4f1e9;
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+  }
+  table.metric-table td.cold { background: var(--cp-red-bg); font-weight: 600; }
+  table.metric-table td.warm { background: var(--cp-green-bg); }
+  table.metric-table tbody tr td:first-child {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  /* ============================================================== */
+  /* Metric pill                                                   */
+  /* ============================================================== */
+  .metric {
+    display: inline-block;
+    padding: 1px 6px;
+    background: #1d1f24;
+    color: #fff;
+    border-radius: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+  }
+  .metric.green { background: var(--cp-green); }
+
+  /* Inline figure caption */
+  .figcap {
+    color: var(--muted);
+    font-size: 11.5px;
+    margin: 6px 4px 0;
+  }
+
+  /* Footnote / scope note */
+  .scope {
+    border-left: 3px solid var(--rule);
+    padding: 6px 12px;
+    color: var(--muted);
+    font-size: 13px;
+    margin-top: 12px;
+    background: #faf8f1;
+  }
+  .scope strong { color: var(--ink); }
+
+  /* Status banner (top-of-page "this has shipped" marker) */
+  .status-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--cp-green-bg);
+    border: 1px solid #b8d9c2;
+    border-left: 4px solid var(--cp-green);
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin: 6px 0 18px 0;
+    font-size: 13px;
+    color: var(--ink);
+    max-width: 920px;
+  }
+  .status-banner code { font-size: 12.5px; }
+  .status-badge {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    background: var(--cp-green);
+    color: #fff;
+    padding: 2px 7px;
+    border-radius: 3px;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+
+  /* Subtle "ka-p741 update" inline callout */
+  .update-callout {
+    background: var(--cp-green-bg);
+    border: 1px solid #b8d9c2;
+    border-left: 3px solid var(--cp-green);
+    border-radius: 5px;
+    padding: 10px 14px;
+    margin: 12px 0;
+    font-size: 13px;
+    color: var(--ink);
+  }
+  .update-callout .tag {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #1d6b3a;
+    font-weight: 600;
+    margin-right: 6px;
+  }
+
+  /* "Before / After" mini-headers */
+  .ba-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin: 0 4px 6px;
+  }
+  .ba-head .tag {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+  }
+  .ba-head .tag.before { color: var(--cp-red); }
+  .ba-head .tag.after  { color: var(--cp-green); }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <h1>Cold First Completion &mdash; Why the First Keystroke After a Pause Is Slow</h1>
+    <p class="lede">
+      A different supersession problem than the one in the sibling page: not <em>completion vs completion</em>
+      within a typing burst, but <em>completion vs an already-in-flight background analyze</em> across the OS
+      pipe boundary. This is the page for ticket <code>ka-p741</code>.
+    </p>
+    <p class="crosslinks">
+      See also:
+      <a href="completion-pipeline.html">completion-pipeline.html</a>
+      <span class="sep">&middot;</span>
+      ticket <code>ka-p741</code> (Phase a landed 2026-05-19)
+      <span class="sep">&middot;</span>
+      <code>ka-hexa</code> (predecessor, Rust-side cancel)
+      <span class="sep">&middot;</span>
+      <code>ser-leba</code> (structural template)
+    </p>
+    <div class="status-banner">
+      <span class="status-badge">Status</span>
+      <span>
+        Fixed in <code>ka-p741</code> Phase&nbsp;(a), landed <strong>2026-05-19</strong>. This page now
+        documents both the diagnosis (sections 1&ndash;4) and the implemented mechanism (sections 5&ndash;7).
+      </span>
+    </div>
+  </header>
+
+  <!-- ====================================================================== -->
+  <!-- SECTION 1: SYMPTOM                                                     -->
+  <!-- ====================================================================== -->
+  <h2>1. The symptom</h2>
+  <div class="section tight">
+    <div class="symptom">
+      <p style="margin:0">
+        Type <span class="keys">f</span> after any typing pause &rarr; first completion took
+        <strong>500&ndash;950 ms</strong>. Continued typing within the same burst was fast (~30 ms warm).
+        Pause, then start again with <span class="keys">b</span> &rarr; slow again.
+      </p>
+    </div>
+    <p style="margin-top:12px;color:var(--muted);max-width:900px">
+      Every typing burst has a slow first character and fast tail. The sibling page covered why warm-burst
+      completions get superseded; this page covers why the cold first one stalls in the first place.
+      Spoiler: it is waiting behind a background <em>analyze</em> request that crossed the OS pipe a few
+      hundred milliseconds before the user pressed a key.
+    </p>
+  </div>
+
+  <!-- ====================================================================== -->
+  <!-- SECTION 2: COLD-START TIMELINE                                         -->
+  <!-- ====================================================================== -->
+  <h2>2. What's actually happening &mdash; the cold-start timeline</h2>
+  <div class="section diagram">
+    <svg viewBox="0 0 1180 470" xmlns="http://www.w3.org/2000/svg"
+         font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+      <defs>
+        <marker id="arr-cold" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#3a3f47"/>
+        </marker>
+        <linearGradient id="pipeCold" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%"   stop-color="#d4d4cf"/>
+          <stop offset="50%"  stop-color="#f4f4ee"/>
+          <stop offset="100%" stop-color="#bcbcb6"/>
+        </linearGradient>
+      </defs>
+
+      <!-- time axis -->
+      <g font-size="10.5" fill="#5a6068">
+        <line x1="120" y1="430" x2="1140" y2="430" stroke="#888" stroke-width="1"/>
+        <!-- tick positions: t=0, 300, 800, 900, 800+analyze, end -->
+        <g>
+          <line x1="160" y1="426" x2="160" y2="434" stroke="#888"/>
+          <text x="160" y="448" text-anchor="middle">t = 0 ms</text>
+          <text x="160" y="460" text-anchor="middle" opacity="0.7">user stops typing</text>
+        </g>
+        <g>
+          <line x1="300" y1="426" x2="300" y2="434" stroke="#888"/>
+          <text x="300" y="448" text-anchor="middle">300 ms</text>
+          <text x="300" y="460" text-anchor="middle" opacity="0.7">debounce expires</text>
+        </g>
+        <g>
+          <line x1="540" y1="426" x2="540" y2="434" stroke="#888"/>
+          <text x="540" y="448" text-anchor="middle">800 ms</text>
+          <text x="540" y="460" text-anchor="middle" opacity="0.7">analyze enqueued</text>
+        </g>
+        <g>
+          <line x1="600" y1="426" x2="600" y2="434" stroke="#888"/>
+          <text x="600" y="448" text-anchor="middle">900 ms</text>
+          <text x="600" y="460" text-anchor="middle" opacity="0.7">user types <tspan font-family="ui-monospace, Menlo, monospace">f</tspan></text>
+        </g>
+        <g>
+          <line x1="1060" y1="426" x2="1060" y2="434" stroke="#888"/>
+          <text x="1060" y="448" text-anchor="middle">~1700 ms</text>
+          <text x="1060" y="460" text-anchor="middle" opacity="0.7">popover shown</text>
+        </g>
+      </g>
+
+      <!-- RUST LSP lane -->
+      <g>
+        <rect x="120" y="60" width="1020" height="100" fill="#fbeee6" stroke="#d97757"
+              stroke-width="1.2" rx="6"/>
+        <text x="130" y="80" font-size="12.5" font-weight="600" fill="#7a3a1c">Rust LSP</text>
+        <text x="130" y="94" font-size="10.5" fill="#7a3a1c" opacity="0.7">debounce, writer task, cancel_pending</text>
+      </g>
+
+      <!-- JVM SIDECAR lane -->
+      <g>
+        <rect x="120" y="280" width="1020" height="100" fill="#e6edf6" stroke="#4a6fa5"
+              stroke-width="1.2" rx="6"/>
+        <text x="130" y="300" font-size="12.5" font-weight="600" fill="#2c4a7d">JVM sidecar</text>
+        <text x="130" y="314" font-size="10.5" fill="#2c4a7d" opacity="0.7">dispatcher, Analysis API (single-threaded)</text>
+      </g>
+
+      <!-- OS PIPE column -->
+      <g>
+        <rect x="520" y="170" width="100" height="100" rx="14"
+              fill="url(#pipeCold)" stroke="#888"/>
+        <text x="570" y="190" text-anchor="middle" font-size="11" font-weight="600" fill="#3a3f47">OS pipe</text>
+        <text x="570" y="204" text-anchor="middle" font-size="10" fill="#5a6068">Rust &rarr; JVM</text>
+        <!-- slot lines -->
+        <g stroke="#999" stroke-width="0.8" stroke-dasharray="2,3" opacity="0.7">
+          <line x1="530" y1="215" x2="610" y2="215"/>
+          <line x1="530" y1="232" x2="610" y2="232"/>
+          <line x1="530" y1="249" x2="610" y2="249"/>
+        </g>
+        <!-- analyze slot present briefly -->
+        <rect x="538" y="220" width="64" height="11" rx="2" fill="#8c5fb3" opacity="0.85"/>
+        <text x="570" y="229" text-anchor="middle" font-size="8.5" fill="#fff">analyze</text>
+        <!-- completion slot waiting -->
+        <rect x="538" y="237" width="64" height="11" rx="2" fill="#2c7a8a" opacity="0.85"/>
+        <text x="570" y="246" text-anchor="middle" font-size="8.5" fill="#fff">completion</text>
+      </g>
+
+      <!-- ===== Rust events ===== -->
+      <!-- (1) user stops typing -->
+      <g>
+        <circle cx="160" cy="110" r="6" fill="#7a3a1c"/>
+        <text x="160" y="135" text-anchor="middle" font-size="10" fill="#7a3a1c">1. stop typing</text>
+      </g>
+      <!-- (2) debounce expires at 300 -->
+      <g>
+        <circle cx="300" cy="110" r="6" fill="#7a3a1c"/>
+        <text x="300" y="135" text-anchor="middle" font-size="10" fill="#7a3a1c">2. debounce timer fires</text>
+      </g>
+      <!-- (3) quiet window 300-800 -->
+      <g>
+        <rect x="300" y="120" width="240" height="14" rx="3" fill="#fff" stroke="#7a3a1c"
+              stroke-dasharray="3,2"/>
+        <text x="420" y="131" text-anchor="middle" font-size="9.5" fill="#7a3a1c">3. post-interactive quiet window (500 ms)</text>
+      </g>
+      <!-- (4) enqueue didChange + analyze at 800 -->
+      <g>
+        <circle cx="540" cy="110" r="6" fill="#7a3a1c"/>
+        <text x="540" y="148" text-anchor="middle" font-size="10" fill="#7a3a1c">4. enqueue didChange + analyze</text>
+      </g>
+      <!-- (5) writer drains in microseconds -->
+      <g>
+        <rect x="540" y="160" width="14" height="10" fill="#b53b3b"/>
+        <text x="556" y="169" font-size="10" fill="#b53b3b" font-weight="600">5. writer drains (&micro;s) &mdash; cancel window closes</text>
+      </g>
+
+      <!-- (7) user types 'f' at 900 -->
+      <g>
+        <circle cx="600" cy="110" r="6" fill="#7a3a1c"/>
+        <text x="600" y="78" text-anchor="middle" font-size="10" fill="#7a3a1c">7. type <tspan font-family="ui-monospace, Menlo, monospace">f</tspan> &rarr; completion enqueued</text>
+        <text x="600" y="90" text-anchor="middle" font-size="9.5" fill="#b53b3b" font-style="italic">cancel_pending finds nothing in channel &mdash; counter += 0</text>
+      </g>
+      <!-- writer writes completion to pipe -->
+      <line x1="600" y1="116" x2="600" y2="160" stroke="#7a3a1c" stroke-width="1.2"
+            marker-end="url(#arr-cold)"/>
+
+      <!-- arrow analyze writer -> pipe at t=800 -->
+      <line x1="540" y1="170" x2="540" y2="220" stroke="#8c5fb3" stroke-width="1.5"
+            marker-end="url(#arr-cold)"/>
+      <!-- completion writer -> pipe at t=900 -->
+      <line x1="602" y1="172" x2="568" y2="240" stroke="#2c7a8a" stroke-width="1.5"
+            marker-end="url(#arr-cold)"/>
+
+      <!-- analyze leaves pipe -> JVM dispatcher -->
+      <line x1="570" y1="270" x2="640" y2="310" stroke="#8c5fb3" stroke-width="1.5"
+            marker-end="url(#arr-cold)"/>
+
+      <!-- ===== JVM events ===== -->
+      <!-- (6) analyze starts ~at 800+ -->
+      <g>
+        <circle cx="640" cy="330" r="6" fill="#2c4a7d"/>
+        <text x="640" y="356" font-size="10" fill="#2c4a7d">6. dispatcher reads pipe, starts analyze</text>
+      </g>
+      <!-- analyze block 640 .. 1000 (FIR work) -->
+      <g>
+        <rect x="640" y="338" width="360" height="20" rx="3" fill="#8c5fb3" opacity="0.85"/>
+        <text x="820" y="352" text-anchor="middle" font-size="10.5" fill="#fff" font-weight="600">
+          analyze (single-threaded FIR work, 500&ndash;950 ms)
+        </text>
+      </g>
+
+      <!-- (8) completion sits in pipe -->
+      <g>
+        <text x="600" y="265" text-anchor="middle" font-size="9.5" fill="#b53b3b" font-weight="600">
+          8. completion blocked
+        </text>
+      </g>
+
+      <!-- (9) completion finally dispatched after analyze -->
+      <g>
+        <circle cx="1000" cy="330" r="6" fill="#2c4a7d"/>
+        <text x="1000" y="356" font-size="10" fill="#2c4a7d">9. analyze done &rarr; pick up completion</text>
+        <rect x="1000" y="338" width="60" height="20" rx="3" fill="#2c7a8a" opacity="0.9"/>
+        <text x="1030" y="352" text-anchor="middle" font-size="10" fill="#fff" font-weight="600">~30 ms</text>
+      </g>
+
+      <!-- (10) result back to Rust -->
+      <g>
+        <line x1="1060" y1="340" x2="1100" y2="140" stroke="#2c7a8a" stroke-width="1.5"
+              stroke-dasharray="4,3" marker-end="url(#arr-cold)"/>
+        <text x="1112" y="125" font-size="10" fill="#2c4a7d" text-anchor="end">10. result &rarr; Rust &rarr; Zed</text>
+      </g>
+
+      <!-- highlight: cancellation window -->
+      <g>
+        <rect x="540" y="34" width="14" height="22" rx="2" fill="#f6e2e1" stroke="#b53b3b"/>
+        <text x="560" y="50" font-size="10.5" fill="#b53b3b" font-weight="600">
+          cancellation window &mdash; microseconds wide
+        </text>
+      </g>
+
+      <!-- bracket showing user-perceived latency -->
+      <g>
+        <line x1="600" y1="402" x2="600" y2="418" stroke="#1d1f24"/>
+        <line x1="1060" y1="402" x2="1060" y2="418" stroke="#1d1f24"/>
+        <line x1="600" y1="412" x2="1060" y2="412" stroke="#1d1f24" stroke-width="1.5"/>
+        <text x="830" y="406" text-anchor="middle" font-size="11" fill="#1d1f24" font-weight="600">
+          user-perceived latency &asymp; analyze (500&ndash;950 ms) + ~30 ms + protocol
+        </text>
+      </g>
+    </svg>
+    <p class="figcap">
+      Two horizontal lanes (Rust LSP / JVM sidecar) cross over a vertical OS pipe at the moment requests
+      change processes. The cancel window highlighted in red is when <code>cancel_pending</code> could
+      have caught the analyze; it closes microseconds after step 4, hundreds of milliseconds before the
+      user starts typing.
+    </p>
+    <div class="update-callout">
+      <span class="tag">Note</span>
+      This is what <em>used to</em> happen. The diagnosis is unchanged &mdash; see Section&nbsp;5 for the
+      after-state diagram showing how the dispatcher now intervenes.
+    </div>
+  </div>
+
+  <!-- ====================================================================== -->
+  <!-- SECTION 3: WHY KA-HEXA CAN'T FIX IT                                    -->
+  <!-- ====================================================================== -->
+  <h2>3. Why <code>ka-hexa</code> alone was insufficient</h2>
+  <div class="section">
+    <div class="two-col">
+      <div class="diagram">
+        <svg viewBox="0 0 560 320" xmlns="http://www.w3.org/2000/svg"
+             font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+          <defs>
+            <marker id="arr-hexa" viewBox="0 0 10 10" refX="9" refY="5"
+                    markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#3a3f47"/>
+            </marker>
+            <linearGradient id="pipeHexa" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%"   stop-color="#d4d4cf"/>
+              <stop offset="50%"  stop-color="#f4f4ee"/>
+              <stop offset="100%" stop-color="#bcbcb6"/>
+            </linearGradient>
+          </defs>
+
+          <!-- Rust process box -->
+          <rect x="20" y="20" width="320" height="280" fill="#fbeee6" stroke="#d97757"
+                stroke-width="1.2" rx="8"/>
+          <text x="180" y="42" text-anchor="middle" font-size="12.5" font-weight="600" fill="#7a3a1c">
+            Rust LSP &mdash; writer-task lifecycle
+          </text>
+
+          <!-- mpsc channel box -->
+          <rect x="50" y="70" width="260" height="80" fill="#fff" stroke="#d97757" rx="6"/>
+          <text x="180" y="92" text-anchor="middle" font-size="12" font-weight="600">mpsc::Sender&lt;QueuedMessage&gt;</text>
+          <text x="180" y="108" text-anchor="middle" font-size="10.5" fill="#5a6068">capacity 32 &mdash; in-process channel</text>
+          <text x="180" y="124" text-anchor="middle" font-size="10.5" fill="#5a6068">
+            <tspan font-family="ui-monospace, Menlo, monospace">cancel_pending</tspan> scans this only
+          </text>
+          <text x="180" y="140" text-anchor="middle" font-size="10" fill="#5a6068" font-style="italic">
+            bridge.rs:823-828
+          </text>
+
+          <!-- writer loop box -->
+          <rect x="50" y="180" width="260" height="80" fill="#fff" stroke="#d97757" rx="6"/>
+          <text x="180" y="202" text-anchor="middle" font-size="12" font-weight="600">writer task: recv &rarr; write_message &rarr; loop</text>
+          <text x="180" y="220" text-anchor="middle" font-size="10.5" fill="#5a6068">drains channel into pipe in microseconds</text>
+          <text x="180" y="236" text-anchor="middle" font-size="10" fill="#5a6068" font-style="italic">
+            bridge.rs:442-477
+          </text>
+
+          <!-- arrow channel -> writer -->
+          <line x1="180" y1="150" x2="180" y2="180" stroke="#3a3f47" stroke-width="1.4"
+                marker-end="url(#arr-hexa)"/>
+
+          <!-- OS pipe column on the right -->
+          <rect x="400" y="60" width="80" height="240" rx="20" fill="url(#pipeHexa)" stroke="#888"/>
+          <text x="440" y="80" text-anchor="middle" font-size="11" font-weight="600" fill="#3a3f47">OS pipe</text>
+          <g stroke="#999" stroke-width="0.8" stroke-dasharray="2,3" opacity="0.7">
+            <line x1="410" y1="110" x2="470" y2="110"/>
+            <line x1="410" y1="140" x2="470" y2="140"/>
+            <line x1="410" y1="170" x2="470" y2="170"/>
+            <line x1="410" y1="200" x2="470" y2="200"/>
+            <line x1="410" y1="230" x2="470" y2="230"/>
+          </g>
+          <rect x="418" y="115" width="44" height="12" rx="2" fill="#8c5fb3" opacity="0.85"/>
+          <text x="440" y="125" text-anchor="middle" font-size="8.5" fill="#fff">analyze</text>
+
+          <!-- arrow writer -> pipe -->
+          <line x1="310" y1="220" x2="400" y2="180" stroke="#3a3f47" stroke-width="1.4"
+                marker-end="url(#arr-hexa)"/>
+
+          <!-- annotation: point of no return -->
+          <g>
+            <line x1="390" y1="55" x2="390" y2="305" stroke="#b53b3b" stroke-width="1"
+                  stroke-dasharray="3,3"/>
+            <text x="488" y="170" font-size="10.5" fill="#b53b3b" font-weight="600">
+              point of no return
+            </text>
+            <text x="488" y="184" font-size="9.5" fill="#b53b3b" opacity="0.85">
+              same boundary
+            </text>
+            <text x="488" y="196" font-size="9.5" fill="#b53b3b" opacity="0.85">
+              ser-leba had to
+            </text>
+            <text x="488" y="208" font-size="9.5" fill="#b53b3b" opacity="0.85">
+              push past
+            </text>
+          </g>
+        </svg>
+        <p class="figcap">
+          The Rust-side cancel only inspects the in-process mpsc channel. Once the writer task pulls a
+          message and calls <code>write_message</code>, the bytes leave Rust's control.
+        </p>
+      </div>
+      <div class="prose">
+        <h3>The cancel mechanism's reach</h3>
+        <p>
+          <code>Bridge::cancel_pending</code> (<code>server/src/bridge.rs:823-828</code>) walks the
+          <code>mpsc::Sender&lt;QueuedMessage&gt;</code> channel, marks anything matching the predicate as
+          superseded, and returns. That channel is drained by the writer loop at
+          <code>bridge.rs:442-477</code> as fast as the kernel will accept bytes &mdash; typically a few
+          microseconds for a JSON-RPC frame this size.
+        </p>
+        <p>
+          Once the analyze message leaves the channel and enters the OS pipe, there is no Rust-side handle
+          on it. No file descriptor write can be retracted, no peek can identify which logical request the
+          bytes belong to. The cancel path stays wired up &mdash; it just isn't enough on its own; the
+          sidecar-side dispatcher check in Section&nbsp;5 is what now does the load-bearing work.
+        </p>
+        <h3>Evidence from the logs</h3>
+        <p>From <code>.logs/kotlin-analyzer-2026-05-18T18-07-46Z.log</code>:</p>
+        <table class="metric-table">
+          <thead>
+            <tr><th>seq</th><th>queue_wait_ms</th><th>dispatch_ms</th><th>cold?</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>10</td><td class="warm">0</td><td>32</td><td>no (mid-burst)</td></tr>
+            <tr><td>12</td><td class="cold">340</td><td>28</td><td>yes (burst start)</td></tr>
+            <tr><td>14</td><td class="cold">948</td><td>31</td><td>yes (burst start)</td></tr>
+            <tr><td>18</td><td class="cold">615</td><td>29</td><td>yes (burst start)</td></tr>
+          </tbody>
+        </table>
+        <p style="margin-top:10px">
+          Across the entire session,
+          <span class="metric">analyze_pending_cancelled_total</span> = <strong>0</strong>. The cancel
+          mechanism is firing zero times because the message it would cancel is already past the
+          boundary it can see.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ====================================================================== -->
+  <!-- SECTION 4: STRUCTURAL PARALLEL                                         -->
+  <!-- ====================================================================== -->
+  <h2>4. Structural parallel with <code>ser-leba</code></h2>
+  <div class="section">
+    <p style="max-width:920px;color:var(--muted);margin-top:0">
+      <code>ser-leba</code> solved an analogous problem one row up. It demonstrated that pushing the
+      supersession check across the process boundary into the sidecar dispatcher works. <code>ka-p741</code>
+      generalises that pattern to cross request <em>types</em>, not just multiple requests of the same type.
+    </p>
+    <table class="compare">
+      <thead>
+        <tr>
+          <th></th>
+          <th><code>ser-leba</code> (CP2, completion vs completion)</th>
+          <th><code>ka-p741</code> (landed, completion vs analyze)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th class="row">Problem</th>
+          <td class="leba">Stale completion bytes already in pipe by the time Rust knows a newer one exists</td>
+          <td class="p741">Background analyze bytes already in pipe by the time the user types</td>
+        </tr>
+        <tr>
+          <th class="row">Rust-side equivalent</th>
+          <td class="leba"><code>ka-rr3u</code> writer-task BeforeSend check</td>
+          <td class="p741"><code>ka-hexa</code> <code>cancel_pending</code></td>
+        </tr>
+        <tr>
+          <th class="row">Why Rust-only insufficient</th>
+          <td class="leba">Writer drains in microseconds; rarely catches anything</td>
+          <td class="p741">Writer drains in microseconds; <em>never</em> catches the analyze</td>
+        </tr>
+        <tr>
+          <th class="row">Sidecar-side fix</th>
+          <td class="leba">Dispatcher peeks pipe, short-circuits older completion for same URI</td>
+          <td class="p741">Dispatcher peeks pipe, supersedes queued analyze when completion arrives</td>
+        </tr>
+        <tr>
+          <th class="row">Scope</th>
+          <td class="leba">Per-URI bucket, same request type</td>
+          <td class="p741">Cross-request-type (completion supersedes analyze)</td>
+        </tr>
+      </tbody>
+    </table>
+    <p style="margin-top:14px;max-width:920px">
+      The takeaway: this is the same shape of problem. <code>ser-leba</code> demonstrated the pattern works
+      in production. <code>ka-p741</code> is the same shape extended one axis.
+    </p>
+  </div>
+
+  <!-- ====================================================================== -->
+  <!-- SECTION 5: IMPLEMENTED FIX (BEFORE / AFTER)                            -->
+  <!-- ====================================================================== -->
+  <h2>5. The implemented fix &mdash; <code>ka-p741</code> Phase&nbsp;(a)</h2>
+  <div class="section">
+
+    <div class="ba-head">
+      <span class="tag before">Before &mdash; pre-ka-p741 cold start</span>
+      <span style="font-size:11.5px;color:var(--muted)">user-perceived: ~800&ndash;1000 ms</span>
+    </div>
+    <div class="diagram">
+      <svg viewBox="0 0 1180 220" xmlns="http://www.w3.org/2000/svg"
+           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+        <defs>
+          <marker id="arr-before" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#3a3f47"/>
+          </marker>
+        </defs>
+        <!-- lanes -->
+        <rect x="120" y="20" width="1020" height="60" fill="#fbeee6" stroke="#d97757" rx="6"/>
+        <text x="130" y="40" font-size="11.5" font-weight="600" fill="#7a3a1c">Rust</text>
+        <rect x="120" y="100" width="1020" height="80" fill="#e6edf6" stroke="#4a6fa5" rx="6"/>
+        <text x="130" y="120" font-size="11.5" font-weight="600" fill="#2c4a7d">JVM</text>
+
+        <!-- analyze enqueued at 540 (t=800) -->
+        <circle cx="540" cy="55" r="5" fill="#7a3a1c"/>
+        <text x="540" y="18" text-anchor="middle" font-size="10" fill="#7a3a1c">enqueue analyze</text>
+
+        <!-- completion enqueued at 600 (t=900) -->
+        <circle cx="600" cy="55" r="5" fill="#7a3a1c"/>
+        <text x="610" y="18" font-size="10" fill="#7a3a1c">enqueue completion (user typed)</text>
+
+        <!-- analyze running on JVM 600..1000 -->
+        <rect x="600" y="130" width="400" height="22" rx="3" fill="#8c5fb3" opacity="0.85"/>
+        <text x="800" y="146" text-anchor="middle" font-size="10.5" fill="#fff" font-weight="600">
+          analyze runs to completion (500&ndash;950 ms)
+        </text>
+
+        <!-- completion queued behind -->
+        <rect x="1000" y="130" width="60" height="22" rx="3" fill="#2c7a8a" opacity="0.9"/>
+        <text x="1030" y="146" text-anchor="middle" font-size="10" fill="#fff" font-weight="600">~30 ms</text>
+
+        <!-- bracket -->
+        <line x1="600" y1="195" x2="600" y2="205" stroke="#1d1f24"/>
+        <line x1="1060" y1="195" x2="1060" y2="205" stroke="#1d1f24"/>
+        <line x1="600" y1="200" x2="1060" y2="200" stroke="#b53b3b" stroke-width="2"/>
+        <text x="830" y="216" text-anchor="middle" font-size="11" fill="#b53b3b" font-weight="600">
+          user waits for whole analyze before completion starts
+        </text>
+      </svg>
+    </div>
+
+    <div class="ba-head" style="margin-top:18px">
+      <span class="tag after">After &mdash; ka-p741 Phase&nbsp;(a) (landed)</span>
+      <span style="font-size:11.5px;color:var(--muted)">user-perceived: ~30 ms + protocol</span>
+    </div>
+    <div class="diagram">
+      <svg viewBox="0 0 1180 240" xmlns="http://www.w3.org/2000/svg"
+           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+        <defs>
+          <marker id="arr-after" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#3a3f47"/>
+          </marker>
+        </defs>
+        <!-- lanes -->
+        <rect x="120" y="20" width="1020" height="60" fill="#fbeee6" stroke="#d97757" rx="6"/>
+        <text x="130" y="40" font-size="11.5" font-weight="600" fill="#7a3a1c">Rust</text>
+        <rect x="120" y="100" width="1020" height="100" fill="#e6edf6" stroke="#4a6fa5" rx="6"/>
+        <text x="130" y="120" font-size="11.5" font-weight="600" fill="#2c4a7d">JVM</text>
+
+        <!-- analyze enqueued at 540 -->
+        <circle cx="540" cy="55" r="5" fill="#7a3a1c"/>
+        <text x="540" y="18" text-anchor="middle" font-size="10" fill="#7a3a1c">enqueue analyze</text>
+
+        <!-- completion enqueued at 600 -->
+        <circle cx="600" cy="55" r="5" fill="#7a3a1c"/>
+        <text x="610" y="18" font-size="10" fill="#7a3a1c">enqueue completion</text>
+
+        <!-- dispatcher peeks pipe, sees analyze queued, supersedes it -->
+        <g>
+          <rect x="600" y="130" width="120" height="22" rx="3" fill="#fff" stroke="#8c5fb3"
+                stroke-dasharray="3,2"/>
+          <text x="660" y="146" text-anchor="middle" font-size="10" fill="#8c5fb3">analyze (queued)</text>
+
+          <!-- supersession marker -->
+          <g>
+            <line x1="660" y1="130" x2="660" y2="152" stroke="#2f8f4e" stroke-width="2"/>
+            <line x1="650" y1="135" x2="670" y2="147" stroke="#2f8f4e" stroke-width="2"/>
+            <line x1="670" y1="135" x2="650" y2="147" stroke="#2f8f4e" stroke-width="2"/>
+          </g>
+          <text x="660" y="170" text-anchor="middle" font-size="10" fill="#2f8f4e" font-weight="600">
+            supersede
+          </text>
+          <text x="660" y="182" text-anchor="middle" font-size="9.5" fill="#2f8f4e">
+            (no-op response &rarr; Rust)
+          </text>
+        </g>
+
+        <!-- completion runs immediately -->
+        <rect x="730" y="130" width="60" height="22" rx="3" fill="#2c7a8a" opacity="0.9"/>
+        <text x="760" y="146" text-anchor="middle" font-size="10" fill="#fff" font-weight="600">~30 ms</text>
+
+        <!-- metric callout -->
+        <g>
+          <rect x="810" y="128" width="280" height="44" rx="4" fill="#e6f3ea" stroke="#2f8f4e"/>
+          <text x="950" y="148" text-anchor="middle" font-size="11" font-weight="600" fill="#1d6b3a">
+            new sidecar counter ticks here:
+          </text>
+          <text x="950" y="164" text-anchor="middle" font-size="11" fill="#1d6b3a"
+                font-family="ui-monospace, Menlo, monospace">
+            analyzeSupersededByCompletion
+          </text>
+        </g>
+
+        <!-- bracket -->
+        <line x1="600" y1="210" x2="600" y2="220" stroke="#1d1f24"/>
+        <line x1="790" y1="210" x2="790" y2="220" stroke="#1d1f24"/>
+        <line x1="600" y1="215" x2="790" y2="215" stroke="#2f8f4e" stroke-width="2"/>
+        <text x="695" y="232" text-anchor="middle" font-size="11" fill="#2f8f4e" font-weight="600">
+          analyze never runs &mdash; completion goes straight through
+        </text>
+      </svg>
+    </div>
+
+    <h3 style="margin-top:22px">Implementation &mdash; what actually landed</h3>
+    <p style="max-width:920px">
+      The dispatcher loop in
+      <code>sidecar/src/main/kotlin/dev/kouros/sidecar/AnalysisServer.kt</code> was extended to track a
+      separate <code>"analyze:&lt;uri&gt;"</code> bucket alongside the existing per-URI completion bucket,
+      then to short-circuit any queued analyze whenever a completion is in the same dispatch window. The
+      load-bearing functions:
+    </p>
+    <ul style="margin:6px 0 12px 18px;padding:0;max-width:920px">
+      <li><code>hasCompletionInQueue(item)</code> &mdash; scans the current dispatch window for a queued completion.</li>
+      <li><code>supersedeQueuedAnalyzes()</code> &mdash; removes every queued analyze entry and short-circuits each one.</li>
+      <li><code>sendSyntheticAnalyzeResponse(request)</code> &mdash; writes the no-op JSON-RPC result back to Rust.</li>
+      <li>
+        <code>analyzeSupersededByCompletionCount</code>: an <code>AtomicLong</code> bumped once per
+        short-circuit, emitted in the metrics block as
+        <span class="metric green">analyzeSupersededByCompletion</span> alongside the existing
+        <code>supersededAtDispatch</code>.
+      </li>
+    </ul>
+    <p style="max-width:920px">
+      The synthetic response is shaped to match what <code>handleAnalyze</code> would have emitted on a
+      normal call, so the Rust side has nothing to special-case:
+    </p>
+<pre style="background:#1d1f24;color:#f4f1e9;padding:10px 14px;border-radius:6px;overflow:auto;font-size:12px;line-height:1.45;margin:6px 0 14px 0;max-width:920px"><code style="background:none;color:inherit;padding:0">{
+  "diagnostics": [],
+  "edits": [],
+  "version": N           <span style="color:#8c97a8">// echoed from the request when present</span>
+}</code></pre>
+
+    <h3 style="margin-top:18px">Ordering: analyze supersession runs before completion dispatch</h3>
+    <p style="max-width:920px">
+      The supersession check fires whether or not the completion that triggered it ultimately turns out
+      to be stale itself: the queue gets flushed of analyzes either way, so a subsequent dispatch step can
+      pick up the freshest completion without dragging a stale analyze in front of it.
+    </p>
+
+    <div class="scope">
+      <p style="margin:0 0 4px 0"><strong>Still out of scope (Phase&nbsp;b territory):</strong></p>
+      <ul style="margin:4px 0 0 18px;padding:0">
+        <li>
+          <strong>Mid-<code>KaSession</code> interruption.</strong> The Kotlin Analysis API is single-threaded
+          and exposes no checkpoint hooks. If an analyze is <em>already running</em> (not merely queued in
+          the pipe) when the completion arrives, it runs to completion. Worst-case latency stays bounded
+          by one analyze duration.
+        </li>
+        <li>
+          <strong>Decomposing analyze into yielding chunks.</strong> Tracked as Phase&nbsp;b in the ticket;
+          separable from Phase&nbsp;(a) and was not required to fix the lived symptom.
+        </li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ====================================================================== -->
+  <!-- SECTION 6: MEASURED RESULTS                                            -->
+  <!-- ====================================================================== -->
+  <h2>6. Measured results</h2>
+  <div class="section">
+    <p style="max-width:920px">
+      When you type after a pause, the analyze that the debouncer fired during your pause is no longer
+      ahead of you in the pipe &mdash; it has been turned into a 0&nbsp;ms no-op response. The completion
+      runs immediately. Both number sets below come from the same Kotlin file
+      (<code>ABTestArgumentResolver.kt</code>) so the comparison is like-for-like.
+    </p>
+    <table class="metric-table">
+      <thead>
+        <tr>
+          <th>metric</th>
+          <th>pre-ka-p741</th>
+          <th>post-ka-p741</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>warm fraction</td>
+          <td class="cold">1 / 8</td>
+          <td class="warm">14 / 18</td>
+        </tr>
+        <tr>
+          <td>all-records <code>bridge_response_wait</code> p50</td>
+          <td class="cold">~500 ms</td>
+          <td class="warm">38 ms</td>
+        </tr>
+        <tr>
+          <td>all-records <code>bridge_response_wait</code> p95</td>
+          <td class="cold">973 ms</td>
+          <td class="warm">348 ms</td>
+        </tr>
+        <tr>
+          <td>queued <code>bridge_response_wait</code> p95</td>
+          <td class="cold">973 ms</td>
+          <td class="warm">350 ms</td>
+        </tr>
+        <tr>
+          <td><code>sidecar_queue_wait</code> p50</td>
+          <td class="cold">474 ms</td>
+          <td class="warm">0.9 ms</td>
+        </tr>
+        <tr>
+          <td><code>analyzeSupersededByCompletion</code> cumulative</td>
+          <td class="cold">n/a (counter did not exist)</td>
+          <td class="warm">5</td>
+        </tr>
+        <tr>
+          <td>session record count</td>
+          <td>8</td>
+          <td>18</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="figcap" style="margin-top:10px;max-width:920px">
+      Pre numbers: <code>.logs/kotlin-analyzer-2026-05-18T18-07-46Z.log</code>
+      (post-<code>ka-t7gp</code> / pre-<code>ka-p741</code>, 8 records).<br>
+      Post numbers: <code>.logs/kotlin-analyzer-2026-05-19T09-22-48Z.log</code>
+      (post-<code>ka-p741</code>, 18 records).
+    </p>
+  </div>
+
+  <!-- ====================================================================== -->
+  <!-- SECTION 7: DIAGNOSTICS                                                 -->
+  <!-- ====================================================================== -->
+  <h2>7. What this means for diagnostics</h2>
+  <div class="section tight">
+    <p>The log-signature of the fix, now observed in the post-ka-p741 session:</p>
+    <ul style="margin:6px 0 12px 18px;padding:0">
+      <li>
+        <span class="metric">sidecar_queue_wait</span> p50 dropped from 474&nbsp;ms to <strong>0.9&nbsp;ms</strong>;
+        p95 on first-of-burst records is now well under 200&nbsp;ms.
+      </li>
+      <li>
+        <span class="metric green">analyzeSupersededByCompletion</span> is <strong>&gt; 0</strong>
+        (5 cumulative in the post-fix sample), scaling with the number of typing bursts. The counter is
+        emitted on every metrics block in the same shape as <code>supersededAtDispatch</code>.
+      </li>
+      <li>
+        <span class="metric">analyze_pending_cancelled_total</span> stays at <strong>~0</strong>, as
+        predicted. It measures the Rust-side in-process channel, not the OS pipe; the new sidecar counter
+        is the correct one to watch.
+      </li>
+    </ul>
+    <div class="update-callout">
+      <span class="tag">Caveat</span>
+      <code>.sensors/log-analysis.py</code> does not yet surface the new
+      <code>analyzeSupersededByCompletion</code> field in its aggregate view (the per-session
+      <code>--path&nbsp;&lt;file&gt;</code> summary also doesn't show it). The counter is present in the
+      raw JSON record. A small script update is a worthwhile follow-up.
+    </div>
+    <p style="color:var(--muted);margin-bottom:0;max-width:920px">
+      If <code>analyze_pending_cancelled_total</code> stays at 0 <em>and</em>
+      <code>analyzeSupersededByCompletion</code> stays at 0 in a future session, the fix did not wire up.
+      Seeing only the former at 0 is expected and not a regression.
+    </p>
+  </div>
+
+</div>
+</body>
+</html>

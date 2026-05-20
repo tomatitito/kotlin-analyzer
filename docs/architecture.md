@@ -415,6 +415,12 @@ checkpoints compose cleanly. See
 [lsp-protocol.md §4.1, Checkpoint 2](lsp-protocol.md#41-latest-wins-supersession-completion)
 for the rationale and the new `metrics.counts.supersededAtDispatch` counter.
 
+The same Checkpoint 2 also runs cross-request-type (ka-p741): when a completion
+is observed at dispatch, any queued analyze (any URI) is short-circuited with a
+synthetic empty-diagnostics response and counted under
+`metrics.counts.analyzeSupersededByCompletion`. See
+[lsp-protocol.md §4.1, Checkpoint 2](lsp-protocol.md#41-latest-wins-supersession-completion).
+
 ### 8.4 What is deliberately not addressed
 
 Mid-flight cancellation of an `analyze` already running inside the sidecar is

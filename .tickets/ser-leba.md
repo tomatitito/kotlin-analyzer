@@ -2,7 +2,7 @@
 id: ser-leba
 status: in_progress
 deps: []
-links: [ka-rr3u, ka-hexa, ka-aa4k, ka-t7gp]
+links: [ka-rr3u, ka-hexa, ka-aa4k, ka-t7gp, ka-p741]
 created: 2026-05-07T14:53:42Z
 type: task
 priority: 1

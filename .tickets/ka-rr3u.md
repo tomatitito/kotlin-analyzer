@@ -2,7 +2,7 @@
 id: ka-rr3u
 status: closed
 deps: []
-links: [ka-aa4k, ka-rd05, ka-t7gp, ka-xjd7, ka-g342, ka-wkai]
+links: [ka-aa4k, ka-rd05, ka-t7gp, ka-xjd7, ka-g342, ka-wkai, ka-p741, ser-leba, ka-hexa]
 created: 2026-05-06T10:50:08Z
 type: task
 priority: 1

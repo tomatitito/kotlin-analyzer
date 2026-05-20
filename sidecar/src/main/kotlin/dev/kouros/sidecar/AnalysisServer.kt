@@ -17,6 +17,13 @@ import java.util.concurrent.atomic.AtomicLong
  * Analysis API call, the dispatcher checks if a newer completion for the
  * same bucket has already arrived; if yes, it short-circuits with an empty
  * `superseded-at-dispatch` response and skips the Analysis API entirely.
+ *
+ * When a completion is observed at dispatch (either as the request just popped
+ * or anywhere in the lookahead-drained pending queue), any queued `analyze`
+ * requests (any URI) are short-circuited with a synthetic empty-diagnostics
+ * response: the user is interacting, so the queued analyze's diagnostics are
+ * stale by definition. The Rust debouncer will re-fire analyze after the
+ * next post-interactive quiet window. See `docs/lsp-protocol.md` §4.1.
  */
 class AnalysisServer(
     private val transport: JsonRpcTransport,
@@ -33,7 +40,10 @@ class AnalysisServer(
     /**
      * Sidecar-local "latest seen seq" per supersession bucket. For completion
      * the bucket is the document URI (matches Rust's bucket convention in
-     * `request_with_supersession`). Strictly monotonic per bucket.
+     * `request_with_supersession`). For analyze the bucket is namespaced as
+     * `"analyze:<uri>"` to keep the two channels disjoint, mirroring the Rust
+     * `cancel_pending("analyze:{uri}")` convention. Strictly monotonic per
+     * bucket.
      */
     private val latestSeenSeq: ConcurrentHashMap<String, Long> = ConcurrentHashMap()
 
@@ -44,6 +54,14 @@ class AnalysisServer(
      * every completion-metrics record.
      */
     private val supersededAtDispatchCount: AtomicLong = AtomicLong(0L)
+
+    /**
+     * Cumulative count of analyze requests short-circuited at the dispatcher
+     * because a completion was observed in the same dispatch window.
+     * Surfaced in `metrics.counts.analyzeSupersededByCompletion` on every
+     * completion-metrics record.
+     */
+    private val analyzeSupersededByCompletionCount: AtomicLong = AtomicLong(0L)
 
     /**
      * Strictly monotonic counter assigned to completion requests at read time.
@@ -71,6 +89,16 @@ class AnalysisServer(
             // still the latest. This is what makes the dispatcher-level
             // supersession check actually catch stale typing-burst completions.
             drainBufferedToPending()
+
+            // Analyze supersession runs first: if a completion is anywhere in this dispatch window the user is interacting, so any queued analyze (incl. `item` itself) is stale.
+            if (hasCompletionInQueue(item)) {
+                if (item.request.method == "analyze") {
+                    sendSyntheticAnalyzeResponse(item.request)
+                    analyzeSupersededByCompletionCount.incrementAndGet()
+                    continue
+                }
+                supersedeQueuedAnalyzes()
+            }
 
             try {
                 handleRequest(item)
@@ -116,11 +144,57 @@ class AnalysisServer(
                 return PendingRequest(request, seq)
             }
         }
+        if (request.method == "analyze") {
+            val bucket = analyzeBucket(request)
+            if (bucket != null) {
+                val seq = sidecarSeqCounter.incrementAndGet()
+                latestSeenSeq.merge(bucket, seq) { old, new -> maxOf(old, new) }
+                return PendingRequest(request, seq)
+            }
+        }
         return PendingRequest(request, null)
     }
 
     private fun completionBucket(request: JsonRpcRequest): String? =
         request.params?.get("uri")?.takeUnless { it.isJsonNull }?.asString
+
+    private fun analyzeBucket(request: JsonRpcRequest): String? =
+        request.params?.get("uri")?.takeUnless { it.isJsonNull }?.asString?.let { "analyze:$it" }
+
+    private fun hasCompletionInQueue(item: PendingRequest): Boolean {
+        if (item.request.method == "completion") return true
+        return pending.any { it.request.method == "completion" }
+    }
+
+    /**
+     * Removes every queued analyze entry from `pending` and short-circuits each
+     * with a synthetic empty-diagnostics response in the same JSON shape
+     * `handleAnalyze` would have emitted on a normal call. Increments
+     * `analyzeSupersededByCompletionCount` once per short-circuit.
+     */
+    private fun supersedeQueuedAnalyzes() {
+        val iter = pending.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            if (entry.request.method != "analyze") continue
+            iter.remove()
+            sendSyntheticAnalyzeResponse(entry.request)
+            analyzeSupersededByCompletionCount.incrementAndGet()
+        }
+    }
+
+    private fun sendSyntheticAnalyzeResponse(request: JsonRpcRequest) {
+        val params = request.params
+        val version = params?.get("version")?.takeUnless { it.isJsonNull }?.asInt
+        val synthetic = JsonObject().apply {
+            add("diagnostics", JsonArray())
+            add("edits", JsonArray())
+            if (version != null) addProperty("version", version)
+        }
+        if (request.id != null) {
+            transport.sendResult(request.id, synthetic)
+        }
+    }
 
     private fun handleRequest(item: PendingRequest) {
         val request = item.request
@@ -370,6 +444,7 @@ class AnalysisServer(
         }
         val counts = metrics.getAsJsonObject("counts") ?: JsonObject().also { metrics.add("counts", it) }
         counts.addProperty("supersededAtDispatch", cumulativeSupersededAtDispatch)
+        counts.addProperty("analyzeSupersededByCompletion", analyzeSupersededByCompletionCount.get())
         if (superseded) {
             val fields = metrics.getAsJsonObject("fields") ?: JsonObject().also { metrics.add("fields", it) }
             fields.addProperty("supersededAtDispatch", "true")

@@ -212,6 +212,21 @@ The sidecar's dispatcher uses the same bucket convention as Rust (`"<uri>"` for
 completion, disjoint from `"analyze:<uri>"`), so the two supersession streams do not
 interfere with each other.
 
+Checkpoint 2 also runs a cross-request-type variant (introduced in ka-p741). When a
+completion is observed at dispatch — either as the request just popped or anywhere in
+the lookahead-drained pending queue — any queued `analyze` request (for any URI,
+bucket `"analyze:<uri>"`) is short-circuited with a synthetic response in the same
+shape `handleAnalyze` would have emitted: `{ diagnostics: [], edits: [], version: N }`.
+The Rust side already tolerates this — it treats it as a normal "no diagnostics
+changed" response — and the debouncer re-fires `analyze` after the next
+post-interactive quiet window, so diagnostics are delayed by one debounce cycle,
+not lost. The cumulative counter `metrics.counts.analyzeSupersededByCompletion`
+increments once per superseded analyze and is emitted alongside `supersededAtDispatch`
+on every completion-metrics record. This eliminates the head-of-line case where an
+analyze sitting in the OS pipe between Rust and JVM (past Rust's
+`cancel_pending("analyze:{uri}")` reach) blocks the next completion for the duration
+of one full `collectDiagnostics` pass (~500-950 ms on cold start; see ka-p741 evidence).
+
 #### Checkpoint 3 — Rust `InFlight`
 
 When the response arrives back at the bridge (whether it's the real result or the

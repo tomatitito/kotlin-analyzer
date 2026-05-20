@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Completion Pipeline &amp; Supersession Checkpoints</title>
+<style>
+  :root {
+    --bg: #fafaf7;
+    --ink: #1d1f24;
+    --muted: #5a6068;
+    --rule: #d8d6cf;
+    --panel: #ffffff;
+
+    --rust:    #d97757;     /* Rust LSP process tint */
+    --rust-bg: #fbeee6;
+    --jvm:     #4a6fa5;     /* JVM sidecar process tint */
+    --jvm-bg:  #e6edf6;
+    --pipe:    #6b6b6b;
+    --pipe-fill:#ececec;
+
+    --cp-green:  #2f8f4e;   /* most saved */
+    --cp-amber:  #c98a18;
+    --cp-red:    #b53b3b;   /* wasted work */
+    --cp-green-bg: #e6f3ea;
+    --cp-amber-bg: #fbf2dc;
+    --cp-red-bg:   #f6e2e1;
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+
+  .page {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 40px 28px 80px;
+  }
+
+  header h1 {
+    font-size: 26px;
+    margin: 0 0 6px 0;
+    letter-spacing: -0.01em;
+  }
+  header .lede {
+    color: var(--muted);
+    max-width: 880px;
+    margin: 0 0 32px 0;
+  }
+  header .lede code { font-size: 13px; }
+
+  h2 {
+    font-size: 18px;
+    margin: 36px 0 8px 0;
+    letter-spacing: -0.005em;
+  }
+  h3 {
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin: 24px 0 8px 0;
+  }
+  p { margin: 6px 0 10px 0; }
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+  }
+  code {
+    background: #efece4;
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  /* ============================================================== */
+  /* Main diagram                                                  */
+  /* ============================================================== */
+  .diagram {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 22px 18px 12px;
+    margin-bottom: 8px;
+  }
+  .diagram svg { display: block; width: 100%; height: auto; }
+
+  /* ============================================================== */
+  /* Checkpoint detail cards                                       */
+  /* ============================================================== */
+  .checkpoints {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+    margin-top: 14px;
+  }
+  .cp {
+    border: 1px solid var(--rule);
+    border-left-width: 4px;
+    border-radius: 6px;
+    padding: 12px 14px;
+    background: var(--panel);
+  }
+  .cp.green { border-left-color: var(--cp-green); background: var(--cp-green-bg); }
+  .cp.amber { border-left-color: var(--cp-amber); background: var(--cp-amber-bg); }
+  .cp.red   { border-left-color: var(--cp-red);   background: var(--cp-red-bg); }
+  .cp .num {
+    display: inline-block;
+    width: 22px; height: 22px;
+    line-height: 22px;
+    text-align: center;
+    border-radius: 50%;
+    color: #fff;
+    font-weight: 600;
+    font-size: 12px;
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  .cp.green .num { background: var(--cp-green); }
+  .cp.amber .num { background: var(--cp-amber); }
+  .cp.red   .num { background: var(--cp-red); }
+  .cp .name {
+    font-weight: 600;
+    font-size: 14px;
+    vertical-align: middle;
+  }
+  .cp dl { margin: 10px 0 0 0; }
+  .cp dt {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin-top: 8px;
+  }
+  .cp dd { margin: 2px 0 0 0; }
+
+  /* ============================================================== */
+  /* Typing burst walkthrough                                      */
+  /* ============================================================== */
+  .burst {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 18px;
+    margin-top: 18px;
+  }
+  .burst-grid {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 10px;
+    margin-top: 12px;
+  }
+  .step {
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 10px 10px 8px;
+    background: #fdfdfb;
+    display: flex;
+    flex-direction: column;
+  }
+  .step .label {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+  }
+  .step .title {
+    font-weight: 600;
+    font-size: 13px;
+    margin-bottom: 6px;
+  }
+  .step svg { width: 100%; height: 90px; }
+  .step .caption {
+    font-size: 11.5px;
+    color: var(--muted);
+    margin-top: 6px;
+    min-height: 50px;
+  }
+  .step .caption.hit-cp3 { color: var(--cp-red); font-weight: 500; }
+  .step .caption.hit-cp2 { color: var(--cp-amber); font-weight: 500; }
+
+  /* ============================================================== */
+  /* Ratio note                                                    */
+  /* ============================================================== */
+  .ratio-callout {
+    margin-top: 20px;
+    background: #fff8e8;
+    border: 1px solid #e8d59a;
+    border-left: 4px solid var(--cp-amber);
+    border-radius: 6px;
+    padding: 14px 16px;
+  }
+  .ratio-callout h2 { margin-top: 0; }
+
+  /* small inline metric pill */
+  .metric {
+    display: inline-block;
+    padding: 1px 6px;
+    background: #1d1f24;
+    color: #fff;
+    border-radius: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+  }
+
+  /* "ka-p741 update" inline callout, mirrors the cold-first-completion page */
+  .cp-update {
+    margin-top: 10px;
+    padding: 8px 10px;
+    background: var(--cp-green-bg);
+    border: 1px solid #b8d9c2;
+    border-left: 3px solid var(--cp-green);
+    border-radius: 4px;
+    font-size: 11.5px;
+    color: var(--ink);
+  }
+  .cp-update .tag {
+    display: inline-block;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #1d6b3a;
+    font-weight: 600;
+    margin-right: 4px;
+  }
+  .cp-update a {
+    color: var(--ink);
+    text-decoration: underline;
+    text-decoration-color: #b8d9c2;
+    text-underline-offset: 2px;
+  }
+  .cp-update a:hover { text-decoration-color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <h1>Completion Pipeline &amp; Supersession Checkpoints</h1>
+    <p class="lede">
+      Three checkpoints all answer the same question — "did a newer completion request
+      arrive for this file before this one finished?" — but they fire at different points along
+      the round trip between the Rust LSP and the JVM sidecar. This page explains why
+      <code>supersededAtDispatch</code> is currently <strong>~0.5&times;</strong> the volume of
+      <code>superseded_in_flight_total</code> instead of the &gt;5&times; we hoped for.
+    </p>
+  </header>
+
+  <!-- ==================================================================== -->
+  <!-- MAIN DIAGRAM                                                         -->
+  <!-- ==================================================================== -->
+  <div class="diagram">
+    <svg viewBox="0 0 1180 520" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+      <defs>
+        <!-- arrowheads -->
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#3a3f47"/>
+        </marker>
+        <marker id="arrow-back" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#3a3f47"/>
+        </marker>
+
+        <!-- pipe gradient: cylinder shading -->
+        <linearGradient id="pipeShade" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%"   stop-color="#d4d4cf"/>
+          <stop offset="50%"  stop-color="#f4f4ee"/>
+          <stop offset="100%" stop-color="#bcbcb6"/>
+        </linearGradient>
+        <linearGradient id="pipeShadeBack" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%"   stop-color="#d4d4cf"/>
+          <stop offset="50%"  stop-color="#f4f4ee"/>
+          <stop offset="100%" stop-color="#bcbcb6"/>
+        </linearGradient>
+      </defs>
+
+      <!-- ============================ PROCESS A: RUST LSP =================== -->
+      <g>
+        <rect x="160" y="20" width="320" height="480"
+              fill="#fbeee6" stroke="#d97757" stroke-width="1.2" rx="8"/>
+        <text x="320" y="44" text-anchor="middle" font-size="13" font-weight="600" fill="#7a3a1c">
+          Process A &mdash; Rust LSP
+        </text>
+        <text x="320" y="60" text-anchor="middle" font-size="11" fill="#7a3a1c" opacity="0.7">
+          (kotlin-analyzer binary)
+        </text>
+      </g>
+
+      <!-- ============================ PROCESS B: JVM SIDECAR ================ -->
+      <g>
+        <rect x="700" y="20" width="320" height="480"
+              fill="#e6edf6" stroke="#4a6fa5" stroke-width="1.2" rx="8"/>
+        <text x="860" y="44" text-anchor="middle" font-size="13" font-weight="600" fill="#2c4a7d">
+          Process B &mdash; JVM Sidecar
+        </text>
+        <text x="860" y="60" text-anchor="middle" font-size="11" fill="#2c4a7d" opacity="0.7">
+          (AnalysisServer, Kotlin Analysis API)
+        </text>
+      </g>
+
+      <!-- ============================ ZED CLIENT ============================ -->
+      <g>
+        <rect x="20" y="170" width="120" height="80" fill="#fff" stroke="#888" rx="6"/>
+        <text x="80" y="200" text-anchor="middle" font-size="13" font-weight="600">Zed editor</text>
+        <text x="80" y="220" text-anchor="middle" font-size="11" fill="#5a6068">client</text>
+      </g>
+
+      <!-- ============================ ANALYSIS API ========================== -->
+      <g>
+        <rect x="1040" y="170" width="120" height="80" fill="#fff" stroke="#4a6fa5" rx="6"/>
+        <text x="1100" y="195" text-anchor="middle" font-size="13" font-weight="600">Analysis API</text>
+        <text x="1100" y="213" text-anchor="middle" font-size="11" fill="#5a6068">~140-180 ms</text>
+        <text x="1100" y="228" text-anchor="middle" font-size="11" fill="#5a6068">warm</text>
+      </g>
+
+      <!-- ============================ RUST WRITER + READER boxes ============ -->
+      <g>
+        <rect x="180" y="110" width="280" height="110" fill="#fff" stroke="#d97757" rx="6"/>
+        <text x="320" y="132" text-anchor="middle" font-size="12.5" font-weight="600">writer task</text>
+        <text x="320" y="150" text-anchor="middle" font-size="11" fill="#5a6068">
+          assigns supersession seq for bucket (uri)
+        </text>
+        <text x="320" y="167" text-anchor="middle" font-size="11" fill="#5a6068">
+          before writing to stdin
+        </text>
+        <!-- CP1 marker anchor on right edge -->
+        <circle cx="460" cy="165" r="11" fill="#2f8f4e" stroke="#fff" stroke-width="2"/>
+        <text x="460" y="169" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">1</text>
+      </g>
+
+      <g>
+        <rect x="180" y="290" width="280" height="110" fill="#fff" stroke="#d97757" rx="6"/>
+        <text x="320" y="312" text-anchor="middle" font-size="12.5" font-weight="600">reader task</text>
+        <text x="320" y="330" text-anchor="middle" font-size="11" fill="#5a6068">
+          receives response, checks bucket seq
+        </text>
+        <text x="320" y="347" text-anchor="middle" font-size="11" fill="#5a6068">
+          forwards items to Zed
+        </text>
+        <!-- CP3 marker anchor on right edge -->
+        <circle cx="460" cy="345" r="11" fill="#b53b3b" stroke="#fff" stroke-width="2"/>
+        <text x="460" y="349" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">3</text>
+      </g>
+
+      <!-- ============================ JVM dispatch / completion boxes ======= -->
+      <g>
+        <rect x="720" y="110" width="280" height="110" fill="#fff" stroke="#4a6fa5" rx="6"/>
+        <text x="860" y="132" text-anchor="middle" font-size="12.5" font-weight="600">dispatch loop</text>
+        <text x="860" y="150" text-anchor="middle" font-size="11" fill="#5a6068">
+          reads stdin, lookahead-drains pipe,
+        </text>
+        <text x="860" y="167" text-anchor="middle" font-size="11" fill="#5a6068">
+          keeps latest seq per bucket
+        </text>
+        <!-- CP2 marker anchor on left edge -->
+        <circle cx="720" cy="165" r="11" fill="#c98a18" stroke="#fff" stroke-width="2"/>
+        <text x="720" y="169" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">2</text>
+      </g>
+
+      <g>
+        <rect x="720" y="290" width="280" height="110" fill="#fff" stroke="#4a6fa5" rx="6"/>
+        <text x="860" y="312" text-anchor="middle" font-size="12.5" font-weight="600">BridgeCompletion</text>
+        <text x="860" y="330" text-anchor="middle" font-size="11" fill="#5a6068">
+          invokes Analysis API,
+        </text>
+        <text x="860" y="347" text-anchor="middle" font-size="11" fill="#5a6068">
+          writes response back to stdout
+        </text>
+      </g>
+
+      <!-- ============================ OUTBOUND PIPE (top) =================== -->
+      <!-- runs from x=480 to x=700, y center ~165 -->
+      <g>
+        <!-- pipe body: rectangle with rounded ends to look like a cylinder -->
+        <rect x="490" y="142" width="200" height="46" rx="23" ry="23"
+              fill="url(#pipeShade)" stroke="#888" stroke-width="1"/>
+        <!-- inner slot cells suggesting buffered requests -->
+        <g stroke="#999" stroke-width="0.8" stroke-dasharray="2,3" opacity="0.7">
+          <line x1="528" y1="148" x2="528" y2="182"/>
+          <line x1="566" y1="148" x2="566" y2="182"/>
+          <line x1="604" y1="148" x2="604" y2="182"/>
+          <line x1="642" y1="148" x2="642" y2="182"/>
+        </g>
+        <!-- sample queued byte slots -->
+        <rect x="500" y="153" width="20" height="24" rx="3" fill="#fff" stroke="#bbb"/>
+        <rect x="538" y="153" width="20" height="24" rx="3" fill="#fff" stroke="#bbb"/>
+        <text x="510" y="170" text-anchor="middle" font-size="9.5" fill="#666">req</text>
+        <text x="548" y="170" text-anchor="middle" font-size="9.5" fill="#666">req</text>
+
+        <!-- arrowhead on right side suggesting outbound direction -->
+        <polygon points="692,165 678,156 678,174" fill="#666"/>
+
+        <!-- labels -->
+        <text x="590" y="130" text-anchor="middle" font-size="12" font-weight="600" fill="#3a3f47">
+          OS pipe &mdash; outbound (Rust stdout &rarr; JVM stdin)
+        </text>
+        <text x="590" y="206" text-anchor="middle" font-size="11" fill="#5a6068">
+          kernel buffer, typically 16-64 KB on macOS
+        </text>
+        <text x="590" y="220" text-anchor="middle" font-size="11" fill="#5a6068">
+          time here = <tspan font-family="ui-monospace, Menlo, monospace">sidecar_queue_wait</tspan>
+        </text>
+      </g>
+
+      <!-- ============================ RETURN PIPE (bottom) ================== -->
+      <g>
+        <rect x="490" y="322" width="200" height="46" rx="23" ry="23"
+              fill="url(#pipeShadeBack)" stroke="#888" stroke-width="1"/>
+        <g stroke="#999" stroke-width="0.8" stroke-dasharray="2,3" opacity="0.7">
+          <line x1="528" y1="328" x2="528" y2="362"/>
+          <line x1="566" y1="328" x2="566" y2="362"/>
+          <line x1="604" y1="328" x2="604" y2="362"/>
+          <line x1="642" y1="328" x2="642" y2="362"/>
+        </g>
+        <rect x="620" y="333" width="20" height="24" rx="3" fill="#fff" stroke="#bbb"/>
+        <text x="630" y="350" text-anchor="middle" font-size="9.5" fill="#666">res</text>
+
+        <!-- arrowhead on left side: return -->
+        <polygon points="488,345 502,336 502,354" fill="#666"/>
+
+        <text x="590" y="310" text-anchor="middle" font-size="12" font-weight="600" fill="#3a3f47">
+          OS pipe &mdash; return (JVM stdout &rarr; Rust stdin)
+        </text>
+        <text x="590" y="386" text-anchor="middle" font-size="11" fill="#5a6068">
+          completion items flow back
+        </text>
+      </g>
+
+      <!-- ============================ EDGES ================================= -->
+      <!-- Zed -> Rust writer  (outbound) -->
+      <line x1="140" y1="200" x2="180" y2="165" stroke="#3a3f47" stroke-width="1.6"
+            marker-end="url(#arrow)"/>
+      <text x="152" y="185" font-size="10" fill="#3a3f47">completion</text>
+
+      <!-- Rust writer -> outbound pipe -->
+      <line x1="460" y1="165" x2="490" y2="165" stroke="#3a3f47" stroke-width="1.6"
+            marker-end="url(#arrow)"/>
+
+      <!-- outbound pipe -> JVM dispatch -->
+      <line x1="690" y1="165" x2="720" y2="165" stroke="#3a3f47" stroke-width="1.6"
+            marker-end="url(#arrow)"/>
+
+      <!-- JVM dispatch -> BridgeCompletion (downward inside JVM) -->
+      <line x1="860" y1="220" x2="860" y2="290" stroke="#3a3f47" stroke-width="1.6"
+            marker-end="url(#arrow)"/>
+
+      <!-- BridgeCompletion -> Analysis API -->
+      <line x1="1000" y1="345" x2="1040" y2="220" stroke="#3a3f47" stroke-width="1.6"
+            marker-end="url(#arrow)"/>
+
+      <!-- Analysis API -> back to BridgeCompletion -->
+      <path d="M 1100 250 Q 1100 320 1000 345" stroke="#3a3f47" stroke-width="1.6"
+            fill="none" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+      <!-- BridgeCompletion -> return pipe -->
+      <line x1="720" y1="345" x2="690" y2="345" stroke="#3a3f47" stroke-width="1.6"
+            marker-end="url(#arrow)"/>
+
+      <!-- return pipe -> Rust reader -->
+      <line x1="490" y1="345" x2="460" y2="345" stroke="#3a3f47" stroke-width="1.6"
+            marker-end="url(#arrow)"/>
+
+      <!-- Rust reader -> Zed -->
+      <line x1="180" y1="345" x2="140" y2="225" stroke="#3a3f47" stroke-width="1.6"
+            marker-end="url(#arrow)"/>
+      <text x="148" y="290" font-size="10" fill="#3a3f47">items</text>
+
+      <!-- ============================ Checkpoint pinned labels (small) ===== -->
+      <g font-size="10.5" fill="#2f8f4e">
+        <text x="406" y="100" text-anchor="end" font-weight="600">CP1: BeforeSend</text>
+        <text x="406" y="113" text-anchor="end" opacity="0.85">superseded_before_send_total</text>
+      </g>
+      <g font-size="10.5" fill="#c98a18">
+        <text x="774" y="100" text-anchor="start" font-weight="600">CP2: AtDispatch</text>
+        <text x="774" y="113" text-anchor="start" opacity="0.85">supersededAtDispatch</text>
+      </g>
+      <g font-size="10.5" fill="#b53b3b">
+        <text x="406" y="282" text-anchor="end" font-weight="600">CP3: InFlight</text>
+        <text x="406" y="295" text-anchor="end" opacity="0.85">superseded_in_flight_total</text>
+      </g>
+
+      <!-- ============================ Process-boundary annotation ========== -->
+      <g>
+        <line x1="590" y1="60" x2="590" y2="92" stroke="#888" stroke-dasharray="3,3"/>
+        <text x="590" y="80" text-anchor="middle" font-size="11" fill="#5a6068" font-style="italic">
+          process boundary
+        </text>
+      </g>
+
+      <!-- stage labels under the diagram -->
+      <g font-size="11" fill="#5a6068">
+        <text x="80"  y="490" text-anchor="middle">1. Zed</text>
+        <text x="320" y="490" text-anchor="middle">2. Rust LSP (process A)</text>
+        <text x="590" y="490" text-anchor="middle">3. OS pipe (kernel)</text>
+        <text x="860" y="490" text-anchor="middle">4. JVM sidecar (process B)</text>
+        <text x="1100" y="490" text-anchor="middle">+ Analysis API</text>
+      </g>
+    </svg>
+  </div>
+
+  <!-- ==================================================================== -->
+  <!-- CHECKPOINT DETAIL CARDS                                              -->
+  <!-- ==================================================================== -->
+  <div class="checkpoints">
+    <div class="cp green">
+      <div><span class="num">1</span><span class="name">BeforeSend</span></div>
+      <dl>
+        <dt>Location</dt>
+        <dd>Rust writer task, before writing bytes to stdin.</dd>
+        <dt>Metric</dt>
+        <dd><span class="metric">superseded_before_send_total</span></dd>
+        <dt>Catches</dt>
+        <dd>A newer request arrived for this bucket before the bytes even crossed into the OS pipe.</dd>
+        <dt>Cost saved</dt>
+        <dd><strong>Full IPC + full sidecar CPU.</strong> Best-case shortcut. (ticket <code>ka-rr3u</code>)</dd>
+      </dl>
+    </div>
+
+    <div class="cp amber">
+      <div><span class="num">2</span><span class="name">AtDispatch</span></div>
+      <dl>
+        <dt>Location</dt>
+        <dd>JVM <code>AnalysisServer</code> dispatch loop, after reading from the pipe, before invoking the Analysis API.</dd>
+        <dt>Mechanism</dt>
+        <dd>"Lookahead drain" — reads everything currently available in the pipe and picks the latest seq per bucket.</dd>
+        <dt>Metric</dt>
+        <dd><span class="metric">supersededAtDispatch</span></dd>
+        <dt>Catches</dt>
+        <dd>When multiple requests are simultaneously sitting in the OS pipe, older ones for the same file get short-circuited.</dd>
+        <dt>Cost saved</dt>
+        <dd><strong>~140-180 ms</strong> of Analysis API work. (ticket <code>ser-leba</code>, just landed)</dd>
+      </dl>
+      <div class="cp-update">
+        <span class="tag">Update <span style="font-family:ui-monospace,Menlo,monospace">ka-p741</span> &middot; 2026-05-19</span>
+        CP2's lookahead-drain has been extended to also recognise queued <code>analyze</code> requests in
+        a separate <code>"analyze:&lt;uri&gt;"</code> bucket. When a completion is in the dispatch window,
+        queued analyzes are short-circuited too &mdash; a cross-request-type variant of the same checkpoint
+        (additive; not a fourth checkpoint). New counter:
+        <span class="metric">analyzeSupersededByCompletion</span>. See
+        <a href="cold-first-completion.html">cold-first-completion.html</a> for the dedicated explanation.
+      </div>
+    </div>
+
+    <div class="cp red">
+      <div><span class="num">3</span><span class="name">InFlight</span></div>
+      <dl>
+        <dt>Location</dt>
+        <dd>Rust, after the response comes back across the pipe.</dd>
+        <dt>Metric</dt>
+        <dd><span class="metric">superseded_in_flight_total</span></dd>
+        <dt>Catches</dt>
+        <dd>The JVM <em>already did</em> the full ~140-180 ms of work, but by the time Rust receives the result a newer request has been sent. Rust discards the response.</dd>
+        <dt>Cost saved</dt>
+        <dd><strong>Nothing</strong> — this is the "we wasted CPU" counter. (ticket <code>ka-rr3u</code>)</dd>
+      </dl>
+    </div>
+  </div>
+
+  <!-- ==================================================================== -->
+  <!-- WHY THE RATIO                                                        -->
+  <!-- ==================================================================== -->
+  <div class="ratio-callout">
+    <h2>Why <code>supersededAtDispatch / superseded_in_flight_total</code> &asymp; 0.5&times;</h2>
+    <p>
+      Checkpoint&nbsp;2 only fires when the dispatcher sees <strong>multiple requests sitting in the pipe at the same time</strong>.
+      The JVM processes each completion in ~140-180 ms. When typing is slower than that drain rate,
+      requests arrive one-at-a-time — there is nothing to deduplicate and only Checkpoint&nbsp;3 catches them,
+      which means we have already wasted the CPU.
+    </p>
+    <p>
+      Walk through the burst below to see why: each time the JVM drains the pipe, it usually finds just a single request
+      waiting (or none), so CP2's lookahead has nothing to throw away.
+    </p>
+  </div>
+
+  <!-- ==================================================================== -->
+  <!-- TYPING BURST WALKTHROUGH                                             -->
+  <!-- ==================================================================== -->
+  <div class="burst">
+    <h2 style="margin-top:0">Typing burst walkthrough: <code>f</code> &rarr; <code>fo</code> &rarr; <code>foo</code></h2>
+    <p style="margin-top:4px;color:var(--muted);max-width:880px">
+      Each card shows the OS pipe state (rectangle with slots) and what the JVM is doing.
+      A filled slot is a request waiting to be picked up; a slot with a halo is the request currently being worked on by the JVM.
+    </p>
+
+    <div class="burst-grid">
+
+      <!-- STEP 1: type f, req 1 hits pipe -->
+      <div class="step">
+        <div class="label">t = 0</div>
+        <div class="title">Type <code>f</code></div>
+        <svg viewBox="0 0 200 90">
+          <rect x="40" y="35" width="120" height="30" rx="15" fill="url(#pipeShade)" stroke="#888"/>
+          <rect x="50" y="42" width="16" height="16" rx="2" fill="#4a6fa5"/>
+          <text x="58" y="54" text-anchor="middle" font-size="9" fill="#fff">1</text>
+          <text x="100" y="22" text-anchor="middle" font-size="10" fill="#5a6068">req 1 enters pipe</text>
+          <text x="100" y="82" text-anchor="middle" font-size="9.5" fill="#5a6068">JVM: idle</text>
+        </svg>
+        <div class="caption">Rust writer assigns seq for the file bucket and writes bytes into the OS pipe.</div>
+      </div>
+
+      <!-- STEP 2: JVM picks up req 1, pipe empty -->
+      <div class="step">
+        <div class="label">t &approx; 0</div>
+        <div class="title">JVM grabs req 1</div>
+        <svg viewBox="0 0 200 90">
+          <rect x="40" y="35" width="120" height="30" rx="15" fill="url(#pipeShade)" stroke="#888"/>
+          <!-- pipe empty -->
+          <circle cx="178" cy="50" r="10" fill="#fff" stroke="#4a6fa5" stroke-width="2"/>
+          <text x="178" y="54" text-anchor="middle" font-size="10" fill="#4a6fa5" font-weight="600">1</text>
+          <text x="100" y="22" text-anchor="middle" font-size="10" fill="#5a6068">pipe empty</text>
+          <text x="100" y="82" text-anchor="middle" font-size="9.5" fill="#5a6068">JVM: working on 1 (~140 ms)</text>
+        </svg>
+        <div class="caption">CP2 lookahead sees nothing else in the pipe &mdash; nothing to skip.</div>
+      </div>
+
+      <!-- STEP 3: user types 'fo', req 2 hits pipe while JVM still busy -->
+      <div class="step">
+        <div class="label">t &approx; 90 ms</div>
+        <div class="title">Type <code>fo</code></div>
+        <svg viewBox="0 0 200 90">
+          <rect x="40" y="35" width="120" height="30" rx="15" fill="url(#pipeShade)" stroke="#888"/>
+          <rect x="50" y="42" width="16" height="16" rx="2" fill="#4a6fa5"/>
+          <text x="58" y="54" text-anchor="middle" font-size="9" fill="#fff">2</text>
+          <circle cx="178" cy="50" r="10" fill="#fff" stroke="#4a6fa5" stroke-width="2"/>
+          <text x="178" y="54" text-anchor="middle" font-size="10" fill="#4a6fa5" font-weight="600">1</text>
+          <text x="100" y="22" text-anchor="middle" font-size="10" fill="#5a6068">req 2 waits</text>
+          <text x="100" y="82" text-anchor="middle" font-size="9.5" fill="#5a6068">JVM still busy on 1</text>
+        </svg>
+        <div class="caption">Req 2 sits in the pipe while the JVM finishes its ~140 ms of work on req 1.</div>
+      </div>
+
+      <!-- STEP 4: JVM finishes 1, sends stale reply -> CP3 -->
+      <div class="step">
+        <div class="label">t &approx; 140 ms</div>
+        <div class="title">JVM returns reply 1</div>
+        <svg viewBox="0 0 200 90">
+          <rect x="40" y="35" width="120" height="30" rx="15" fill="url(#pipeShade)" stroke="#888"/>
+          <rect x="50" y="42" width="16" height="16" rx="2" fill="#4a6fa5"/>
+          <text x="58" y="54" text-anchor="middle" font-size="9" fill="#fff">2</text>
+          <!-- return arrow -->
+          <line x1="160" y1="20" x2="20" y2="20" stroke="#b53b3b" stroke-width="1.6"
+                marker-end="url(#arrow)"/>
+          <text x="100" y="14" text-anchor="middle" font-size="10" fill="#b53b3b" font-weight="600">stale reply 1</text>
+          <text x="100" y="82" text-anchor="middle" font-size="9.5" fill="#5a6068">Rust sees newer seq</text>
+        </svg>
+        <div class="caption hit-cp3">CP3 fires: Rust discards reply 1. <strong>CPU wasted.</strong></div>
+      </div>
+
+      <!-- STEP 5: JVM dispatcher reads -- only req 2 in pipe, CP2 does NOT fire -->
+      <div class="step">
+        <div class="label">t &approx; 140 ms</div>
+        <div class="title">JVM reads pipe</div>
+        <svg viewBox="0 0 200 90">
+          <rect x="40" y="35" width="120" height="30" rx="15" fill="url(#pipeShade)" stroke="#888"/>
+          <!-- empty pipe now -->
+          <circle cx="178" cy="50" r="10" fill="#fff" stroke="#4a6fa5" stroke-width="2"/>
+          <text x="178" y="54" text-anchor="middle" font-size="10" fill="#4a6fa5" font-weight="600">2</text>
+          <text x="100" y="22" text-anchor="middle" font-size="10" fill="#5a6068">only req 2 was there</text>
+          <text x="100" y="82" text-anchor="middle" font-size="9.5" fill="#5a6068">JVM: working on 2</text>
+        </svg>
+        <div class="caption">CP2 lookahead drains the pipe but finds only one request — <strong>no supersession</strong>.</div>
+      </div>
+
+      <!-- STEP 6: user types 'foo', same pattern repeats -->
+      <div class="step">
+        <div class="label">t &approx; 230 ms</div>
+        <div class="title">Type <code>foo</code> &mdash; repeat</div>
+        <svg viewBox="0 0 200 90">
+          <rect x="40" y="35" width="120" height="30" rx="15" fill="url(#pipeShade)" stroke="#888"/>
+          <rect x="50" y="42" width="16" height="16" rx="2" fill="#4a6fa5"/>
+          <text x="58" y="54" text-anchor="middle" font-size="9" fill="#fff">3</text>
+          <circle cx="178" cy="50" r="10" fill="#fff" stroke="#4a6fa5" stroke-width="2"/>
+          <text x="178" y="54" text-anchor="middle" font-size="10" fill="#4a6fa5" font-weight="600">2</text>
+          <text x="100" y="22" text-anchor="middle" font-size="10" fill="#5a6068">req 3 waits</text>
+          <text x="100" y="82" text-anchor="middle" font-size="9.5" fill="#5a6068">JVM still busy on 2</text>
+        </svg>
+        <div class="caption">Cycle restarts. Reply 2 returns &rarr; CP3 fires again. Req 3 alone &rarr; CP2 silent.</div>
+      </div>
+
+    </div>
+
+    <p style="margin-top:14px;color:var(--muted);max-width:920px;">
+      CP2 only fires when typing is <em>faster</em> than the JVM can drain the pipe — i.e. when a second
+      request for the same bucket lands <strong>before the dispatcher has had a chance to call read</strong>.
+      In normal interactive typing (interval ~80-200 ms, JVM work ~140-180 ms), they alternate just fast
+      enough for the JVM to keep up one-at-a-time, so the lookahead drain almost always picks up a single request.
+      That is why <code>supersededAtDispatch</code> is small while <code>superseded_in_flight_total</code> stays high.
+    </p>
+  </div>
+
+</div>
+</body>
+</html>
