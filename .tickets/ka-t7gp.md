@@ -30,3 +30,9 @@ When prefix is empty (just typed `.`), keep `{ true }` to return all members.
 - Completion with a typed prefix fetches fewer symbols (verify via logging)
 - Empty-prefix completion (e.g., right after dot) still returns all members
 - No change in completion result correctness
+
+## Notes
+
+**2026-05-18T15:15:59Z**
+
+Scope amended during initial implementation. The original four call-sites' line numbers had drifted (285→446, 320→488, 411→587, 443→626); a fifth equivalent site was discovered at the current line ~515 in the `KaClassType` branch of `collectMemberCompletions` — `memberScope.callables` (no-arg getter on `KaScope`, returns all callables). Same prefix filter applies. Now in scope for this ticket; will be applied alongside the other four sites in the same change.

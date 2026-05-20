@@ -11,6 +11,7 @@ import org.jetbrains.kotlin.analysis.api.symbols.*
 import org.jetbrains.kotlin.analysis.api.symbols.markers.KaDeclarationContainerSymbol
 import org.jetbrains.kotlin.analysis.api.symbols.markers.KaNamedSymbol
 import org.jetbrains.kotlin.analysis.api.types.KaClassType
+import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.psi.*
 import org.jetbrains.kotlin.types.Variance
 
@@ -283,8 +284,8 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.completeInsideAnalysis(
         } else {
             val prefix = extractCompletionPrefix(element, offset)
             val visibleCandidates = metrics?.stage("scope_candidate_collection") {
-                collectScopeCompletionCandidates(ktFile, element, metrics)
-            } ?: collectScopeCompletionCandidates(ktFile, element, null)
+                collectScopeCompletionCandidates(ktFile, element, prefix, metrics)
+            } ?: collectScopeCompletionCandidates(ktFile, element, prefix, null)
             metrics?.count("scopeCandidates", visibleCandidates.size)
             val keywordCandidates = metrics?.stage("keyword_fallback_collection") {
                 keywordCompletionCandidates()
@@ -432,6 +433,18 @@ private fun findDotCompletionReceiverBeforePrefix(file: KtFile, offset: Int): Kt
 
 // --- KaSession extensions ---
 
+/**
+ * Builds a `KaScopeNameFilter` matching the case-insensitive `startsWith` semantics
+ * used by client-side prefix filtering elsewhere in this file. An empty prefix
+ * yields a permissive `{ true }` filter so scope queries still return all members
+ * (e.g. right after a `.` with no characters typed yet).
+ */
+private fun scopeNamePrefixFilter(prefix: String): (Name) -> Boolean {
+    if (prefix.isEmpty()) return { true }
+    val lowerPrefix = prefix.lowercase()
+    return { name -> name.asString().lowercase().startsWith(lowerPrefix) }
+}
+
 private fun org.jetbrains.kotlin.analysis.api.KaSession.collectMemberCompletions(
     receiverExpr: KtExpression,
     itemsArray: JsonArray,
@@ -440,10 +453,11 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectMemberCompletions
 ) {
     val receiverType = receiverExpr.expressionType ?: return
     val lowerPrefix = prefix.lowercase()
+    val nameFilter = scopeNamePrefixFilter(prefix)
 
     val typeScope = receiverType.scope
     if (typeScope != null) {
-        val callableSignatures = typeScope.getCallableSignatures { true }
+        val callableSignatures = typeScope.getCallableSignatures(nameFilter)
         for (sig in callableSignatures) {
             val symbol = sig.symbol
             if (symbol is KaNamedSymbol) {
@@ -485,7 +499,7 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectMemberCompletions
             }
         }
 
-        val classifiers = typeScope.getClassifierSymbols { true }
+        val classifiers = typeScope.getClassifierSymbols(nameFilter)
         for (classifier in classifiers) {
             if (classifier is KaNamedSymbol) {
                 val name = classifier.name.asString()
@@ -512,7 +526,7 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectMemberCompletions
                 if (label != null) existingLabels.add(label)
             }
 
-            for (callable in memberScope.callables) {
+            for (callable in memberScope.callables(nameFilter)) {
                 if (callable is KaNamedSymbol) {
                     val name = callable.name.asString()
                     if (name.startsWith("<") || name in existingLabels) continue
@@ -559,9 +573,11 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectMemberCompletions
 private fun org.jetbrains.kotlin.analysis.api.KaSession.collectScopeCompletionCandidates(
     ktFile: KtFile,
     element: PsiElement,
+    prefix: String = "",
     metrics: CompletionMetrics? = null,
 ): List<ScopeCompletionCandidate> {
     val candidates = mutableListOf<ScopeCompletionCandidate>()
+    val nameFilter = scopeNamePrefixFilter(prefix)
 
     fun addCandidate(item: JsonObject) {
         val label = item.get("label")?.asString ?: return
@@ -584,7 +600,7 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectScopeCompletionCa
 
             val seen = mutableSetOf<String>()
 
-            for (callable in compositeScope.callables) {
+            for (callable in compositeScope.callables(nameFilter)) {
                 if (callable !is KaNamedSymbol) continue
 
                 val name = callable.name.asString()
@@ -623,7 +639,7 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectScopeCompletionCa
                 addCandidate(item)
             }
 
-            for (classifier in compositeScope.classifiers) {
+            for (classifier in compositeScope.classifiers(nameFilter)) {
                 if (classifier !is KaNamedSymbol) continue
 
                 val name = classifier.name.asString()
