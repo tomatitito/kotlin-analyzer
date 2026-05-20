@@ -938,6 +938,62 @@ class CompilerBridgeIntegrationTest {
         }
     }
 
+    @Test
+    fun `completion - overlay-only local declaration resolves member access beyond Any`() {
+        // Regression for ka-d4n8: with IGNORE_SELF, a receiver whose declaration only
+        // exists in the editor overlay (not on disk) resolves to Any, so member
+        // completion exposes only toString/equals/hashCode. PREFER_SELF must surface
+        // the declared type's own members instead.
+        val uri = "file://$testSourceDir/Completion.kt"
+        val content = """
+            fun overlayUsage() {
+                val overlayPerson = model.Person(1L, "n", "e")
+                overlayPerson.
+            }
+        """.trimIndent()
+        bridge.updateFile(uri, content)
+
+        // Cursor is right after `overlayPerson.` on the third line.
+        val result = bridge.completion(
+            uri = uri,
+            line = 3,
+            character = 18,
+            triggerCharacter = ".",
+            includeMetrics = true,
+        )
+
+        val items = result.getAsJsonArray("items")
+        assertNotNull(items, "completion items array should be present")
+        val labels = items.labels()
+        val anyMembers = setOf("toString", "equals", "hashCode")
+        val nonAnyLabels = labels.filter { it !in anyMembers }
+        assertTrue(
+            nonAnyLabels.isNotEmpty(),
+            "overlay-only receiver must resolve declared type members, got only Any members: ${labels.take(20)} (reason=${result.get("reason")?.asString})",
+        )
+        assertTrue(
+            labels.any { it == "name" || it == "email" || it == "id" },
+            "completion should expose Person properties from the overlay-declared receiver, got: ${labels.take(20)} (reason=${result.get("reason")?.asString})",
+        )
+
+        val metrics = result.getAsJsonObject("metrics")
+        assertNotNull(metrics, "completion metrics should be present")
+        val counts = metrics.getAsJsonObject("counts")
+        val fields = metrics.getAsJsonObject("fields")
+        assertEquals(
+            "existing_session_source_with_editor_overlay",
+            fields.get("completionFileMode")?.asString,
+            "overlay-only receiver test must exercise the dangling overlay path",
+        )
+        assertEquals(
+            COMPLETION_DANGLING_FILE_RESOLUTION_MODE_NAME,
+            fields.get("danglingAnalysisMode")?.asString,
+            "completion should use the configured dangling Analysis API mode",
+        )
+        assertEquals(0, counts.get("sessionRebuilt")?.asInt, "overlay-only receiver completion must not rebuild")
+        assertEquals(0, counts.get("danglingFallback")?.asInt, "overlay-only receiver completion must not fall back")
+    }
+
     // --- Signature Help ---
 
     @Test

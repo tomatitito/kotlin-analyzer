@@ -33,9 +33,9 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 
-internal const val COMPLETION_DANGLING_FILE_RESOLUTION_MODE_NAME = "IGNORE_SELF"
+internal const val COMPLETION_DANGLING_FILE_RESOLUTION_MODE_NAME = "PREFER_SELF"
 internal val COMPLETION_DANGLING_FILE_RESOLUTION_MODE: KaDanglingFileResolutionMode =
-    KaDanglingFileResolutionMode.IGNORE_SELF
+    KaDanglingFileResolutionMode.PREFER_SELF
 
 internal const val PSI_VALIDATION_BYPASS_PROPERTY = "kotlin.analyzer.psi.validation.bypass"
 internal const val PSI_VALIDATION_BYPASS_ENV = "KOTLIN_ANALYZER_PSI_VALIDATION_BYPASS"
