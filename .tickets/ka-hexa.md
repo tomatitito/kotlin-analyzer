@@ -2,7 +2,7 @@
 id: ka-hexa
 status: in_progress
 deps: [ka-kyvv]
-links: [ka-rr3u, ka-aa4k, ka-t7gp, ka-rd05, ka-p741, ser-leba]
+links: [ka-rr3u, ka-aa4k, ka-t7gp, ka-rd05, ka-p741, ser-leba, sid-colf, ka-d4n8, sid-an2f]
 created: 2026-05-05T15:36:27Z
 type: task
 priority: 1

@@ -2,7 +2,7 @@
 id: ka-d4n8
 status: closed
 deps: []
-links: [ka-rd03, ka-slua, ka-p0fi, sid-colf]
+links: [ka-rd03, ka-slua, ka-p0fi, sid-colf, ka-p741, ka-hexa, sid-an2f]
 created: 2026-05-20T10:43:13Z
 type: bug
 priority: 1

@@ -1,8 +1,8 @@
 ---
 id: sid-colf
-status: open
+status: in_progress
 deps: []
-links: [ka-d4n8]
+links: [ka-d4n8, ka-p741, ka-hexa, sid-an2f]
 created: 2026-05-20T11:12:37Z
 type: bug
 priority: 1

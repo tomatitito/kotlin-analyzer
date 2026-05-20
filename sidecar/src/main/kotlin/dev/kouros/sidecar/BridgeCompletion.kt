@@ -11,6 +11,7 @@ import org.jetbrains.kotlin.analysis.api.symbols.*
 import org.jetbrains.kotlin.analysis.api.symbols.markers.KaDeclarationContainerSymbol
 import org.jetbrains.kotlin.analysis.api.symbols.markers.KaNamedSymbol
 import org.jetbrains.kotlin.analysis.api.types.KaClassType
+import org.jetbrains.kotlin.idea.references.KtReference
 import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.psi.*
 import org.jetbrains.kotlin.types.Variance
@@ -451,6 +452,21 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectMemberCompletions
     prefix: String = "",
     metrics: CompletionMetrics? = null,
 ) {
+    // If the receiver is the class itself (e.g. `EnumName.`, `Foo.companionFn`,
+    // `Outer.Inner`) rather than an instance value, walking instance scopes
+    // returns only the inherited `Any` members. Divert to the static-qualifier
+    // path before falling back to `expressionType` (sid-colf).
+    val classReferenceSymbol = resolveClassReferenceReceiver(receiverExpr)
+    if (classReferenceSymbol != null) {
+        collectClassReferenceCompletions(
+            classSymbol = classReferenceSymbol,
+            itemsArray = itemsArray,
+            prefix = prefix,
+            metrics = metrics,
+        )
+        return
+    }
+
     val receiverType = receiverExpr.expressionType ?: return
     val lowerPrefix = prefix.lowercase()
     val nameFilter = scopeNamePrefixFilter(prefix)
@@ -567,6 +583,263 @@ private fun org.jetbrains.kotlin.analysis.api.KaSession.collectMemberCompletions
                 }
             }
         }
+    }
+}
+
+/**
+ * Instance callables inherited from `Any`. These are not legitimate completions
+ * for a static qualifier such as `EnumName.` or `ClassName.`, so we strip them
+ * from the class-reference completion path even when they accidentally surface
+ * via inherited scopes.
+ */
+private val ANY_INSTANCE_CALLABLE_NAMES = setOf("toString", "equals", "hashCode")
+
+/**
+ * Sort-priority buckets for class-reference completion items. Lower numbers
+ * sort first. The user-facing ordering puts the user's own declarations ahead
+ * of synthetic / inherited material:
+ *
+ *  - Enum entries: the most specific thing to type after `EnumName.`.
+ *  - Properties: includes companion `val`s and the synthetic `entries` property.
+ *  - Functions: includes companion `fun`s and the synthetic `values()` /
+ *    `valueOf()` methods. They are still useful but less common than entries.
+ *  - Classifiers: nested classes and the bare `Companion` reference go last.
+ */
+private const val SORT_BUCKET_ENUM_ENTRY = "a"
+private const val SORT_BUCKET_PROPERTY = "b"
+private const val SORT_BUCKET_FUNCTION = "c"
+private const val SORT_BUCKET_CLASSIFIER = "d"
+
+private fun callableSortBucket(symbol: KaCallableSymbol): String = when (symbol) {
+    is KaEnumEntrySymbol -> SORT_BUCKET_ENUM_ENTRY
+    is KaVariableSymbol -> SORT_BUCKET_PROPERTY
+    else -> SORT_BUCKET_FUNCTION
+}
+
+private fun classReferenceSortText(bucket: String, index: Int, label: String): String {
+    // Zero-pad the index so the lexicographic comparison preserves insertion
+    // order (which usually matches source declaration order from the scope).
+    return "%s_%05d_%s".format(bucket, index, label)
+}
+
+/**
+ * Resolves the receiver expression to a class-like symbol when the receiver is
+ * the class itself rather than an instance value. Returns null for instance
+ * receivers, objects (which are singletons and behave like instances), and
+ * companion-object references, so callers can fall back to the existing
+ * instance-receiver path.
+ */
+/**
+ * Resolves the receiver expression to a class-like symbol when the receiver is
+ * the class itself rather than an instance value. Returns null for plain
+ * object/anonymous-object receivers (which act as singletons — the existing
+ * instance-receiver path returns the correct members for them).
+ *
+ * Note: when the receiver is `Foo.` and `Foo` has a companion, K2 resolves the
+ * reference to the companion's `KaClassSymbol` (kind = COMPANION_OBJECT). We
+ * still treat that as a class-reference receiver so callers can walk the
+ * companion's member scope and filter the inherited `Any` callables that are
+ * cosmetically meaningless for a static qualifier.
+ */
+private fun org.jetbrains.kotlin.analysis.api.KaSession.resolveClassReferenceReceiver(
+    receiverExpr: KtExpression,
+): KaClassSymbol? {
+    val refExpr = receiverExpr as? KtReferenceExpression ?: return null
+    for (ref in refExpr.references) {
+        if (ref !is KtReference) continue
+        val symbol = try {
+            ref.resolveToSymbol()
+        } catch (_: Throwable) {
+            continue
+        }
+        val classLike = when (symbol) {
+            is KaClassSymbol -> symbol
+            is KaTypeAliasSymbol -> (symbol.expandedType as? KaClassType)?.symbol as? KaClassSymbol
+            else -> null
+        } ?: continue
+        return when (classLike.classKind) {
+            KaClassKind.OBJECT,
+            KaClassKind.ANONYMOUS_OBJECT -> null
+            else -> classLike
+        }
+    }
+    return null
+}
+
+/**
+ * Collects completion candidates for a class-reference receiver (`ClassName.`):
+ *
+ *  - Enum entries plus the synthetic `values()`, `valueOf()`, `entries` come
+ *    from the enum class's static-declared member scope.
+ *  - Companion-instance callables (`ClassName.companionFn(...)`) come from
+ *    walking the companion object's member scope. K2 resolves `ClassName` to
+ *    the companion's `KaClassSymbol` directly when the class has a companion,
+ *    so we walk that symbol's member scope; otherwise we look up
+ *    `companionObject` on the surrounding `KaNamedClassSymbol`.
+ *  - Nested classes/objects come from the static-declared classifier scope.
+ *
+ * Inherited instance `Any` callables (`toString`/`equals`/`hashCode`) are
+ * filtered out because they are not callable through a static qualifier.
+ */
+private fun org.jetbrains.kotlin.analysis.api.KaSession.collectClassReferenceCompletions(
+    classSymbol: KaClassSymbol,
+    itemsArray: JsonArray,
+    prefix: String,
+    metrics: CompletionMetrics?,
+) {
+    val lowerPrefix = prefix.lowercase()
+    val nameFilter = scopeNamePrefixFilter(prefix)
+    val seenLabels = mutableSetOf<String>()
+    val indexCounter = intArrayOf(0)
+
+    if (classSymbol.classKind == KaClassKind.COMPANION_OBJECT) {
+        // Receiver was `Foo.` where `Foo` has a companion — K2 resolved the
+        // reference directly to the companion symbol. Walk its member scope to
+        // expose companion callables (`Foo.create`, etc.) while still filtering
+        // the inherited Any callables.
+        val companionScope = classSymbol.memberScope
+        addClassReferenceCallables(
+            callables = companionScope.callables(nameFilter),
+            itemsArray = itemsArray,
+            seenLabels = seenLabels,
+            lowerPrefix = lowerPrefix,
+            indexCounter = indexCounter,
+            metrics = metrics,
+        )
+        addClassReferenceClassifiers(
+            classifiers = companionScope.classifiers(nameFilter),
+            itemsArray = itemsArray,
+            seenLabels = seenLabels,
+            lowerPrefix = lowerPrefix,
+            indexCounter = indexCounter,
+        )
+        return
+    }
+
+    val staticScope = classSymbol.staticDeclaredMemberScope
+    addClassReferenceCallables(
+        callables = staticScope.callables(nameFilter),
+        itemsArray = itemsArray,
+        seenLabels = seenLabels,
+        lowerPrefix = lowerPrefix,
+        indexCounter = indexCounter,
+        metrics = metrics,
+    )
+    addClassReferenceClassifiers(
+        classifiers = staticScope.classifiers(nameFilter),
+        itemsArray = itemsArray,
+        seenLabels = seenLabels,
+        lowerPrefix = lowerPrefix,
+        indexCounter = indexCounter,
+    )
+
+    if (classSymbol is KaNamedClassSymbol) {
+        val companion = classSymbol.companionObject
+        if (companion != null) {
+            val companionScope = companion.memberScope
+            addClassReferenceCallables(
+                callables = companionScope.callables(nameFilter),
+                itemsArray = itemsArray,
+                seenLabels = seenLabels,
+                lowerPrefix = lowerPrefix,
+                indexCounter = indexCounter,
+                metrics = metrics,
+            )
+            addClassReferenceClassifiers(
+                classifiers = companionScope.classifiers(nameFilter),
+                itemsArray = itemsArray,
+                seenLabels = seenLabels,
+                lowerPrefix = lowerPrefix,
+                indexCounter = indexCounter,
+            )
+        }
+    }
+}
+
+private fun org.jetbrains.kotlin.analysis.api.KaSession.addClassReferenceCallables(
+    callables: Sequence<KaCallableSymbol>,
+    itemsArray: JsonArray,
+    seenLabels: MutableSet<String>,
+    lowerPrefix: String,
+    indexCounter: IntArray,
+    metrics: CompletionMetrics?,
+) {
+    for (callable in callables) {
+        if (callable !is KaNamedSymbol) continue
+        val name = callable.name.asString()
+        if (name.startsWith("<")) continue
+        if (lowerPrefix.isNotEmpty() && !name.lowercase().startsWith(lowerPrefix)) continue
+        if (name in ANY_INSTANCE_CALLABLE_NAMES) continue
+        if (!seenLabels.add(name)) continue
+
+        val returnType = metrics?.stage("detail_type_rendering") {
+            try {
+                callable.returnType.render(
+                    KaTypeRendererForSource.WITH_SHORT_NAMES,
+                    Variance.INVARIANT,
+                )
+            } catch (_: Exception) { "" }
+        } ?: try {
+            callable.returnType.render(
+                KaTypeRendererForSource.WITH_SHORT_NAMES,
+                Variance.INVARIANT,
+            )
+        } catch (_: Exception) { "" }
+
+        val item = JsonObject()
+        item.addProperty("label", name)
+        item.addProperty("kind", symbolToCompletionKind(callable))
+        item.addProperty("detail", returnType)
+
+        if (callable is KaFunctionSymbol) {
+            if (callable.valueParameters.isEmpty()) {
+                item.addProperty("insertText", "$name()")
+            } else {
+                item.addProperty("insertText", "$name(")
+            }
+        } else {
+            item.addProperty("insertText", name)
+        }
+        item.addProperty(
+            "sortText",
+            classReferenceSortText(
+                bucket = callableSortBucket(callable),
+                index = indexCounter[0]++,
+                label = name,
+            ),
+        )
+        itemsArray.add(item)
+    }
+}
+
+private fun addClassReferenceClassifiers(
+    classifiers: Sequence<KaClassifierSymbol>,
+    itemsArray: JsonArray,
+    seenLabels: MutableSet<String>,
+    lowerPrefix: String,
+    indexCounter: IntArray,
+) {
+    for (classifier in classifiers) {
+        if (classifier !is KaNamedSymbol) continue
+        val name = classifier.name.asString()
+        if (name.startsWith("<")) continue
+        if (lowerPrefix.isNotEmpty() && !name.lowercase().startsWith(lowerPrefix)) continue
+        if (!seenLabels.add(name)) continue
+
+        val item = JsonObject()
+        item.addProperty("label", name)
+        item.addProperty("kind", "class")
+        item.addProperty("detail", "")
+        item.addProperty("insertText", name)
+        item.addProperty(
+            "sortText",
+            classReferenceSortText(
+                bucket = SORT_BUCKET_CLASSIFIER,
+                index = indexCounter[0]++,
+                label = name,
+            ),
+        )
+        itemsArray.add(item)
     }
 }
 
