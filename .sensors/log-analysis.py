@@ -73,6 +73,12 @@ class Record:
     analyze_pending_cancelled_total: int
     superseded_at_dispatch_cumulative: int | None
     final_items: int | None
+    line: int | None
+    character: int | None
+    # Only populated when the sidecar classified the request as member-access
+    # completion (counts.memberCandidates present). None for other completion
+    # kinds (scope, import, keyword-only).
+    member_candidates: int | None
 
     @property
     def is_warm(self) -> bool:
@@ -157,6 +163,15 @@ def parse_record(line: str) -> Record | None:
     queue_wait_from_sidecar = stages.get("sidecar_queue_wait")
     queue_wait = float(queue_wait_from_sidecar) if isinstance(queue_wait_from_sidecar, (int, float)) else 0.0
 
+    def get_optional_int(key: str) -> int | None:
+        raw = fields.get(key)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
     return Record(
         correlation_id=fields.get("correlation_id", "?"),
         uri=fields.get("uri", "?"),
@@ -170,6 +185,11 @@ def parse_record(line: str) -> Record | None:
             int(counts["supersededAtDispatch"]) if "supersededAtDispatch" in counts else None
         ),
         final_items=int(counts["finalItems"]) if "finalItems" in counts else None,
+        line=get_optional_int("line"),
+        character=get_optional_int("character"),
+        member_candidates=(
+            int(counts["memberCandidates"]) if "memberCandidates" in counts else None
+        ),
     )
 
 
@@ -510,6 +530,36 @@ def render_single_text(summary: Summary, *, verbose: bool) -> str:
     qw = [r.sidecar_queue_wait_ms for r in records]
     out.append(f"  all     : {format_stats(latency_stats(qw))}")
 
+    member_records = [r for r in records if r.member_candidates is not None]
+    if member_records:
+        out.append("")
+        out.append("=== member completions (per-record candidate count) ===")
+        # "Any-only" = receiver collapsed to Any/Any?, scope exposed only
+        # toString/equals/hashCode. Symptom of either an unresolved receiver
+        # (e.g. unimported type, prefix-search miss) or, before ka-d4n8,
+        # IGNORE_SELF discarding overlay-only declarations.
+        any_only = [r for r in member_records if r.member_candidates == 3]
+        out.append(
+            f"  total member-access records: {len(member_records)}"
+            f"   any-only (memberCandidates=3): {len(any_only)}"
+        )
+        for r in member_records:
+            flag = "  <-- ANY-ONLY" if r.member_candidates == 3 else ""
+            pos = (
+                f"line={r.line:<3} char={r.character:<3}"
+                if r.line is not None and r.character is not None
+                else "line=?   char=?  "
+            )
+            out.append(
+                f"  seq={r.supersession_seq:>3}  "
+                f"id={r.correlation_id:<16}  "
+                f"{pos}  "
+                f"file={Path(r.uri).name:<40}  "
+                f"member={r.member_candidates:>4}  "
+                f"items={(r.final_items if r.final_items is not None else '-'):>4}"
+                f"{flag}"
+            )
+
     if verbose:
         out.append("")
         out.append("=== per-record trace ===")
@@ -593,6 +643,20 @@ def render_single_json(summary: Summary) -> str:
             ),
             "sidecar_queue_wait": latency_stats([r.sidecar_queue_wait_ms for r in records]),
         },
+        "member_completions": [
+            {
+                "correlation_id": r.correlation_id,
+                "supersession_seq": r.supersession_seq,
+                "uri": r.uri,
+                "line": r.line,
+                "character": r.character,
+                "member_candidates": r.member_candidates,
+                "final_items": r.final_items,
+                "any_only": r.member_candidates == 3,
+            }
+            for r in records
+            if r.member_candidates is not None
+        ],
     }
     return json.dumps(payload, indent=2)
 
