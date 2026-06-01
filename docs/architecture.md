@@ -421,12 +421,25 @@ synthetic empty-diagnostics response and counted under
 `metrics.counts.analyzeSupersededByCompletion`. See
 [lsp-protocol.md §4.1, Checkpoint 2](lsp-protocol.md#41-latest-wins-supersession-completion).
 
-### 8.4 What is deliberately not addressed
+### 8.4 In-flight analyze cancellation (sid-an2f)
 
-Mid-flight cancellation of an `analyze` already running inside the sidecar is
-out of scope. The Kotlin Analysis API exposes no cooperative cancellation
-hooks inside `collectDiagnostics`, and hard-killing the analysis thread would
-corrupt the session. If the JetBrains team adds checkpoint hooks to the K2
-Analysis API in a future release, this becomes feasible; until then the
-two-layer Rust-side defence (cooldown + queue-level supersession) is the
-ceiling of what we can do without sidecar architectural changes.
+The bridge-level supersession in §8.3 can only catch an analyze before
+`collectDiagnostics` starts running. Once K2 is inside the analysis pass, the
+ka-p741 dispatcher check fires too late — the worker is already past the
+short-circuit point. sid-an2f closes that gap by running heavy analyze bodies on
+a dedicated single-thread worker (`sidecar-analyze`) wrapped in
+`ProgressManager.runProcess(body, indicator)`. When the dispatcher pops a
+competing completion, it calls `indicator.cancel()` and K2's internal
+`ProgressManager.checkCanceled()` polls inside `collectDiagnostics` see the
+cancelled indicator on the next checkpoint and throw `ProcessCanceledException`,
+which unwinds out of the analysis pass.
+
+The K2 Analysis API's single-thread contract is preserved because (a) the worker
+is single-threaded, (b) non-analyze Analysis API calls (completion, hover, …)
+await any in-flight analyze on the dispatcher thread first, and (c) at most one
+analyze is in flight at a time. The cumulative counter
+`metrics.counts.analyzeCancelledInFlight` surfaces this layer on every
+completion-metrics record alongside `analyzeSupersededByCompletion` and
+`analyze_pending_cancelled_total`. See
+[lsp-protocol.md §4.2, In-Flight Cancellation Contract](lsp-protocol.md#42-background-analyze-supersession)
+for the full contract and the indicator-vs-Application init details.

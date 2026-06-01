@@ -2,6 +2,7 @@ package dev.kouros.sidecar
 
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
+import com.intellij.openapi.progress.ProcessCanceledException
 import org.jetbrains.kotlin.analysis.api.analyze
 import org.jetbrains.kotlin.analysis.api.components.KaDiagnosticCheckerFilter
 import org.jetbrains.kotlin.psi.*
@@ -125,6 +126,13 @@ internal fun BridgeContext.analyze(uri: String, version: Int? = null): JsonObjec
                 diagnosticsArray.add(diagObj)
             }
         }
+    } catch (e: ProcessCanceledException) {
+        // Cooperative cancellation from AnalysisServer's in-flight cancel path.
+        // Re-throw so the worker can emit the cancelled-shape response and bump
+        // analyzeCancelledInFlight; if we swallowed it here the response would
+        // look like a normal empty-diagnostics result and the metric would not
+        // fire.
+        throw e
     } catch (e: Throwable) {
         System.err.println("CompilerBridge: analysis failed for $uri: ${e.javaClass.name}: ${e.message}")
         e.printStackTrace(System.err)

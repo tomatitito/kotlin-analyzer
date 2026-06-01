@@ -1,6 +1,6 @@
 ---
 id: sid-an2f
-status: open
+status: in_progress
 deps: []
 links: [ka-p741, sid-colf, ka-d4n8, ka-hexa]
 created: 2026-05-20T13:40:18Z

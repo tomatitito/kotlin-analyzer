@@ -206,7 +206,8 @@ the newer arrivals.
 
 The check happens at a safe point — between requests, before the Analysis API call —
 so the single-threaded contract of the K2 Analysis API is preserved. Mid-flight
-cancellation of an in-progress `KaSession` call remains out of scope (see §5).
+cancellation of an in-progress `KaSession` call is covered by §4.2's in-flight
+cancellation contract (sid-an2f).
 
 The sidecar's dispatcher uses the same bucket convention as Rust (`"<uri>"` for
 completion, disjoint from `"analyze:<uri>"`), so the two supersession streams do not
@@ -303,34 +304,89 @@ The `analyze:{uri}` bucket convention ensures that each URI's background diagnos
 can be cancelled independently. Future expansion may add similar `cancel_pending`
 calls for other request types (hover, definition, etc.) using their own bucket names.
 
-#### Two Layers of Defence
+#### Three Layers of Defence
 
-The ka-hexa implementation provides two layers to reduce wasted sidecar CPU during
-interactive bursts:
+The pipeline provides three layers to reduce wasted sidecar CPU during interactive
+bursts. Each layer catches a different state the analyze can be in when a completion
+arrives:
 
 | Failure mode | Covered by |
 |---|---|
 | Analyze about to be scheduled when user types | Layer 1: post-interactive cooldown in the debouncer (`POST_INTERACTIVE_QUIET_WINDOW = 500 ms`, capped by `MAX_DEFER = 5 s`). Built on the `interactive_epoch` and `last_interactive_at` signals. |
 | Analyze already in writer queue, not yet sent | Layer 2: `Bridge::cancel_pending("analyze:{uri}")` in the completion handler (drops queued analyze before it reaches sidecar stdin) |
-| Analyze already mid-`collectDiagnostics` | Out of scope (no mid-flight cancellation) |
+| Analyze sitting in the OS pipe between Rust writer and JVM stdin, or already at the JVM dispatcher but not yet on the worker | Layer 3a (ka-p741): sidecar dispatcher short-circuits any queued analyze when a completion is in the same lookahead window — synthetic `{ diagnostics: [], edits: [], version: N }` response. |
+| Analyze already on the worker, mid-`collectDiagnostics` | Layer 3b (sid-an2f): per-analyze `ProgressIndicator` wrapped via `ProgressManager.runProcess`. The dispatcher calls `indicator.cancel()` on the in-flight entry as soon as a completion is observed; K2's internal `ProgressManager.checkCanceled()` polls inside `collectDiagnostics` see the cancelled indicator and unwind via `ProcessCanceledException`. |
 
 The full mechanism behind Layer 1 — the `interactive_epoch` sentinel, the cooldown
 timing, and the relationship to the project-wide background analysis loop — is
 documented in [architecture.md §8](architecture.md#8-interactive-vs-background-request-scheduling).
 This section covers only the wire-level consequences for `analyze` requests.
 
-**Mid-flight cancellation is explicitly not implemented.** The sidecar runs analysis
-on a single thread with no checkpoint hooks in the Kotlin Analysis API. Cancelling
-an in-flight analyze would require threading interruption state through the compiler,
-which is brittle and offers marginal benefit — the interactive cooldown and
-queue-based cancellation already cover the high-value cases.
+#### In-Flight Cancellation Contract (sid-an2f)
+
+The sidecar runs heavy `analyze` bodies on a dedicated single-thread worker
+(`sidecar-analyze`); the dispatcher thread stays free to keep peeking at the
+inbound queue. Each analyze body is wrapped in
+`ProgressManager.runProcess(body, indicator)` with a per-request indicator stored in
+the dispatcher's `inFlightAnalyze: AtomicReference<InFlightAnalyze?>` slot.
+
+When the dispatcher pops a completion (either as the current request or anywhere
+in the lookahead-drained pending queue) it calls `cancelInFlightAnalyze()` before
+dispatching the completion. That method:
+
+1. Atomically clears the slot and reads the previous entry. If the slot was empty,
+   the call is a no-op.
+2. Calls `indicator.cancel()`. K2's `ProgressManager.checkCanceled()` polls see the
+   cancelled indicator on the next checkpoint and throw `ProcessCanceledException`,
+   which unwinds out of `collectDiagnostics`.
+3. Waits up to 2 s for the worker future to settle. The worker's `catch
+   (ProcessCanceledException)` handler emits the cancelled-shape response
+   `{ diagnostics: [], edits: [], cancelled: true, version: N }` and increments
+   `analyzeCancelledInFlightCount`. If K2 fails to honour the cancel within 2 s,
+   the dispatcher proceeds with the completion anyway — the worker continues to
+   completion on its own thread, and the dispatcher cannot race the worker on the
+   K2 session because all non-analyze Analysis API calls go through
+   `awaitInFlightAnalyze()` first.
+
+The K2 Analysis API's single-thread contract is preserved because (a) the analyze
+worker is single-threaded, (b) the dispatcher awaits the worker before running any
+other Analysis API call (completion, hover, definition, …), and (c) the next
+`analyze` queue entry is only dispatched after `awaitInFlightAnalyze()` drains the
+prior one. At most one Analysis API call is ever in flight.
+
+The dispatcher's worker thread sets the indicator in a `ThreadLocal` accessor
+(`workerIndicatorForTest`) before invoking `bridge.analyze`. The production path
+does not read this — K2's checkpoint polls read the indicator that
+`ProgressManager.runProcess` installs as the thread's current indicator. The
+ThreadLocal is a test-only seam: standalone unit tests construct `AnalysisServer`
+without ever running `bridge.initialize()`, so the IntelliJ Application (and the
+`ProgressManager` service) are not registered; the test bridge polls the indicator
+from a stub `CompilerBridge.analyze` instead. The dispatcher gates the
+`runProcess` wrap on `ProgressManager.getInstanceOrNull() != null` and falls back
+to running the body directly when null, so the same code path works in both modes.
+
+The custom `SidecarProgressIndicator` implements `StandardProgressIndicator` with
+volatile `cancelled` / `running` flags and `ModalityState.nonModal()`. The stock
+`EmptyProgressIndicator` is unusable here because its no-arg constructor calls
+`ModalityState.defaultModalityState()` → `ApplicationManager.getApplication()`,
+which NPEs in tests.
 
 #### Observability
 
-The observable signal for this mechanism is the `analyze_pending_cancelled_total`
-field on the `target=completion_metrics` log line. This cumulative counter increments
-each time the bridge writer task drops a queued analyze request due to
-`cancel_pending`. It resets only on bridge restart.
+Two cumulative counters surface this work, both emitted on every
+`target=completion_metrics` record:
+
+- `analyze_pending_cancelled_total` — Layer 2 hits (Rust writer dropped a queued
+  analyze).
+- `metrics.counts.analyzeSupersededByCompletion` — Layer 3a hits (sidecar
+  dispatcher short-circuited a queued analyze before it reached the worker).
+- `metrics.counts.analyzeCancelledInFlight` — Layer 3b hits (sidecar cancelled an
+  already-running analyze via `ProcessCanceledException`).
+
+All three counters reset only on bridge restart. The expected steady-state ratio
+during typing bursts is Layer 1 ≫ Layer 2 ≫ Layer 3a ≫ Layer 3b — Layer 3b should
+fire only when the user resumes typing inside the ≥500 ms cooldown window between
+the analyze starting and the next completion.
 
 ## 5. Cancellation
 
